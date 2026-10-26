@@ -1,0 +1,17 @@
+[package]
+name = "ols-core"
+description = "OLS as attention: closed-form ridge, dual weights, recursive least squares and the Matrix memory"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nalgebra = "0.35"
+thiserror = "2.0.21"
+
+[dev-dependencies]
+proptest = "1.12"
+
+[lints]
+workspace = true

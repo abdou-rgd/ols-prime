@@ -1,0 +1,16 @@
+[package]
+name = "backtest"
+description = "Bar-based backtest for long/flat spot strategies: next-open execution, venue fees, exchange filters, metrics"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+thiserror = "2.0.21"
+
+[dev-dependencies]
+proptest = "1.12"
+
+[lints]
+workspace = true

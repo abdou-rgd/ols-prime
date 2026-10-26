@@ -1,0 +1,27 @@
+[project]
+name = "olsprime"
+version = "0.1.0"
+description = "OLS Prime: point-in-time crypto market data, universe and a from-scratch OLS-attention encoder."
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.27",
+    "numpy>=2.0",
+    "polars>=1.20",
+    "pyarrow>=17",
+    # Windows has no system time zone database; zoneinfo needs it for UTC datetimes.
+    "tzdata>=2024.1; sys_platform == 'win32'",
+]
+
+[dependency-groups]
+dev = ["pytest>=8"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["olsprime"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"

@@ -1,0 +1,3 @@
+# Store text files with LF line endings whatever each contributor's core.autocrlf:
+# the tools that write them (Windows editors, Python in text mode, WSL2) disagree.
+* text=auto

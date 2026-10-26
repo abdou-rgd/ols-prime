@@ -1,0 +1,128 @@
+# Kani proofs of crates/risk, kept apart from ci.yml because most harnesses
+# run for hours. docs/ITERATIONS.md records each harness's local timing.
+#
+# - `proven` runs the harnesses known to finish, on every push and pull
+#   request that touches the risk crate, the workspace manifests or this
+#   file. A counterexample fails the run.
+# - `open` runs every other harness in a job of its own, only when started by
+#   hand (Actions, Kani, Run workflow), each for at most `minutes`. Running out
+#   of time is a warning; a counterexample still fails the job. A harness that
+#   finishes moves to `proven`, here and in the Verification section of
+#   CLAUDE.md.
+#
+# There is no schedule. One run of `open` costs up to (minutes + 5) runner
+# minutes per harness, which a private repository pays for. If Kani becomes a
+# required check, drop the `paths` filters: a required check that never starts
+# blocks the merge.
+#
+# Pins as in ci.yml, checked on 2026-10-25.
+name: Kani
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/risk/**"
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/kani.yml
+  pull_request:
+    paths:
+      - "crates/risk/**"
+      - Cargo.toml
+      - Cargo.lock
+      - .github/workflows/kani.yml
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Time limit of each open harness, in minutes (1 to 340)
+        type: number
+        default: 120
+
+permissions:
+  contents: read
+
+concurrency:
+  # A long manual run never holds back the runs of a push.
+  group: kani-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  KANI_VERSION: "0.68.0"
+
+jobs:
+  proven:
+    name: Kani, proven harnesses
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier --version "$KANI_VERSION"
+          cargo kani setup
+      # With --exact, Kani 0.68.0 exits 1 on any name that matches no harness
+      # (checked locally), so a renamed harness fails this job.
+      - name: Prove
+        run: >-
+          cargo kani -p risk --exact
+          --harness proofs::buy_gates_block_every_buy
+          --harness proofs::sells_are_never_gated
+
+  open:
+    name: Kani, open (${{ matrix.harness }})
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    # The most a GitHub-hosted runner allows; the harness's own limit is `minutes`.
+    timeout-minutes: 360
+    strategy:
+      fail-fast: false
+      matrix:
+        harness:
+          - check_order_full
+          - check_order_market
+          - check_order_tiny
+          - approval_is_maximal_and_stable_tiny
+          - sell_outcome_ignores_trip_wires
+          - notional_helpers_full
+          - ceil_is_subadditive_full
+          - max_qty_within_exact_full
+          - max_qty_within_exact_market
+          - max_qty_within_galois_market
+          - round_down_to_lot_full
+          - tripwires_full
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
+      - name: Install Kani
+        run: |
+          cargo install --locked kani-verifier --version "$KANI_VERSION"
+          cargo kani setup
+      - name: Run the harness within the time limit
+        env:
+          NAME: ${{ matrix.harness }}
+          MINUTES: ${{ inputs.minutes }}
+        run: |
+          if ! [[ "$MINUTES" =~ ^[1-9][0-9]*$ ]] || (( MINUTES > 340 )); then
+            echo "::error::minutes must be a whole number from 1 to 340, not '$MINUTES'."
+            exit 1
+          fi
+          status=0
+          timeout --kill-after=5m "${MINUTES}m" \
+            cargo kani -p risk --exact --harness "proofs::$NAME" || status=$?
+          # 124: the time limit ran out. Any other failure is a real one.
+          if (( status == 124 )); then
+            echo "::warning title=$NAME::No verdict within $MINUTES minutes."
+            exit 0
+          fi
+          exit "$status"

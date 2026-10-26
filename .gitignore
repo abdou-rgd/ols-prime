@@ -1,0 +1,31 @@
+# Rust
+/target/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+.ipynb_checkpoints/
+
+# Data and experiment outputs: never committed (size, and the licenses of the sources)
+/data/
+/runs/*
+# ...except the vault's audit trail: the key file and the log of the one opening.
+!/runs/vault/
+/runs/vault/*
+!/runs/vault/OPEN
+!/runs/vault/ACCESS.log
+
+# Secrets
+.env
+*.key
+kaggle.json
+
+# OS and editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
