@@ -32,6 +32,7 @@ from olsprime.protocol import (
     seal,
     vault_open,
 )
+from tests.allowlist import ALLOWED
 from tests.fakes import DAY_MS, HOUR_MS, FakeBucket, kline_rows, klines_csv, month_rows
 
 PACKAGE = Path(protocol.__file__).parent
@@ -423,27 +424,7 @@ MODULE_ATTRIBUTES: dict[str, tuple[str, frozenset[str]]] = {
 # but still scanned for these data tokens, so that ``!parquet-tools cat x.parquet`` does not slip through.
 MAGIC_DATA_TOKENS = re.compile(r"parquet|\.zip\b|duckdb|\.ipc\b|\.arrow\b|vault", re.I)
 
-# Where a rule is allowed, by file relative to python/, each with its reason. Exact, not by pattern.
-ALLOWED: dict[str, dict[str, str]] = {
-    "olsprime/protocol.py": {
-        "reader": "the one reader of stored klines, always followed by seal",
-        "seal": "defines and calls the seal",
-    },
-    "olsprime/data/binance_vision.py": {
-        "raw-reader": "parses the downloaded archives into the stored schema",
-        "import:zipfile": "opens the downloaded archives",
-    },
-    "tests/fakes.py": {
-        "raw-reader": "writes fake archives",
-        "import:zipfile": "writes fake archives",
-    },
-    "tests/test_binance_vision.py": {"reader": "reads back the Parquet file the build just wrote"},
-    "tests/test_universe.py": {"reader": "reads back the universe file the run just wrote"},
-    "tests/test_protocol.py": {
-        "reader": "shows that the stored file keeps the vault rows",
-        "seal": "tests the seal itself",
-    },
-}
+# Where a rule is allowed, by file: tests/allowlist.py (shared with the run-time tripwire, tests/tripwire.py).
 
 
 def _root_name(node: ast.AST) -> str | None:

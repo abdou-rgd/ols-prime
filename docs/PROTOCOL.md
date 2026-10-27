@@ -48,15 +48,19 @@ Fixed before any model is trained. Any change gets a dated entry in the change l
 
 ## Costs
 
-Results are reported under three fee schedules, as of October 2026 (re-check before use):
+Results are reported under four fee schedules, plus zero fees as the gross reference. Rates as of October 2026; re-check before use.
 
-| Venue | Maker | Taker |
-|---|---|---|
-| Binance spot | 0.10 % | 0.10 % |
-| Coinbase Advanced, entry tier | 0.25 % | 0.50 % |
-| Kraken Pro, entry tier | 0.40 % | 0.80 % |
+| Venue | Maker | Taker | Source, read on 2026-10-27 |
+|---|---|---|---|
+| Binance spot (history only) | 0.10 % | 0.10 % | checked in iteration 1 |
+| Bitvavo, entry tier (MiCA, Dutch AFM) | 0.15 % | 0.25 % | Bitvavo's API documentation and a search snippet of its fee page. The page itself was not read. |
+| Coinbase Advanced, entry tier, EU | 0.25 % | 0.50 % | two news reports of Coinbase's announcement of 2026-09-16. Coinbase's own pages answer HTTP 403. |
+| Kraken Pro, entry tier | 0.40 % | 0.80 % | Kraken's fee-schedule page, level 1 |
 
-Slippage is 2 bps per side. The exchange minimum notional and lot step are enforced.
+- Slippage is 2 bps per side. The exchange minimum notional and lot step are enforced.
+- Every order is charged the taker rate: a decision at a close executes at the next open.
+- Fee schedules change (Kraken on 2026-07-09, Coinbase on 2026-09-16). Applying today's rates to past years is a stated assumption, not a leak.
+- The backtest uses Binance's USDT prices. Bitvavo, Coinbase and Kraken quote BTC and ETH in EUR or USD, so their price paths differ by the exchange rate.
 
 ## Baselines
 
@@ -67,3 +71,9 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
 - 2026-10-25: initial version.
 - 2026-10-25: the vault is sealed in code, after the iteration 1 audit. The splits do not change.
 - 2026-10-26: git tracks the vault's key file and access log, after the re-audit.
+- 2026-10-27, before Report n°1 runs:
+  - Fees re-read at the source by a `scout`. Kraken is confirmed. Coinbase rests on secondary sources.
+  - Bitvavo joins as a fourth schedule. It is the cheapest MiCA-authorized venue found that serves French residents.
+  - Binance's exit from France is confirmed at the source: the AMF withdrew BINANCE France SAS's registration on 2026-07-02, at the end of the MiCA transition period.
+  - A runtime tripwire in `python/tests/conftest.py` now backs the static guard during tests.
+  - Diebold-Mariano tests use the original rectangular kernel with h − 1 lags and the Harvey-Leybourne-Newbold correction. They fall back to Bartlett only when the rectangular variance is not positive. Measured size at a nominal 5 %, with h = 7: 5.25 % rectangular against 8.75 % for Bartlett. With h = 1 the two are identical.

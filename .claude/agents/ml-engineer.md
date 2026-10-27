@@ -34,7 +34,7 @@ You are the ML engineer of OLS Prime: a from-scratch encoder whose attention hea
   - The vault (2026-01 → 2026-10) is never touched.
 - **Ablations.** Change one thing at a time. Fixed seeds; configs as dataclasses saved with every run; every variant tried is logged, because it counts toward the deflated Sharpe.
 - **Size.** Models stay small enough for an RTX 3060 12 GB (≤ 10 M parameters unless the brief says otherwise). Training runs in WSL2.
-- **Outputs.** Calibrated probabilities over typed options, trained with label-smoothed cross-entropy plus a Brier term. Report log-loss, Brier score and ECE, never accuracy alone.
+- **Outputs.** Calibrated probabilities over typed options, trained with cross-entropy plus a Brier term. Label smoothing is an ablation, off by default, because it biases the expected edge (`docs/DESIGN.md` §5). Report log-loss, Brier score and ECE, never accuracy alone.
 
 ## Workflow
 

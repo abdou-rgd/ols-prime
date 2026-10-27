@@ -1,0 +1,424 @@
+"""Type stubs for olsprime_rs, the Rust core of OLS Prime.
+
+Conventions:
+- Arrays in are numpy arrays of the exact dtype (float64; int64 for times) and number of
+  dimensions; anything else raises TypeError before a value is read. Strided views are read
+  in their logical order.
+- Arrays out are fresh copies owned by the caller.
+- SimError and OlsError are ValueErrors carrying the Rust message.
+"""
+
+from typing import Final, Literal, final
+
+import numpy as np
+import numpy.typing as npt
+
+__version__: Final[str]
+
+_F64 = npt.NDArray[np.float64]
+_I64 = npt.NDArray[np.int64]
+_I8 = npt.NDArray[np.int8]
+
+# --- errors -------------------------------------------------------------------------------
+
+class SimError(ValueError):
+    """backtest::SimError: the simulator refused its inputs."""
+
+class OlsError(ValueError):
+    """ols_core::OlsError: an OLS-core operation failed."""
+
+# --- backtest -----------------------------------------------------------------------------
+
+BUY: Final[int]
+"""Fills.side code of a buy: +1."""
+SELL: Final[int]
+"""Fills.side code of a sell: -1."""
+
+_FeeName = Literal[
+    "zero",
+    "binance-spot",
+    "binance-spot-bnb",
+    "coinbase-advanced-entry",
+    "kraken-pro-entry",
+    "bitvavo-entry",
+]
+
+@final
+class FeeSchedule:
+    """A venue's spot fee schedule, as fractions of notional."""
+
+    ZERO: Final[FeeSchedule]
+    BINANCE_SPOT: Final[FeeSchedule]
+    BINANCE_SPOT_BNB: Final[FeeSchedule]
+    COINBASE_ADVANCED_ENTRY: Final[FeeSchedule]
+    KRAKEN_PRO_ENTRY: Final[FeeSchedule]
+    BITVAVO_ENTRY: Final[FeeSchedule]
+
+    def __init__(self, name: str, maker: float, taker: float) -> None:
+        """A custom schedule: rates in [0, 1), built-in names reserved (ValueError)."""
+    @staticmethod
+    def named(name: str) -> FeeSchedule:
+        """The built-in schedule with this exact name (ValueError if unknown)."""
+    @staticmethod
+    def names() -> list[str]: ...
+    @property
+    def name(self) -> str: ...
+    @property
+    def maker(self) -> float: ...
+    @property
+    def taker(self) -> float: ...
+    def rate(self, liquidity: Literal["taker", "maker"]) -> float: ...
+    def __eq__(self, other: object) -> bool: ...
+
+@final
+class Fills:
+    """The fills of a simulation, one column per field, in fill order."""
+
+    @property
+    def bar(self) -> _I64:
+        """Index of the bar whose open executed the fill."""
+    @property
+    def time(self) -> _I64:
+        """open_time of that bar, ms since the epoch, UTC."""
+    @property
+    def side(self) -> _I8:
+        """BUY (+1) or SELL (-1)."""
+    @property
+    def qty(self) -> _F64: ...
+    @property
+    def price(self) -> _F64:
+        """Executed price, slippage included."""
+    @property
+    def notional(self) -> _F64: ...
+    @property
+    def fee(self) -> _F64: ...
+    def as_dict(self) -> dict[str, _I64 | _I8 | _F64]: ...
+    def __len__(self) -> int: ...
+
+@final
+class SimResult:
+    """The output of simulate: one value per bar, marked at the close."""
+
+    @property
+    def equity(self) -> _F64: ...
+    @property
+    def position(self) -> _F64: ...
+    @property
+    def cash(self) -> _F64: ...
+    @property
+    def fills(self) -> Fills: ...
+    @property
+    def fees_paid(self) -> float: ...
+    def __len__(self) -> int: ...
+
+def simulate(
+    open_time: _I64,
+    open: _F64,
+    high: _F64,
+    low: _F64,
+    close: _F64,
+    volume: _F64,
+    targets: _F64,
+    *,
+    initial_cash: float,
+    fees: FeeSchedule | _FeeName,
+    liquidity: Literal["taker", "maker"] = "taker",
+    slippage_bps: float = 2.0,
+    min_notional: float = 0.0,
+    step_size: float = 0.0,
+    rebalance_threshold: float = 0.0,
+) -> SimResult:
+    """backtest::simulate. targets[t] executes at the open of bar t + 1; targets[-1] never.
+
+    Raises SimError for invalid bars, targets or config, ValueError for bar columns of unequal
+    length or an unknown fee or liquidity name, TypeError for wrong dtypes.
+    """
+
+@final
+class Metrics:
+    """backtest::metrics::Metrics."""
+
+    @property
+    def periods(self) -> int: ...
+    @property
+    def total_return(self) -> float: ...
+    @property
+    def annualized_return(self) -> float: ...
+    @property
+    def annualized_volatility(self) -> float: ...
+    @property
+    def sharpe(self) -> float | None: ...
+    @property
+    def sortino(self) -> float | None: ...
+    @property
+    def max_drawdown(self) -> float: ...
+    @property
+    def turnover(self) -> float: ...
+    @property
+    def exposure(self) -> float: ...
+    @property
+    def fees_paid(self) -> float: ...
+    def as_dict(self) -> dict[str, int | float | None]: ...
+    def __eq__(self, other: object) -> bool: ...
+
+def metrics(result: SimResult, periods_per_year: float) -> Metrics:
+    """backtest::metrics::compute. ValueError unless periods_per_year is finite and > 0."""
+
+def periods_per_year(bar_ms: int) -> float:
+    """365 * 86_400_000 / bar_ms. ValueError if bar_ms <= 0."""
+
+def max_drawdown(equity: _F64) -> float: ...
+
+# --- ols-core -----------------------------------------------------------------------------
+
+@final
+class RidgeConfig:
+    """Penalty lam >= 0 on every coordinate, or on all but coordinate 0 with intercept=True."""
+
+    def __init__(self, lam: float, *, intercept: bool = False) -> None: ...
+    @staticmethod
+    def with_intercept(lam: float) -> RidgeConfig: ...
+    @property
+    def lam(self) -> float: ...
+    @property
+    def intercept(self) -> bool: ...
+    def __eq__(self, other: object) -> bool: ...
+
+class SuffStats:
+    """Sufficient statistics of weighted entries; mutable only through push and merge."""
+
+    def __init__(self, p: int, q: int) -> None:
+        """The statistics of the empty set."""
+    @staticmethod
+    def from_rows(xs: _F64, ys: _F64) -> SuffStats:
+        """Unit-weight rows: xs is (n, p), ys is (n, q)."""
+    def push(self, x: _F64, y: _F64, w: float = 1.0) -> None: ...
+    def merge(self, other: SuffStats) -> None: ...
+    def merged(self, other: SuffStats) -> SuffStats: ...
+    def copy(self) -> SuffStats: ...
+    def __copy__(self) -> SuffStats: ...
+    def mean_y(self) -> _F64 | None: ...
+    @property
+    def p(self) -> int: ...
+    @property
+    def q(self) -> int: ...
+    @property
+    def count(self) -> int: ...
+    @property
+    def n(self) -> float: ...
+    @property
+    def sum_x(self) -> _F64: ...
+    @property
+    def gram(self) -> _F64:
+        """G = sum w x x^T, shape (p, p)."""
+    @property
+    def cross(self) -> _F64:
+        """C = sum w y x^T, shape (q, p)."""
+    @property
+    def sum_y(self) -> _F64: ...
+    @property
+    def sum_yy(self) -> _F64: ...
+    def __eq__(self, other: object) -> bool: ...
+
+@final
+class RidgeModel:
+    @property
+    def beta(self) -> _F64:
+        """beta = C (G + Lambda)^-1, shape (q, p)."""
+    def predict(self, x: _F64) -> _F64: ...
+    def __eq__(self, other: object) -> bool: ...
+
+def ridge_fit(stats: SuffStats, cfg: RidgeConfig) -> RidgeModel: ...
+def solve_query(stats: SuffStats, cfg: RidgeConfig, x_q: _F64) -> _F64:
+    """The dual direction a = (G + Lambda)^-1 x_q."""
+
+def residual_sum_squares(stats: SuffStats, model: RidgeModel) -> _F64: ...
+
+@final
+class Attention:
+    @property
+    def weights(self) -> _F64:
+        """Signed weights, shape (queries, keys)."""
+    @property
+    def forecast(self) -> _F64:
+        """weights @ values, shape (queries, q)."""
+
+def ols_attention(keys: _F64, values: _F64, queries: _F64, cfg: RidgeConfig) -> Attention: ...
+
+class Rls:
+    """Recursive least squares with forgetting factor gamma in (0, 1]."""
+
+    def __init__(self, p: int, q: int, lam: float, gamma: float = 1.0) -> None: ...
+    def update(self, x: _F64, y: _F64) -> None: ...
+    def predict(self, x: _F64) -> _F64: ...
+    @property
+    def beta(self) -> _F64: ...
+    @property
+    def updates(self) -> int: ...
+    @property
+    def gamma(self) -> float: ...
+
+@final
+class Readout:
+    """A read of Matrix; only the Matrix that made it accepts it."""
+
+    @property
+    def start(self) -> int: ...
+    @property
+    def end(self) -> int: ...
+    @property
+    def a(self) -> _F64: ...
+    @property
+    def forecast(self) -> _F64: ...
+
+@final
+class Summary:
+    @property
+    def start(self) -> int: ...
+    @property
+    def end(self) -> int: ...
+    @property
+    def n(self) -> float: ...
+    @property
+    def mean_y(self) -> _F64: ...
+    @property
+    def model(self) -> RidgeModel: ...
+    @property
+    def residual_var(self) -> _F64: ...
+
+class Matrix:
+    """Append-only memory of (time, state, outcome) entries. Push an entry only once its
+    outcome is known, stamped with the time it became known (ms, UTC)."""
+
+    def __init__(self, p: int, q: int, *, block_log2: int = 6) -> None: ...
+    def push(self, time: int, x: _F64, y: _F64) -> None: ...
+    def extend(self, times: _I64, xs: _F64, ys: _F64) -> None:
+        """Push n entries at once, or none."""
+    def __len__(self) -> int: ...
+    @property
+    def p(self) -> int: ...
+    @property
+    def q(self) -> int: ...
+    @property
+    def block_size(self) -> int: ...
+    @property
+    def times(self) -> _I64: ...
+    def time_range(self, from_time: int, as_of: int) -> tuple[int, int]:
+        """(start, end) of the entries with from_time <= time <= as_of."""
+    def range_stats(self, start: int, end: int) -> SuffStats: ...
+    def query(self, x_q: _F64, start: int, end: int, cfg: RidgeConfig) -> Readout: ...
+    def weights(self, readout: Readout) -> _F64: ...
+    def contribution(self, readout: Readout, start: int, end: int) -> _F64: ...
+    def summarize(self, start: int, end: int, cfg: RidgeConfig) -> Summary: ...
+
+# --- risk ---------------------------------------------------------------------------------
+
+QTY_SCALE: Final[int]
+"""Qty units per whole base unit (1e8)."""
+QUOTE_SCALE: Final[int]
+"""Quote units per whole quote unit (1e6)."""
+BPS_SCALE: Final[int]
+
+@final
+class Side:
+    BUY: Final[Side]
+    SELL: Final[Side]
+    def __eq__(self, other: object) -> bool: ...
+    def __hash__(self) -> int: ...
+    def __int__(self) -> int: ...
+
+@final
+class Rejection:
+    INVALID_INPUT: Final[Rejection]
+    KILL_SWITCH: Final[Rejection]
+    DAILY_LOSS: Final[Rejection]
+    COOLDOWN: Final[Rejection]
+    POSITION_CAP: Final[Rejection]
+    NO_POSITION: Final[Rejection]
+    BELOW_MINIMUM: Final[Rejection]
+    OVERFLOW: Final[Rejection]
+    def __eq__(self, other: object) -> bool: ...
+    def __hash__(self) -> int: ...
+    def __int__(self) -> int: ...
+
+@final
+class Account:
+    """Account state at the decision bar's close, in quote and qty units."""
+
+    def __init__(
+        self,
+        *,
+        equity: int,
+        peak_equity: int,
+        day_start_equity: int,
+        position: int,
+        bars_since_order: int,
+    ) -> None: ...
+    @property
+    def equity(self) -> int: ...
+    @property
+    def peak_equity(self) -> int: ...
+    @property
+    def day_start_equity(self) -> int: ...
+    @property
+    def position(self) -> int: ...
+    @property
+    def bars_since_order(self) -> int: ...
+
+@final
+class Limits:
+    def __init__(
+        self,
+        *,
+        max_position: int,
+        max_order: int,
+        min_order: int,
+        lot_step: int,
+        max_daily_loss: int,
+        max_drawdown_bps: int,
+        cooldown_bars: int,
+    ) -> None: ...
+    @property
+    def max_position(self) -> int: ...
+    @property
+    def max_order(self) -> int: ...
+    @property
+    def min_order(self) -> int: ...
+    @property
+    def lot_step(self) -> int: ...
+    @property
+    def max_daily_loss(self) -> int: ...
+    @property
+    def max_drawdown_bps(self) -> int: ...
+    @property
+    def cooldown_bars(self) -> int: ...
+
+@final
+class OrderRequest:
+    def __init__(self, *, side: Side, qty: int, price: int) -> None: ...
+    @property
+    def side(self) -> Side: ...
+    @property
+    def qty(self) -> int: ...
+    @property
+    def price(self) -> int: ...
+
+@final
+class Approved:
+    """An order that passed every check; only check_order makes one."""
+
+    @property
+    def side(self) -> Side: ...
+    @property
+    def qty(self) -> int: ...
+    @property
+    def notional(self) -> int: ...
+
+@final
+class Rejected:
+    @property
+    def reason(self) -> Rejection: ...
+    @property
+    def message(self) -> str: ...
+
+def check_order(account: Account, limits: Limits, request: OrderRequest) -> Approved | Rejected: ...

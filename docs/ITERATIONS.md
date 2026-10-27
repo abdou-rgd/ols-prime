@@ -102,16 +102,54 @@ One Claude Code session delivers one iteration. The orchestrator writes the brie
 
 **Learning page.** [Comprendre OLS Prime](https://claude.ai/artifact/386T8BiAjdUfbmjMZ1niGw), in French, written by `teacher` and checked by the orchestrator. It is private to Abdou's account.
 
-## Next — Iteration 2: Honest bench (roadmap phase 1)
+## Iteration 2 — Honest bench (2026-10-27)
 
-- PyO3 bindings for `ols-core` and `backtest`.
-- Walk-forward splitter with purge and embargo.
-- Baselines: climatology, buy and hold, momentum, random, ridge, XGBoost.
-- Cheater test (H1).
-- Report n°1: what fees do to simple strategies.
+**Goal.** One command, from the verified archives to the rows of Report n°1: "what fees do to simple strategies". The bench must catch a model that reads its own label.
+
+**Deliverables.**
+- `crates/olsprime-py`: PyO3 bindings for `backtest`, `ols-core` and `risk`, importable as `olsprime_rs` from the uv environment, on Windows and in CI.
+- Point-in-time hand-made features, and forward labels that carry the instant they become known.
+- A walk-forward splitter with monthly refits, purge and embargo.
+- Baselines: climatology, always flat, buy and hold, momentum, random positions with matched turnover, ridge, XGBoost. Plus a cheater that reads the next bar.
+- Statistics on every reported number:
+  - Sharpe standard error for non-normal returns (Mertens 2002, Opdyke 2007) and a stationary block-bootstrap interval;
+  - probabilistic and deflated Sharpe ratios (Bailey and López de Prado 2012, 2014);
+  - log-loss, Brier skill score, expected calibration error, Diebold-Mariano with HAC variance.
+- H1: the future-invariance test, run on every model, and the cheater flagged.
+- Report n°1 as a single command, `uv run python -m olsprime.bench.report1`, deterministic. It prints the vault manifest: each Parquet file's SHA-256 and sealed row count.
+- The full universe: daily bars of every eligible USDT pair, the monthly top 30 from 2017-10 to 2025-12, and hourly bars of every member.
 - Carried over from iteration 1:
-  - a Sharpe standard error (Lo 2002, with skewness and kurtosis) and the deflated Sharpe ratio (Bailey and López de Prado 2014) on every reported Sharpe, before any row reaches `RESULTS.md`;
-  - a vault manifest in `runs/`: the SHA-256 and the sealed row count of each Parquet file;
-  - a runtime tripwire in `python/tests/conftest.py` that makes Parquet reads outside `protocol.py` fail. It catches what the static guard cannot see: indirection, computed paths, `torch.load`;
-  - Kani function contracts. Prove `max_qty_within`, `round_down_to_lot` and the notional helpers once against their specifications, then let the `check_order` harnesses use them through `stub_verified`, so that no harness bit-blasts a 128-bit division. The aim is all 14 harnesses in the `proven` job;
-  - re-read Coinbase's own EU fee page before Report n°1 uses it.
+  - the vault manifest above;
+  - a runtime tripwire in `python/tests/conftest.py`: a Parquet read outside the allowed files fails, whatever the indirection;
+  - Kani function contracts for the arithmetic helpers, used by the `check_order` harnesses through `stub_verified`, with all 14 harnesses in the `proven` job as the aim;
+  - the venues' fee pages re-read at the source before Report n°1 uses them.
+
+**Hypotheses touched.** H1 is tested. H9 is registered before Report n°1 runs.
+
+**Done when.**
+- Every check of `CLAUDE.md` is green, locally and in GitHub Actions.
+- Report n°1 runs as one command, and a second run reproduces its table exactly.
+- `RESULTS.md` has the H1 row and the Report n°1 rows, each Sharpe with its interval, its deflated value and the variant count.
+- `leakage-auditor` passes.
+- The pull request is merged into `main` and pushed. Abdou authorized commit, merge and push for this iteration on 2026-10-27.
+
+**Plan.** Briefs are in `.claude/briefs/iteration-2/`.
+
+| Wave | Task | Agent | Brief |
+|---|---|---|---|
+| 1 | PyO3 bindings | `rust-engineer` | `pyo3.md` |
+| 1 | Kani function contracts | `rust-engineer` | `kani-contracts.md` |
+| 1 | Universe download, vault manifest, runtime tripwire | `data-engineer` | `universe-manifest-tripwire.md` |
+| 1 | Fees, formulas and tool facts at the source | `scout` | `sources.md` |
+| 2 | Features, labels, walk-forward splits | `data-engineer` | `features-labels-splits.md` |
+| 2 | Baselines, decision rule, cheater | `ml-engineer` | `baselines.md` |
+| 2 | Statistics | `ml-engineer` | `stats.md` |
+| 3 | H1 bench and the Report n°1 command | `ml-engineer` | `bench.md` |
+| 3 | Run Report n°1 twice, record the rows | `experiment-runner` | `report1-run.md` |
+| 4 | Audit | `leakage-auditor` | `audit.md` |
+| 5 | Learning page | `teacher` | `learning-page.md` |
+
+**Set up by the orchestrator before wave 1.**
+- The public repository [abdou-rgd/ols-prime](https://github.com/abdou-rgd/ols-prime), created at Abdou's request, with iteration 1 pushed to `main`. That commit now carries Abdou's GitHub noreply address, again at their request. Work happens on the branch `iteration-2`.
+- The `open` Kani job was started on GitHub runners for the twelve unproven harnesses, 340 minutes each, on the iteration 1 code (run 40596921451). Public repositories pay no Actions minutes.
+- `scipy` and `xgboost-cpu` were added to `python/pyproject.toml`. The empty packages `features`, `labels`, `eval`, `models` and `bench` were created, so that parallel agents never create the same file.

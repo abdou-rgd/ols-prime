@@ -1,0 +1,40 @@
+[build-system]
+# maturin >= 1.9.4 sets PYO3_BUILD_EXTENSION_MODULE, which replaces PyO3's deprecated
+# `extension-module` feature. Pinned exactly: uv.lock does not lock build dependencies.
+requires = ["maturin==1.15.0"]
+build-backend = "maturin"
+
+[project]
+name = "olsprime-rs"
+description = "OLS Prime's Rust core for Python: the backtest simulator, OLS attention and Matrix, the risk kernel."
+requires-python = ">=3.12"
+license = "MIT"
+# rust-numpy reads and returns numpy arrays through numpy's C API.
+dependencies = ["numpy>=2.0"]
+dynamic = ["version"]
+
+[tool.maturin]
+module-name = "olsprime_rs"
+features = ["python"]
+# The default is a release build; keep debug assertions out of the extension.
+profile = "release"
+strip = true
+
+[tool.uv]
+# uv rebuilds a path dependency only when one of these files changes. The defaults
+# (pyproject.toml, setup.py, setup.cfg) would leave a stale binary after a Rust edit, so the
+# key covers this crate and every crate compiled into it, and the lock file.
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "olsprime_rs.pyi" },
+    { file = "Cargo.toml" },
+    { file = "src/**/*.rs" },
+    { file = "../backtest/Cargo.toml" },
+    { file = "../backtest/src/**/*.rs" },
+    { file = "../ols-core/Cargo.toml" },
+    { file = "../ols-core/src/**/*.rs" },
+    { file = "../risk/Cargo.toml" },
+    { file = "../risk/src/**/*.rs" },
+    { file = "../../Cargo.toml" },
+    { file = "../../Cargo.lock" },
+]

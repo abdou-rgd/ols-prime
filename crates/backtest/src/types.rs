@@ -103,6 +103,31 @@ impl FeeSchedule {
         maker: 0.004,
         taker: 0.008,
     };
+    /// Bitvavo, entry tier (Category A, €0+): 0.15 % / 0.25 %. MiCA-authorized
+    /// by the Dutch AFM. Rates from Bitvavo's API documentation and a search
+    /// snippet of its fee page on 2026-10-27; the fee page itself was not read.
+    /// Re-check before use.
+    pub const BITVAVO_ENTRY: Self = Self {
+        name: "bitvavo-entry",
+        maker: 0.001_5,
+        taker: 0.002_5,
+    };
+
+    /// Every named schedule above, so that callers (the Python bindings, a
+    /// CLI) resolve names from one table instead of copying it.
+    pub const ALL: [Self; 6] = [
+        Self::ZERO,
+        Self::BINANCE_SPOT,
+        Self::BINANCE_SPOT_BNB,
+        Self::COINBASE_ADVANCED_ENTRY,
+        Self::KRAKEN_PRO_ENTRY,
+        Self::BITVAVO_ENTRY,
+    ];
+
+    /// The schedule of [`FeeSchedule::ALL`] with this exact name.
+    pub fn named(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|f| f.name == name)
+    }
 
     /// Fee rate charged for the given liquidity.
     pub fn rate(&self, liquidity: Liquidity) -> f64 {
@@ -182,4 +207,24 @@ pub struct SimResult {
     pub fills: Vec<Fill>,
     /// Sum of `fill.fee` over all fills, in fill order.
     pub fees_paid: f64,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::FeeSchedule;
+
+    #[test]
+    fn every_named_schedule_resolves_to_itself() {
+        for (i, f) in FeeSchedule::ALL.iter().enumerate() {
+            assert_eq!(FeeSchedule::named(f.name), Some(*f));
+            assert!(
+                FeeSchedule::ALL[..i].iter().all(|g| g.name != f.name),
+                "duplicate name {}",
+                f.name
+            );
+            assert!((0.0..1.0).contains(&f.maker) && (0.0..1.0).contains(&f.taker));
+        }
+        assert_eq!(FeeSchedule::named("Binance-Spot"), None);
+        assert_eq!(FeeSchedule::named(""), None);
+    }
 }
