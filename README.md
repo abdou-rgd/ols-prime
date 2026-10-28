@@ -4,7 +4,7 @@
 
 OLS Prime is a local-AI lab. Crypto trading is the playground, not the goal. Every component is a hypothesis: it is registered before it is tested, then measured by ablation against simple baselines on a leak-free backtest bench. A clean negative result counts as a result.
 
-> Status: iteration 1, foundations. Nothing here trades yet, and nothing here is investment advice.
+> Status: iteration 2, the honest bench. Nothing here trades yet, and nothing here is investment advice.
 
 ## The idea
 
@@ -25,28 +25,53 @@ A pretrained LLM has already read the news of the years we would backtest on, so
 |---|---|
 | `crates/ols-core` | closed-form ridge, dual (attention) weights, recursive least squares with forgetting, Matrix |
 | `crates/backtest` | bar simulator (decide at the close, execute at the next open), venue fee schedules, metrics |
-| `crates/risk` | fixed-point risk kernel with Kani proof harnesses |
-| `python/olsprime` | data pipeline (data.binance.vision), point-in-time universe; models and training later |
-| `docs/` | [design](docs/DESIGN.md), [evaluation protocol](docs/PROTOCOL.md), [pre-registered hypotheses](docs/HYPOTHESES.md), [results](docs/RESULTS.md) |
+| `crates/risk` | fixed-point risk kernel, with Kani proof harnesses and function contracts |
+| `crates/olsprime-py` | Python bindings of the Rust core (PyO3), built by `uv sync` |
+| `python/olsprime/data`, `universe.py` | data pipeline (data.binance.vision), point-in-time universe, the vault seal and the data manifest |
+| `python/olsprime/features`, `labels` | point-in-time features; three-class forward labels |
+| `python/olsprime/eval` | walk-forward splits with purge and embargo; statistics (Sharpe intervals, PSR, DSR, stationary bootstrap, Diebold-Mariano, calibration) |
+| `python/olsprime/models` | baselines and the long/flat decision rule; the encoder and Matrix later |
+| `python/olsprime/bench` | the future-invariance test (H1) and the reports, one command each |
+| `docs/` | [design](docs/DESIGN.md), [evaluation protocol](docs/PROTOCOL.md), [pre-registered hypotheses](docs/HYPOTHESES.md), [results](docs/RESULTS.md), [reports](docs/reports/) |
 
 ## Getting started
 
 ```bash
 cargo test --workspace
+cd python
+uv sync
+uv run pytest
 ```
 
-The Kani proofs need Linux (WSL2 works). Two of the fourteen harnesses finish, in about 11 minutes together on the development machine:
+`uv sync` also builds the Rust core into the Python environment. The bench reads the klines of data.binance.vision, which are never committed:
 
 ```bash
-cargo kani -p risk --exact --harness proofs::buy_gates_block_every_buy --harness proofs::sells_are_never_gated
+uv run python -m olsprime.data.binance_vision --symbols BTCUSDT ETHUSDT --intervals 1d --start 2017-08 --end 2025-12
+uv run python -m olsprime.bench.invariance
+uv run python -m olsprime.bench.report1
 ```
 
-`cargo kani -p risk` runs all of them. The other twelve ran out of time at one hour each, on a shared machine. [`kani.yml`](.github/workflows/kani.yml) keeps both lists.
+The first command downloads and checks the archives. The second runs H1, the future-invariance test, in about eight minutes. The third writes [Report n°1](docs/reports/report-1.md) in about a minute and a half. `report1 --check <run folder>` re-runs a report and compares it byte for byte.
+
+The Kani proofs need Linux (WSL2 works). Four of the twenty-one harnesses finish. On the development machine they take 14 to 16 minutes run four at a time (`-j 4 --output-format=terse`), or 18 minutes one after another:
+- the two of iteration 1: every buy gate blocks every buy, and sells are never gated;
+- the function contract of `product`;
+- a lemma that the specifications' 128-bit products never wrap.
+
+```bash
+cargo kani -p risk --exact -Z function-contracts -Z stubbing --no-assert-contracts --harness proofs::buy_gates_block_every_buy --harness proofs::sells_are_never_gated --harness proofs::product_contract --harness proofs::exact_never_wraps
+```
+
+`cargo kani -p risk`, with the same flags, runs all of them.
+- The contracts of the four helpers that divide (`notional_floor`, `notional_ceil`, `max_qty_within`, `round_down_to_lot`) are written in `crates/risk/src/spec.rs`. They are not proven yet: each ran out of time at 40 minutes. Property tests are the evidence for them for now.
+- So did the `check_order` harnesses that use those contracts as stubs.
+
+[`kani.yml`](.github/workflows/kani.yml) keeps both lists.
 
 ## Roadmap
 
-0. **Foundations:** repository, data pipeline, CI.
-1. **Honest bench:**
+0. **Foundations:** repository, data pipeline, CI. Done in iteration 1.
+1. **Honest bench**, done in iteration 2:
    - Rust backtest with real venue fees;
    - risk kernel;
    - walk-forward protocol and baselines.

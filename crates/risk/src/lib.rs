@@ -59,6 +59,10 @@ use core::fmt;
 
 #[cfg(kani)]
 mod proofs;
+// The contracts are compiled for Kani and for the unit tests that check them
+// against the helpers on random inputs.
+#[cfg(any(kani, test))]
+mod spec;
 
 /// Qty units per whole base unit (1e-8 resolution).
 pub const QTY_SCALE: i64 = 100_000_000;
@@ -216,6 +220,7 @@ impl core::error::Error for Rejection {}
 
 /// `qty · price` in `i128`, or `None` if either factor is negative.
 /// Exact: |i64 · i64| ≤ 2^126 < i128::MAX.
+#[cfg_attr(kani, kani::ensures(|r: &Option<i128>| spec::product_spec(qty, price, *r)))]
 fn product(qty: Qty, price: Price) -> Option<i128> {
     if qty.0 < 0 || price.0 < 0 {
         return None;
@@ -227,6 +232,7 @@ fn product(qty: Qty, price: Price) -> Option<i128> {
 ///
 /// `None` if `qty` or `price` is negative, or if the result exceeds `i64`.
 #[must_use]
+#[cfg_attr(kani, kani::ensures(|r: &Option<Quote>| spec::floor_spec(qty, price, *r)))]
 pub fn notional_floor(qty: Qty, price: Price) -> Option<Quote> {
     let p = product(qty, price)?;
     i64::try_from(p / i128::from(QTY_SCALE)).ok().map(Quote)
@@ -237,6 +243,7 @@ pub fn notional_floor(qty: Qty, price: Price) -> Option<Quote> {
 ///
 /// `None` if `qty` or `price` is negative, or if the result exceeds `i64`.
 #[must_use]
+#[cfg_attr(kani, kani::ensures(|r: &Option<Quote>| spec::ceil_spec(qty, price, *r)))]
 pub fn notional_ceil(qty: Qty, price: Price) -> Option<Quote> {
     let p = product(qty, price)?;
     let s = i128::from(QTY_SCALE);
@@ -256,6 +263,7 @@ pub fn notional_ceil(qty: Qty, price: Price) -> Option<Quote> {
 ///
 /// `None` if `cap < 0` or `price ≤ 0`.
 #[must_use]
+#[cfg_attr(kani, kani::ensures(|r: &Option<Qty>| spec::max_qty_spec(cap, price, *r)))]
 pub fn max_qty_within(cap: Quote, price: Price) -> Option<Qty> {
     if cap.0 < 0 || price.0 <= 0 {
         return None;
@@ -304,6 +312,8 @@ fn inputs_valid(account: &Account, limits: &Limits, request: &OrderRequest) -> b
 
 /// Largest multiple of `lot` that is ≤ `qty`. Requires `qty ≥ 0` and
 /// `lot > 0`, so neither `%` nor `-` can overflow.
+#[cfg_attr(kani, kani::requires(qty >= 0 && lot > 0))]
+#[cfg_attr(kani, kani::ensures(|r: &i64| spec::lot_spec(qty, lot, *r)))]
 fn round_down_to_lot(qty: i64, lot: i64) -> i64 {
     qty - qty % lot
 }

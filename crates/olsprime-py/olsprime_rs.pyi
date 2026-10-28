@@ -4,8 +4,16 @@ Conventions:
 - Arrays in are numpy arrays of the exact dtype (float64; int64 for times) and number of
   dimensions; anything else raises TypeError before a value is read. Strided views are read
   in their logical order.
+- Scalars: an `int` parameter takes any integer (numpy's included) and a `float` parameter any
+  real number; a bool is refused for both.
 - Arrays out are fresh copies owned by the caller.
-- SimError and OlsError are ValueErrors carrying the Rust message.
+- Errors: bad input raises TypeError (wrong type) or ValueError (wrong value), and nothing
+  else. An integer outside its Rust range is a ValueError naming the parameter, never an
+  OverflowError. SimError and OlsError are ValueErrors carrying the Rust message.
+- Sizes: a shape whose allocation would exceed MAX_ALLOC_BYTES (a p x p Gram matrix, an
+  attention matrix, or the copy of an input array, zero-stride views included) is a ValueError
+  naming the arguments, raised before anything is allocated. A failed allocation would abort
+  the interpreter instead of raising.
 """
 
 from typing import Final, Literal, final
@@ -26,6 +34,15 @@ class SimError(ValueError):
 
 class OlsError(ValueError):
     """ols_core::OlsError: an OLS-core operation failed."""
+
+# --- limits -------------------------------------------------------------------------------
+
+MAX_ALLOC_BYTES: Final[int]
+"""2**30 (1 GiB): the most bytes one object or array copy sized by a caller's shape may take."""
+MICROSECOND_TIMES_FROM: Final[int]
+"""10**14: the first time refused as microseconds by simulate (open_time) and Matrix (push,
+extend, time_range). Every time here is in milliseconds; 10**14 ms is the year 5138, 10**14 us
+is 1973."""
 
 # --- backtest -----------------------------------------------------------------------------
 
@@ -130,8 +147,11 @@ def simulate(
 ) -> SimResult:
     """backtest::simulate. targets[t] executes at the open of bar t + 1; targets[-1] never.
 
+    open_time is in milliseconds since the epoch, UTC. A time >= 10**14 (the year 5138 in ms,
+    1973 in microseconds) is refused as a microsecond time.
+
     Raises SimError for invalid bars, targets or config, ValueError for bar columns of unequal
-    length or an unknown fee or liquidity name, TypeError for wrong dtypes.
+    length, a microsecond time, or an unknown fee or liquidity name, TypeError for wrong dtypes.
     """
 
 @final
@@ -290,10 +310,14 @@ class Matrix:
     """Append-only memory of (time, state, outcome) entries. Push an entry only once its
     outcome is known, stamped with the time it became known (ms, UTC)."""
 
-    def __init__(self, p: int, q: int, *, block_log2: int = 6) -> None: ...
-    def push(self, time: int, x: _F64, y: _F64) -> None: ...
+    def __init__(self, p: int, q: int, *, block_log2: int = 6) -> None:
+        """MAX_ALLOC_BYTES bounds one tree node (p*p + q*p + p + 2*q + 1 floats), not the
+        memory, which grows by p + q floats per entry and one node per closed block."""
+    def push(self, time: int, x: _F64, y: _F64) -> None:
+        """Push one entry. A time >= MICROSECOND_TIMES_FROM is a ValueError."""
     def extend(self, times: _I64, xs: _F64, ys: _F64) -> None:
-        """Push n entries at once, or none."""
+        """Push n entries at once, or none. Shapes are checked first, then the unit of every
+        time (a time >= MICROSECOND_TIMES_FROM is a ValueError), then each entry in order."""
     def __len__(self) -> int: ...
     @property
     def p(self) -> int: ...
@@ -304,7 +328,9 @@ class Matrix:
     @property
     def times(self) -> _I64: ...
     def time_range(self, from_time: int, as_of: int) -> tuple[int, int]:
-        """(start, end) of the entries with from_time <= time <= as_of."""
+        """(start, end) of the entries with from_time <= time <= as_of. Both are milliseconds:
+        a bound >= MICROSECOND_TIMES_FROM is a ValueError, since an as_of in microseconds would
+        expose every entry. -2**63 stays a valid from_time."""
     def range_stats(self, start: int, end: int) -> SuffStats: ...
     def query(self, x_q: _F64, start: int, end: int, cfg: RidgeConfig) -> Readout: ...
     def weights(self, readout: Readout) -> _F64: ...

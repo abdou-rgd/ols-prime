@@ -2,6 +2,16 @@
 
 - **Agent:** `experiment-runner` (sonnet, medium).
 - **When:** after the bench (`bench.md`) is merged into the working tree by the orchestrator.
+- **Updated 2026-10-28.** The runs are made on a clean, committed tree, so that the provenance block (git commit, code digest, data manifest) names exactly the commit that produced the numbers.
+  - The tree contains the bench fixes of `bench-fixes.md`, `bench-fixes-2.md` and `bench-fixes-3.md`.
+    - H1 now perturbs every column and every ratio, in both directions.
+    - The two runs of a cut give bar t + 1 opposite candle shapes: body-dominant when the future is multiplied by 3, wick-dominant when it is divided by 3.
+    - H1 carries planted leaks as controls, each with an exact predicted pattern, and a positive control.
+    - A `?` cut is predicted from the original bars, with a declared reason. A cut that fails to cross without a declared reason fails H1.
+    - H1 writes a `provenance` block in `h1.json` and at the end of `h1.md`.
+  - H1 counts only if every honest model has 0 violations, every control sits exactly on its predicted pattern, and the positive control passes. The h1.md headline says so. Report every `?` cut it lists, with its reason.
+  - The data is final: `python -m olsprime.manifest` must give digest `230e28e830f728ec7b3974c359f944e7d7bc28f8268694ef00448e672f52f3cd` (843 files). Stop and report if it does not.
+  - Run `uv sync` once at the start, as step 1 says. The orchestrator makes sure no other agent is using the environment then.
 - **Motto:** we should be more ambitious: use the compute we have, and record everything.
 
 ## Goal
@@ -15,7 +25,10 @@ Make the official runs of the two commands the bench provides, prove they reprod
 3. `uv run python -m olsprime.bench.invariance`: H1 on BTCUSDT and ETHUSDT, 1d.
 4. `uv run python -m olsprime.bench.report1`: the first official run of Report n°1.
 5. `uv run python -m olsprime.bench.report1 --check <dir of run 4>`: the reproducibility check, which must pass byte for byte.
-6. For every run, record the wall time, the git commit and the `git status --porcelain` state. The tree is not committed yet, so say so.
+6. For every run, record the wall time, the git commit and the `git status --porcelain` state.
+   - The tree must be clean before the first run.
+   - Afterwards, only `runs/`, which git ignores, and the regenerated `docs/reports/report-1.md` may have changed.
+   - Check that the commit in `h1.json` and in Report n°1's provenance block is the one `git rev-parse HEAD` gives.
 
 Run exactly these commands, with their defaults. Any other configuration is an extra variant: do not run it.
 

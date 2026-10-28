@@ -4,12 +4,21 @@
 //! arrays with one entry per row. Matrices come back C-ordered: `beta` is (q, p), attention
 //! weights (queries, keys).
 
-use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
 use ols_core::OlsError as RsOlsError;
 use pyo3::prelude::*;
 
-use super::{array2, dmatrix, dvector, ols_error, rows2, vec1};
-use crate::convert;
+use super::{Float, Int, array2, check_alloc, dmatrix, dvector, ols_error, rows2, shape2, vec1};
+use crate::convert::{self, MICROSECOND_TIMES_FROM, stats_blocks};
+
+/// A Matrix time in microseconds, refused as `simulate` refuses a bar time: see
+/// [`MICROSECOND_TIMES_FROM`].
+fn microseconds(name: &str, time: i64) -> PyErr {
+    pyo3::exceptions::PyValueError::new_err(format!(
+        "{name} = {time} looks like microseconds: Matrix times are milliseconds since the \
+         epoch, and every time >= 10^14 (the year 5138 in ms, 1973 in us) is refused"
+    ))
+}
 
 /// `x` and `p` must agree before a slice reaches `ols-core`; it checks too, but the batch
 /// shapes are the bindings' to check.
@@ -30,7 +39,8 @@ pub struct RidgeConfig {
 impl RidgeConfig {
     #[new]
     #[pyo3(signature = (lam, *, intercept = false))]
-    fn new(lam: f64, intercept: bool) -> PyResult<Self> {
+    fn new(lam: Float, intercept: bool) -> PyResult<Self> {
+        let lam = lam.get("lam")?;
         let inner = if intercept {
             ols_core::RidgeConfig::with_intercept(lam)
         } else {
@@ -42,7 +52,7 @@ impl RidgeConfig {
 
     /// `RidgeConfig(lam, intercept=True)`.
     #[staticmethod]
-    fn with_intercept(lam: f64) -> PyResult<Self> {
+    fn with_intercept(lam: Float) -> PyResult<Self> {
         Self::new(lam, true)
     }
 
@@ -83,12 +93,14 @@ pub struct SuffStats {
 impl SuffStats {
     /// The statistics of the empty set, for states in Rᵖ and outcomes in Rᵠ.
     #[new]
-    fn new(p: usize, q: usize) -> PyResult<Self> {
+    fn new(p: Int, q: Int) -> PyResult<Self> {
+        let (p, q): (usize, usize) = (p.get("p")?, q.get("q")?);
         if p == 0 || q == 0 {
             return Err(ols_error(RsOlsError::InvalidShape(
                 "p and q must be at least 1",
             )));
         }
+        check_alloc(|| format!("SuffStats(p={p}, q={q})"), &stats_blocks(p, q))?;
         Ok(Self {
             inner: ols_core::SuffStats::zeros(p, q),
         })
@@ -97,25 +109,37 @@ impl SuffStats {
     /// The statistics of unit-weight rows: `xs` is (n, p), `ys` is (n, q).
     #[staticmethod]
     fn from_rows(xs: PyReadonlyArray2<'_, f64>, ys: PyReadonlyArray2<'_, f64>) -> PyResult<Self> {
-        let (n, p, xs) = rows2(&xs);
-        let (m, q, ys) = rows2(&ys);
+        let ((n, p), (m, q)) = (shape2(&xs), shape2(&ys));
         if n != m {
             return Err(shape_error(n, m));
         }
+        check_alloc(
+            || {
+                format!(
+                    "SuffStats(p={p}, q={q}) from xs of shape ({n}, {p}) and ys of shape ({m}, {q})"
+                )
+            },
+            &stats_blocks(p, q),
+        )?;
+        let (_, _, xs) = rows2(&xs, "xs")?;
+        let (_, _, ys) = rows2(&ys, "ys")?;
         ols_core::SuffStats::from_rows(&xs, &ys, p, q)
             .map(|inner| Self { inner })
             .map_err(ols_error)
     }
 
     /// Adds one entry with weight `w ≥ 0`; a rejected entry changes nothing.
-    #[pyo3(signature = (x, y, w = 1.0))]
+    #[pyo3(signature = (x, y, w = Float::from(1.0)))]
     fn push(
         &mut self,
         x: PyReadonlyArray1<'_, f64>,
         y: PyReadonlyArray1<'_, f64>,
-        w: f64,
+        w: Float,
     ) -> PyResult<()> {
-        self.inner.push(&vec1(&x), &vec1(&y), w).map_err(ols_error)
+        let w = w.get("w")?;
+        self.inner
+            .push(&vec1(&x, "x")?, &vec1(&y, "y")?, w)
+            .map_err(ols_error)
     }
 
     /// Adds the statistics of a disjoint set. `s.merge(s)` doubles `s`.
@@ -231,7 +255,7 @@ impl RidgeModel {
         py: Python<'py>,
         x: PyReadonlyArray1<'_, f64>,
     ) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        let f = self.inner.predict(&vec1(&x)).map_err(ols_error)?;
+        let f = self.inner.predict(&vec1(&x, "x")?).map_err(ols_error)?;
         Ok(dvector(py, &f))
     }
 
@@ -260,7 +284,8 @@ fn solve_query<'py>(
     cfg: &RidgeConfig,
     x_q: PyReadonlyArray1<'_, f64>,
 ) -> PyResult<Bound<'py, PyArray1<f64>>> {
-    let a = ols_core::solve_query(&stats.inner, &cfg.inner, &vec1(&x_q)).map_err(ols_error)?;
+    let a =
+        ols_core::solve_query(&stats.inner, &cfg.inner, &vec1(&x_q, "x_q")?).map_err(ols_error)?;
     Ok(dvector(py, &a))
 }
 
@@ -305,13 +330,43 @@ fn ols_attention(
     queries: PyReadonlyArray2<'_, f64>,
     cfg: &RidgeConfig,
 ) -> PyResult<Attention> {
-    let (keys, values, queries) = (dmatrix(&keys), dmatrix(&values), dmatrix(&queries));
+    let ((n, p), (nv, q), (m, pq)) = (shape2(&keys), shape2(&values), shape2(&queries));
     // ols-core never builds a zero-width state or outcome elsewhere; numpy can (shape (n, 0)).
-    if keys.ncols() == 0 || values.ncols() == 0 {
+    if p == 0 || q == 0 {
         return Err(ols_error(RsOlsError::InvalidShape(
             "p and q must be at least 1",
         )));
     }
+    // ols-core's own shape checks, in its order, made here so that the sizes below are real.
+    if n != nv {
+        return Err(shape_error(n, nv));
+    }
+    if p != pq {
+        return Err(shape_error(p, pq));
+    }
+    // What ols-core allocates from these shapes: XᵀX and its factor (p × p),
+    // A = (XᵀX + Λ)⁻¹ X_qᵀ (p × m), X A and W (n × m, m × n), and Ŷ (m × q).
+    for (what, block) in [
+        ("the Gram matrix of keys", (p, p)),
+        ("the solve of queries", (p, m)),
+        ("the weights", (m, n)),
+        ("the forecast", (m, q)),
+    ] {
+        check_alloc(
+            || {
+                format!(
+                    "ols_attention: {what} of shape {block:?}, for keys ({n}, {p}), values \
+                     ({nv}, {q}) and queries ({m}, {pq}),"
+                )
+            },
+            &[block],
+        )?;
+    }
+    let (keys, values, queries) = (
+        dmatrix(&keys, "keys")?,
+        dmatrix(&values, "values")?,
+        dmatrix(&queries, "queries")?,
+    );
     ols_core::ols_attention(&keys, &values, &queries, &cfg.inner)
         .map(|inner| Attention { inner })
         .map_err(ols_error)
@@ -327,8 +382,12 @@ pub struct Rls {
 impl Rls {
     /// Starts from β = 0 and P = I/λ, with λ > 0 and γ in (0, 1].
     #[new]
-    #[pyo3(signature = (p, q, lam, gamma = 1.0))]
-    fn new(p: usize, q: usize, lam: f64, gamma: f64) -> PyResult<Self> {
+    #[pyo3(signature = (p, q, lam, gamma = Float::from(1.0)))]
+    fn new(p: Int, q: Int, lam: Float, gamma: Float) -> PyResult<Self> {
+        let (p, q) = (p.get("p")?, q.get("q")?);
+        let (lam, gamma) = (lam.get("lam")?, gamma.get("gamma")?);
+        // β (q × p) and P (p × p).
+        check_alloc(|| format!("Rls(p={p}, q={q})"), &[(p, p), (q, p)])?;
         ols_core::Rls::new(p, q, lam, gamma)
             .map(|inner| Self { inner })
             .map_err(ols_error)
@@ -340,7 +399,9 @@ impl Rls {
         x: PyReadonlyArray1<'_, f64>,
         y: PyReadonlyArray1<'_, f64>,
     ) -> PyResult<()> {
-        self.inner.update(&vec1(&x), &vec1(&y)).map_err(ols_error)
+        self.inner
+            .update(&vec1(&x, "x")?, &vec1(&y, "y")?)
+            .map_err(ols_error)
     }
 
     /// The forecast `β x`, shape (q,).
@@ -349,7 +410,7 @@ impl Rls {
         py: Python<'py>,
         x: PyReadonlyArray1<'_, f64>,
     ) -> PyResult<Bound<'py, PyArray1<f64>>> {
-        let f = self.inner.predict(&vec1(&x)).map_err(ols_error)?;
+        let f = self.inner.predict(&vec1(&x, "x")?).map_err(ols_error)?;
         Ok(dvector(py, &f))
     }
 
@@ -468,27 +529,45 @@ pub struct Matrix {
 impl Matrix {
     /// An empty memory for states in Rᵖ and outcomes in Rᵠ, with blocks of `2**block_log2`
     /// entries. The block size only trades memory for scan length; reads are exact either way.
+    ///
+    /// `MAX_ALLOC_BYTES` bounds one tree node (p² + qp + p + 2q + 1 floats), not the memory:
+    /// that grows by p + q floats per entry and by one node per closed block, as long as
+    /// entries are pushed.
     #[new]
-    #[pyo3(signature = (p, q, *, block_log2 = 6))]
-    fn new(p: usize, q: usize, block_log2: u32) -> PyResult<Self> {
+    #[pyo3(signature = (p, q, *, block_log2 = Int::from(6)))]
+    fn new(p: Int, q: Int, block_log2: Int) -> PyResult<Self> {
+        let (p, q) = (p.get("p")?, q.get("q")?);
+        let block_log2 = block_log2.get("block_log2")?;
+        // Every closed block adds tree nodes of this size: refuse the shape now, not at the
+        // push that closes the first block.
+        check_alloc(
+            || format!("Matrix(p={p}, q={q}): one tree node"),
+            &stats_blocks(p, q),
+        )?;
         ols_core::Matrix::new(p, q, block_log2)
             .map(|inner| Self { inner })
             .map_err(ols_error)
     }
 
-    /// Appends one entry whose outcome `y` for state `x` became known at `time` (ms, UTC).
+    /// Appends one entry whose outcome `y` for state `x` became known at `time` (ms, UTC). A
+    /// time at or above `MICROSECOND_TIMES_FROM` is refused first, as `simulate` refuses one.
     fn push(
         &mut self,
-        time: i64,
+        time: Int,
         x: PyReadonlyArray1<'_, f64>,
         y: PyReadonlyArray1<'_, f64>,
     ) -> PyResult<()> {
+        let time: i64 = time.get("time")?;
+        if time >= MICROSECOND_TIMES_FROM {
+            return Err(microseconds("time", time));
+        }
         self.inner
-            .push(time, &vec1(&x), &vec1(&y))
+            .push(time, &vec1(&x, "x")?, &vec1(&y, "y")?)
             .map_err(ols_error)
     }
 
-    /// Appends n entries at once, or none: `times` (n,), `xs` (n, p), `ys` (n, q). The error is
+    /// Appends n entries at once, or none: `times` (n,), `xs` (n, p), `ys` (n, q). The shapes
+    /// are checked first, then the unit of every time as in `push`; past those, the error is
     /// the one the first failing `push` would raise.
     fn extend(
         &mut self,
@@ -496,15 +575,20 @@ impl Matrix {
         xs: PyReadonlyArray2<'_, f64>,
         ys: PyReadonlyArray2<'_, f64>,
     ) -> PyResult<()> {
-        let times = vec1(&times);
         let (p, q) = self.inner.dims();
-        let (nx, px, xs) = rows2(&xs);
-        let (ny, qy, ys) = rows2(&ys);
-        for (expected, got) in [(p, px), (q, qy), (times.len(), nx), (times.len(), ny)] {
+        let ((nx, px), (ny, qy)) = (shape2(&xs), shape2(&ys));
+        let nt = times.len();
+        for (expected, got) in [(p, px), (q, qy), (nt, nx), (nt, ny)] {
             if expected != got {
                 return Err(shape_error(expected, got));
             }
         }
+        let times = vec1(&times, "times")?;
+        if let Some((i, t)) = convert::first_microsecond_time(&times) {
+            return Err(microseconds(&format!("times[{i}]"), t));
+        }
+        let (_, _, xs) = rows2(&xs, "xs")?;
+        let (_, _, ys) = rows2(&ys, "ys")?;
         convert::extend_matrix(&mut self.inner, &times, &xs, &ys).map_err(ols_error)
     }
 
@@ -535,15 +619,24 @@ impl Matrix {
         PyArray1::from_vec(py, t)
     }
 
-    /// Index range `(start, end)` of the entries with `from_time <= time <= as_of`.
-    fn time_range(&self, from_time: i64, as_of: i64) -> (usize, usize) {
-        self.inner.time_range(from_time, as_of)
+    /// Index range `(start, end)` of the entries with `from_time <= time <= as_of`. Both bounds
+    /// are milliseconds, refused at or above `MICROSECOND_TIMES_FROM` as in `push`: an `as_of`
+    /// in microseconds would silently expose every entry, a look-ahead. `i64::MIN` stays a valid
+    /// `from_time`.
+    fn time_range(&self, from_time: Int, as_of: Int) -> PyResult<(usize, usize)> {
+        let (from_time, as_of): (i64, i64) = (from_time.get("from_time")?, as_of.get("as_of")?);
+        for (name, t) in [("from_time", from_time), ("as_of", as_of)] {
+            if t >= MICROSECOND_TIMES_FROM {
+                return Err(microseconds(name, t));
+            }
+        }
+        Ok(self.inner.time_range(from_time, as_of))
     }
 
     /// The statistics of entries `[start, end)`.
-    fn range_stats(&self, start: usize, end: usize) -> PyResult<SuffStats> {
+    fn range_stats(&self, start: Int, end: Int) -> PyResult<SuffStats> {
         self.inner
-            .range_stats(start, end)
+            .range_stats(start.get("start")?, end.get("end")?)
             .map(|inner| SuffStats { inner })
             .map_err(ols_error)
     }
@@ -552,12 +645,13 @@ impl Matrix {
     fn query(
         &self,
         x_q: PyReadonlyArray1<'_, f64>,
-        start: usize,
-        end: usize,
+        start: Int,
+        end: Int,
         cfg: &RidgeConfig,
     ) -> PyResult<Readout> {
+        let (start, end) = (start.get("start")?, end.get("end")?);
         self.inner
-            .query(&vec1(&x_q), start, end, &cfg.inner)
+            .query(&vec1(&x_q, "x_q")?, start, end, &cfg.inner)
             .map(|inner| Readout { inner })
             .map_err(ols_error)
     }
@@ -577,9 +671,10 @@ impl Matrix {
         &self,
         py: Python<'py>,
         readout: &Readout,
-        start: usize,
-        end: usize,
+        start: Int,
+        end: Int,
     ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let (start, end) = (start.get("start")?, end.get("end")?);
         let c = self
             .inner
             .contribution(&readout.inner, start, end)
@@ -588,9 +683,9 @@ impl Matrix {
     }
 
     /// The summary of entries `[start, end)`.
-    fn summarize(&self, start: usize, end: usize, cfg: &RidgeConfig) -> PyResult<Summary> {
+    fn summarize(&self, start: Int, end: Int, cfg: &RidgeConfig) -> PyResult<Summary> {
         self.inner
-            .summarize(start, end, &cfg.inner)
+            .summarize(start.get("start")?, end.get("end")?, &cfg.inner)
             .map(|inner| Summary { inner })
             .map_err(ols_error)
     }

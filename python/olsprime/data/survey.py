@@ -154,8 +154,7 @@ def _markdown_table(header: Sequence[str], rows: Iterable[Sequence[object]]) -> 
 
 def _quality_section(title: str, reports: list[dict]) -> list[str]:
     total = aggregate(reports)
-    out = [f"### {title}
-"]
+    out = [f"### {title}\n"]
     out.append(
         _markdown_table(
             ["pairs", "rows", "gaps (pairs with)", "missing bars", "duplicates", "non-monotonic", "OHLC", "off-grid", "bad close", "volume", "clean pairs"],
@@ -164,9 +163,7 @@ def _quality_section(title: str, reports: list[dict]) -> list[str]:
               total["bad_close_time"], total["invalid_volume"], total["clean_pairs"]]],
         )  # fmt: skip
     )
-    out.append("
-Ten worst pairs (most gaps, duplicates and other problems):
-")
+    out.append("\nTen worst pairs (most gaps, duplicates and other problems):\n")
     out.append(
         _markdown_table(
             ["pair", "rows", "gaps", "missing bars", "duplicates", "non-monotonic", "OHLC", "off-grid", "bad close", "volume"],
@@ -193,16 +190,12 @@ def render(data_dir: Path, top_n: int = 30, intervals: Sequence[str] = ("1h", "1
     if universe is not None:
         summary = universe_summary(universe)
         out.append(
-            f"### Universe
-
-{summary['rebalances']} rebalances, {summary['first']:%Y-%m} to {summary['last']:%Y-%m}; "
+            f"### Universe\n\n{summary['rebalances']} rebalances, {summary['first']:%Y-%m} to {summary['last']:%Y-%m}; "
             f"members per month: min {summary['min']}, median {summary['median']}, max {summary['max']}; "
-            f"{summary['distinct']} distinct members.
-"
+            f"{summary['distinct']} distinct members.\n"
         )
         reuse = ticker_reuse(data_dir, sorted(members))
-        out.append("### Likely ticker reuse (members, 1d: gap over 7 days, price level changed by over 50 %)
-")
+        out.append("### Likely ticker reuse (members, 1d: gap over 7 days, price level changed by over 50 %)\n")
         out.append(
             _markdown_table(
                 ["pair", "gap starts", "gap days", "close before", "open after", "ratio"],
@@ -211,8 +204,7 @@ def render(data_dir: Path, top_n: int = 30, intervals: Sequence[str] = ("1h", "1
             if reuse
             else "none"
         )
-    return "
-".join(out)
+    return "\n".join(out)
 
 
 def main(argv: Sequence[str] | None = None) -> int:

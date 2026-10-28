@@ -5,40 +5,9 @@
 //! A float, a `bool` or a value outside the field's Rust type is refused, with the field's name:
 //! a silent rounding or wrap-around here would be a wrong order.
 
-use pyo3::exceptions::{PyOverflowError, PyTypeError, PyValueError};
 use pyo3::prelude::*;
-use pyo3::types::PyBool;
 
-/// An exact integer of type `T` from a Python `int` (or any `__index__` integer, numpy's
-/// included).
-fn int_field<T>(obj: &Bound<'_, PyAny>, field: &str) -> PyResult<T>
-where
-    T: TryFrom<i128>,
-{
-    if obj.is_instance_of::<PyBool>() {
-        return Err(PyTypeError::new_err(format!(
-            "{field} must be an int, got bool"
-        )));
-    }
-    let wide: i128 = obj.extract().map_err(|e: PyErr| {
-        let py = obj.py();
-        if e.is_instance_of::<PyOverflowError>(py) {
-            PyValueError::new_err(format!("{field} is out of range: {obj}"))
-        } else {
-            let ty = obj
-                .get_type()
-                .name()
-                .map_or_else(|_| "?".to_owned(), |n| n.to_string());
-            PyTypeError::new_err(format!("{field} must be an int, got {ty}"))
-        }
-    })?;
-    T::try_from(wide).map_err(|_| {
-        PyValueError::new_err(format!(
-            "{field} = {wide} is out of range for {}",
-            std::any::type_name::<T>()
-        ))
-    })
-}
+use super::Int;
 
 /// Order direction.
 #[pyclass(module = "olsprime_rs", frozen, eq, eq_int, hash, from_py_object)]
@@ -124,18 +93,18 @@ impl Account {
     #[new]
     #[pyo3(signature = (*, equity, peak_equity, day_start_equity, position, bars_since_order))]
     fn new(
-        equity: &Bound<'_, PyAny>,
-        peak_equity: &Bound<'_, PyAny>,
-        day_start_equity: &Bound<'_, PyAny>,
-        position: &Bound<'_, PyAny>,
-        bars_since_order: &Bound<'_, PyAny>,
+        equity: Int,
+        peak_equity: Int,
+        day_start_equity: Int,
+        position: Int,
+        bars_since_order: Int,
     ) -> PyResult<Self> {
         Ok(Self {
-            equity: int_field(equity, "equity")?,
-            peak_equity: int_field(peak_equity, "peak_equity")?,
-            day_start_equity: int_field(day_start_equity, "day_start_equity")?,
-            position: int_field(position, "position")?,
-            bars_since_order: int_field(bars_since_order, "bars_since_order")?,
+            equity: equity.get("equity")?,
+            peak_equity: peak_equity.get("peak_equity")?,
+            day_start_equity: day_start_equity.get("day_start_equity")?,
+            position: position.get("position")?,
+            bars_since_order: bars_since_order.get("bars_since_order")?,
         })
     }
 
@@ -185,22 +154,22 @@ impl Limits {
     ))]
     #[allow(clippy::too_many_arguments)]
     fn new(
-        max_position: &Bound<'_, PyAny>,
-        max_order: &Bound<'_, PyAny>,
-        min_order: &Bound<'_, PyAny>,
-        lot_step: &Bound<'_, PyAny>,
-        max_daily_loss: &Bound<'_, PyAny>,
-        max_drawdown_bps: &Bound<'_, PyAny>,
-        cooldown_bars: &Bound<'_, PyAny>,
+        max_position: Int,
+        max_order: Int,
+        min_order: Int,
+        lot_step: Int,
+        max_daily_loss: Int,
+        max_drawdown_bps: Int,
+        cooldown_bars: Int,
     ) -> PyResult<Self> {
         Ok(Self {
-            max_position: int_field(max_position, "max_position")?,
-            max_order: int_field(max_order, "max_order")?,
-            min_order: int_field(min_order, "min_order")?,
-            lot_step: int_field(lot_step, "lot_step")?,
-            max_daily_loss: int_field(max_daily_loss, "max_daily_loss")?,
-            max_drawdown_bps: int_field(max_drawdown_bps, "max_drawdown_bps")?,
-            cooldown_bars: int_field(cooldown_bars, "cooldown_bars")?,
+            max_position: max_position.get("max_position")?,
+            max_order: max_order.get("max_order")?,
+            min_order: min_order.get("min_order")?,
+            lot_step: lot_step.get("lot_step")?,
+            max_daily_loss: max_daily_loss.get("max_daily_loss")?,
+            max_drawdown_bps: max_drawdown_bps.get("max_drawdown_bps")?,
+            cooldown_bars: cooldown_bars.get("cooldown_bars")?,
         })
     }
 
@@ -245,11 +214,11 @@ pub struct OrderRequest {
 impl OrderRequest {
     #[new]
     #[pyo3(signature = (*, side, qty, price))]
-    fn new(side: Side, qty: &Bound<'_, PyAny>, price: &Bound<'_, PyAny>) -> PyResult<Self> {
+    fn new(side: Side, qty: Int, price: Int) -> PyResult<Self> {
         Ok(Self {
             side,
-            qty: int_field(qty, "qty")?,
-            price: int_field(price, "price")?,
+            qty: qty.get("qty")?,
+            price: price.get("price")?,
         })
     }
 

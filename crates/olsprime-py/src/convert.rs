@@ -75,15 +75,105 @@ pub fn custom_fee(name: &str, maker: f64, taker: f64) -> Result<FeeSchedule, Fee
     })
 }
 
-/// Bar columns of unequal length. The simulator's own [`backtest::SimError::LengthMismatch`]
-/// covers targets against bars; this covers the columns of the bars themselves, which the
-/// simulator never sees as columns.
+/// The first bar time [`BarColumns::to_bars`] refuses: 10¹⁴.
+///
+/// Why: Binance's spot files switched from milliseconds to microseconds on 2025-01-01
+/// (`docs/PROTOCOL.md`). Every time of the bench is in milliseconds, and nothing in the
+/// simulator tells the units apart, since only the order of the times matters to it. A series
+/// left in microseconds would still simulate, but every bar length derived from it, hence every
+/// annualized figure, would be off by 10³. In milliseconds 10¹⁴ is the year 5138; in
+/// microseconds it is 1973, before any crypto market. So every real time in microseconds is
+/// above it and every real time in milliseconds below it.
+pub const MICROSECOND_TIMES_FROM: i64 = 100_000_000_000_000;
+
+/// The first time in a batch of Matrix times that is at or above [`MICROSECOND_TIMES_FROM`],
+/// as `(index, time)`. Matrix times are milliseconds like bar times, for the same reason: a
+/// memory stamped in microseconds would read every lookback in milliseconds a thousand times
+/// too short.
+pub fn first_microsecond_time(times: &[i64]) -> Option<(usize, i64)> {
+    times
+        .iter()
+        .copied()
+        .enumerate()
+        .find(|&(_, t)| t >= MICROSECOND_TIMES_FROM)
+}
+
+/// The most bytes the bindings let one array or one object take when a caller's shape sets its
+/// size: 1 GiB.
+///
+/// Why: a failed allocation does not raise in Rust, it aborts the process, and the Python
+/// interpreter with it. `SuffStats(2**20, 1)` asks for a 2²⁰ × 2²⁰ Gram matrix, 8 TiB, and
+/// numpy's zero-stride views make an array of any logical size free to build. So every
+/// allocation whose size comes from a caller's shape is sized first, in exact arithmetic, and
+/// refused above this limit before anything is allocated. 1 GiB is a p of about 11,500 for a
+/// Gram matrix, two orders of magnitude above any state the protocol uses, and small enough
+/// that a handful of such objects fit the 15 GB of the development machine.
+pub const MAX_ALLOC_BYTES: u64 = 1 << 30;
+
+/// The bytes of `Σ rows · cols` float64 values (or of any 8-byte element), exactly, or `None`
+/// if the count does not fit in `u128`, which no machine can allocate anyway.
+pub fn f64_bytes(blocks: &[(usize, usize)]) -> Option<u128> {
+    blocks.iter().try_fold(0u128, |acc, &(rows, cols)| {
+        // usize is at most 64 bits on every target Rust supports, so these widenings are exact.
+        let floats = (rows as u128).checked_mul(cols as u128)?;
+        acc.checked_add(floats.checked_mul(8)?)
+    })
+}
+
+/// The float64 blocks of one [`ols_core::SuffStats`] (or one Matrix tree node): the p × p Gram
+/// matrix, the q × p cross matrix, `sum_x`, `sum_y`, `sum_yy` and the weight.
+pub fn stats_blocks(p: usize, q: usize) -> [(usize, usize); 5] {
+    [(p, p), (q, p), (p, 1), (q, 2), (1, 1)]
+}
+
+/// An allocation sized by a caller's shape above [`MAX_ALLOC_BYTES`].
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-#[error("column {column} has {got} values but open_time has {expected}")]
-pub struct ColumnError {
-    pub column: &'static str,
-    pub expected: usize,
-    pub got: usize,
+#[error(
+    "{what} would take {} bytes, above the limit MAX_ALLOC_BYTES = {MAX_ALLOC_BYTES} (1 GiB)",
+    bytes.map_or_else(|| "more than 2^128".to_owned(), |b| b.to_string())
+)]
+pub struct TooLarge {
+    /// The object and the arguments that size it, e.g. `"SuffStats(p=1048576, q=1)"`.
+    pub what: String,
+    /// The exact size, or `None` beyond `u128`.
+    pub bytes: Option<u128>,
+}
+
+/// `Ok` if the blocks fit in [`MAX_ALLOC_BYTES`], else the error naming `what`. Only builds
+/// the name on failure.
+pub fn check_alloc(
+    what: impl FnOnce() -> String,
+    blocks: &[(usize, usize)],
+) -> Result<(), TooLarge> {
+    let bytes = f64_bytes(blocks);
+    match bytes {
+        Some(b) if b <= u128::from(MAX_ALLOC_BYTES) => Ok(()),
+        _ => Err(TooLarge {
+            what: what(),
+            bytes,
+        }),
+    }
+}
+
+/// Why bar columns were refused before the simulator saw them. The simulator's own
+/// [`backtest::SimError`] covers everything else, and only its error carries its message.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum ColumnError {
+    /// Bar columns of unequal length. [`backtest::SimError::LengthMismatch`] covers targets
+    /// against bars; this covers the columns of the bars themselves, which the simulator never
+    /// sees as columns.
+    #[error("column {column} has {got} values but open_time has {expected}")]
+    Length {
+        column: &'static str,
+        expected: usize,
+        got: usize,
+    },
+    /// A bar time at or above [`MICROSECOND_TIMES_FROM`].
+    #[error(
+        "open_time[{index}] = {time} looks like microseconds: bar times are milliseconds since \
+         the epoch, and every time >= 10^14 (the year 5138 in ms, 1973 in us) is refused"
+    )]
+    Microseconds { index: usize, time: i64 },
 }
 
 /// The six columns of a bar series, borrowed.
@@ -98,8 +188,9 @@ pub struct BarColumns<'a> {
 }
 
 impl BarColumns<'_> {
-    /// The bars, row by row. Only the lengths are checked here; prices, volumes and times are
-    /// the simulator's to validate, so that its error is the one the caller sees.
+    /// The bars, row by row. The lengths are checked here, and the unit of the times (see
+    /// [`MICROSECOND_TIMES_FROM`]); prices, volumes and the order of the times are the
+    /// simulator's to validate, so that its error is the one the caller sees.
     pub fn to_bars(&self) -> Result<Vec<Bar>, ColumnError> {
         let n = self.open_time.len();
         for (column, values) in [
@@ -110,12 +201,20 @@ impl BarColumns<'_> {
             ("volume", self.volume),
         ] {
             if values.len() != n {
-                return Err(ColumnError {
+                return Err(ColumnError::Length {
                     column,
                     expected: n,
                     got: values.len(),
                 });
             }
+        }
+        if let Some((index, &time)) = self
+            .open_time
+            .iter()
+            .enumerate()
+            .find(|&(_, &t)| t >= MICROSECOND_TIMES_FROM)
+        {
+            return Err(ColumnError::Microseconds { index, time });
         }
         Ok((0..n)
             .map(|i| Bar {
@@ -284,6 +383,57 @@ mod tests {
     use proptest::prelude::*;
 
     #[test]
+    fn the_audit_shapes_are_refused_and_real_ones_pass() {
+        // SuffStats(2**20, 1): 2^40 + 2^20 + 2^20 + 2 + 1 floats.
+        let huge = check_alloc(
+            || "SuffStats(p=1048576, q=1)".to_owned(),
+            &stats_blocks(1 << 20, 1),
+        );
+        let err = huge.unwrap_err();
+        assert_eq!(err.bytes, Some(8 * ((1u128 << 40) + (1 << 21) + 3)));
+        assert_eq!(
+            err.to_string(),
+            "SuffStats(p=1048576, q=1) would take 8796109799448 bytes, above the limit \
+             MAX_ALLOC_BYTES = 1073741824 (1 GiB)"
+        );
+        // usize::MAX squared overflows u128 only after the factor 8: still refused, no panic.
+        let beyond = check_alloc(
+            String::new,
+            &[(usize::MAX, usize::MAX), (usize::MAX, usize::MAX)],
+        );
+        assert_eq!(beyond.unwrap_err().bytes, None);
+        // A protocol-sized memory and the largest Gram under the limit pass.
+        assert!(check_alloc(String::new, &stats_blocks(64, 4)).is_ok());
+        assert!(check_alloc(String::new, &[(1 << 13, 1 << 14)]).is_ok());
+        assert!(check_alloc(String::new, &[(1 << 13, (1 << 14) + 1)]).is_err());
+        assert!(check_alloc(String::new, &[]).is_ok());
+    }
+
+    #[test]
+    fn the_microsecond_message_reads_as_one_line() {
+        let e = ColumnError::Microseconds {
+            index: 0,
+            time: MICROSECOND_TIMES_FROM,
+        };
+        let text = e.to_string();
+        assert!(!text.contains("  "), "{text}");
+        assert!(text.contains("milliseconds since the epoch"), "{text}");
+    }
+
+    #[test]
+    fn first_microsecond_time_finds_the_first_at_or_above_the_boundary() {
+        assert_eq!(first_microsecond_time(&[]), None);
+        assert_eq!(
+            first_microsecond_time(&[0, MICROSECOND_TIMES_FROM - 1]),
+            None
+        );
+        assert_eq!(
+            first_microsecond_time(&[i64::MIN, MICROSECOND_TIMES_FROM, i64::MAX]),
+            Some((1, MICROSECOND_TIMES_FROM))
+        );
+    }
+
+    #[test]
     fn python_defaults_are_the_simulator_defaults() {
         let cfg = SimConfig::new(1.0, FeeSchedule::ZERO);
         assert_eq!(cfg.slippage_bps.to_bits(), DEFAULT_SLIPPAGE_BPS.to_bits());
@@ -351,7 +501,7 @@ mod tests {
         };
         assert_eq!(
             cols.to_bars(),
-            Err(ColumnError {
+            Err(ColumnError::Length {
                 column: "low",
                 expected: 3,
                 got: 2
@@ -366,6 +516,28 @@ mod tests {
             volume: &[],
         };
         assert_eq!(empty.to_bars(), Ok(vec![]));
+    }
+
+    #[test]
+    fn the_microsecond_boundary_is_the_year_5138_in_ms_and_1973_in_us() {
+        // 365.2425-day Gregorian years from 1970.
+        let year_ms = 31_556_952_000.0;
+        let threshold = MICROSECOND_TIMES_FROM as f64;
+        assert_eq!((1970.0 + threshold / year_ms).floor(), 5138.0);
+        assert_eq!((1970.0 + threshold / 1e3 / year_ms).floor(), 1973.0);
+        // Binance's first spot kline (2017-08-17) in µs, and 2100-01-01 in ms.
+        let first_kline_us = 1_502_942_400_000_000;
+        let year_2100_ms = 4_102_444_800_000;
+        assert!(first_kline_us >= MICROSECOND_TIMES_FROM && year_2100_ms < MICROSECOND_TIMES_FROM);
+        let err = ColumnError::Microseconds {
+            index: 2,
+            time: first_kline_us,
+        };
+        assert!(
+            err.to_string()
+                .starts_with("open_time[2] = 1502942400000000 looks like microseconds"),
+            "{err}"
+        );
     }
 
     fn any_f64() -> impl Strategy<Value = f64> {
@@ -401,7 +573,7 @@ mod tests {
     proptest! {
         #[test]
         fn bars_keep_every_bit(rows in prop::collection::vec(
-            (any::<i64>(), any_f64(), any_f64(), any_f64(), any_f64(), any_f64()), 0..40)
+            (i64::MIN..MICROSECOND_TIMES_FROM, any_f64(), any_f64(), any_f64(), any_f64(), any_f64()), 0..40)
         ) {
             let col = |k: usize| -> Vec<f64> {
                 rows.iter().map(|r| [r.1, r.2, r.3, r.4, r.5][k]).collect()
@@ -418,6 +590,34 @@ mod tests {
                     &[b.open, b.high, b.low, b.close, b.volume],
                     &[r.1, r.2, r.3, r.4, r.5]
                 ));
+            }
+        }
+
+        /// A series is refused exactly when one of its times is at or above 10¹⁴, and the
+        /// error points at the first such time. Times are drawn around the boundary and from
+        /// real ms and µs ranges.
+        #[test]
+        fn microsecond_times_are_refused_at_the_first(times in prop::collection::vec(
+            prop_oneof![
+                Just(MICROSECOND_TIMES_FROM - 1),
+                Just(MICROSECOND_TIMES_FROM),
+                Just(i64::MAX),
+                Just(i64::MIN),
+                1_500_000_000_000i64..1_900_000_000_000,
+                1_500_000_000_000_000i64..1_900_000_000_000_000,
+                any::<i64>(),
+            ],
+            0..12,
+        )) {
+            let v = vec![1.0; times.len()];
+            let got = BarColumns { open_time: &times, open: &v, high: &v, low: &v, close: &v, volume: &v }
+                .to_bars();
+            match times.iter().position(|&t| t >= MICROSECOND_TIMES_FROM) {
+                Some(index) => prop_assert_eq!(
+                    got,
+                    Err(ColumnError::Microseconds { index, time: times[index] })
+                ),
+                None => prop_assert_eq!(got.map(|b| b.len()), Ok(times.len())),
             }
         }
 
@@ -527,5 +727,21 @@ mod tests {
         assert!(m.is_empty());
         extend_matrix(&mut m, &[], &[], &[]).unwrap();
         assert!(m.is_empty());
+    }
+
+    proptest! {
+        /// The checked size is the exact one whenever it fits, and the check agrees with it.
+        #[test]
+        fn f64_bytes_is_exact(blocks in prop::collection::vec((any::<usize>(), any::<usize>()), 0..4)) {
+            // Reference: count the floats first, then the bytes. 8 · Σ fits iff every partial
+            // sum of 8 · rᵢcᵢ does, so both orders agree on `None` too.
+            let floats: Option<u128> = blocks
+                .iter()
+                .try_fold(0u128, |acc, &(r, c)| acc.checked_add((r as u128).checked_mul(c as u128)?));
+            let exact = floats.and_then(|f| f.checked_mul(8));
+            prop_assert_eq!(f64_bytes(&blocks), exact);
+            let fits = exact.is_some_and(|b| b <= u128::from(MAX_ALLOC_BYTES));
+            prop_assert_eq!(check_alloc(String::new, &blocks).is_ok(), fits);
+        }
     }
 }

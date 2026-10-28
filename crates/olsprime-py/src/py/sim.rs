@@ -1,12 +1,12 @@
 //! `simulate`, its result, its metrics and the fee schedules.
 
 use backtest::metrics as bm;
-use numpy::{PyArray1, PyReadonlyArray1};
+use numpy::{PyArray1, PyReadonlyArray1, PyUntypedArrayMethods};
 use pyo3::exceptions::{PyTypeError, PyValueError};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyString};
 
-use super::{sim_error, vec1};
+use super::{Float, Int, check_alloc, sim_error, vec1};
 use crate::convert::{self, BarColumns, FillColumns};
 
 /// A venue's spot fee schedule. Built-in schedules come from `FeeSchedule.named` or the class
@@ -48,8 +48,8 @@ impl FeeSchedule {
     /// A custom schedule. Rates are fractions of notional in [0, 1); built-in names are
     /// reserved.
     #[new]
-    fn new(name: String, maker: f64, taker: f64) -> PyResult<Self> {
-        let inner = convert::custom_fee(&name, maker, taker)
+    fn new(name: String, maker: Float, taker: Float) -> PyResult<Self> {
+        let inner = convert::custom_fee(&name, maker.get("maker")?, taker.get("taker")?)
             .map_err(|e| PyValueError::new_err(e.to_string()))?;
         Ok(Self { name, inner })
     }
@@ -271,11 +271,16 @@ impl Fills {
 }
 
 /// Runs a long/flat spot strategy; see `backtest::simulate` for the execution model.
+///
+/// Before the simulator sees the bars, the columns must have one length and every `open_time`
+/// must be below [`convert::MICROSECOND_TIMES_FROM`]: a microsecond series is refused rather
+/// than simulated with bar lengths 10³ too long.
 #[pyfunction]
 #[pyo3(signature = (
     open_time, open, high, low, close, volume, targets, *,
-    initial_cash, fees, liquidity = "taker", slippage_bps = 2.0,
-    min_notional = 0.0, step_size = 0.0, rebalance_threshold = 0.0,
+    initial_cash, fees, liquidity = "taker", slippage_bps = Float::from(2.0),
+    min_notional = Float::from(0.0), step_size = Float::from(0.0),
+    rebalance_threshold = Float::from(0.0),
 ))]
 #[allow(clippy::too_many_arguments)]
 fn simulate(
@@ -287,30 +292,39 @@ fn simulate(
     close: PyReadonlyArray1<'_, f64>,
     volume: PyReadonlyArray1<'_, f64>,
     targets: PyReadonlyArray1<'_, f64>,
-    initial_cash: f64,
+    initial_cash: Float,
     fees: &Bound<'_, PyAny>,
     liquidity: &str,
-    slippage_bps: f64,
-    min_notional: f64,
-    step_size: f64,
-    rebalance_threshold: f64,
+    slippage_bps: Float,
+    min_notional: Float,
+    step_size: Float,
+    rebalance_threshold: Float,
 ) -> PyResult<SimResult> {
-    let mut cfg = backtest::SimConfig::new(initial_cash, FeeSchedule::resolve(fees)?);
+    let mut cfg = backtest::SimConfig::new(
+        initial_cash.get("initial_cash")?,
+        FeeSchedule::resolve(fees)?,
+    );
     cfg.liquidity = liquidity_arg(liquidity)?;
-    cfg.slippage_bps = slippage_bps;
+    cfg.slippage_bps = slippage_bps.get("slippage_bps")?;
     cfg.filters = backtest::SymbolFilters {
-        min_notional,
-        step_size,
+        min_notional: min_notional.get("min_notional")?,
+        step_size: step_size.get("step_size")?,
     };
-    cfg.rebalance_threshold = rebalance_threshold;
+    cfg.rebalance_threshold = rebalance_threshold.get("rebalance_threshold")?;
 
+    // The rows of bars are the largest copy, six words per bar: size it before any copy.
+    let n = open_time.len();
+    check_alloc(
+        || format!("open_time ({n} bars)"),
+        &[(n, size_of::<backtest::Bar>().div_ceil(8))],
+    )?;
     let (t, o, h, l, c, v) = (
-        vec1(&open_time),
-        vec1(&open),
-        vec1(&high),
-        vec1(&low),
-        vec1(&close),
-        vec1(&volume),
+        vec1(&open_time, "open_time")?,
+        vec1(&open, "open")?,
+        vec1(&high, "high")?,
+        vec1(&low, "low")?,
+        vec1(&close, "close")?,
+        vec1(&volume, "volume")?,
     );
     let bars = BarColumns {
         open_time: &t,
@@ -322,7 +336,7 @@ fn simulate(
     }
     .to_bars()
     .map_err(|e| PyValueError::new_err(e.to_string()))?;
-    let targets = vec1(&targets);
+    let targets = vec1(&targets, "targets")?;
     // The inputs are owned copies now: the loop runs without the interpreter lock.
     let inner = py
         .detach(move || backtest::simulate(&bars, &targets, &cfg))
@@ -400,7 +414,8 @@ impl Metrics {
 
 /// `backtest::metrics::compute`, annualizing with `periods_per_year`.
 #[pyfunction]
-fn metrics(result: &SimResult, periods_per_year: f64) -> PyResult<Metrics> {
+fn metrics(result: &SimResult, periods_per_year: Float) -> PyResult<Metrics> {
+    let periods_per_year = periods_per_year.get("periods_per_year")?;
     // `compute` asserts this; a panic must not reach Python.
     if !(periods_per_year.is_finite() && periods_per_year > 0.0) {
         return Err(PyValueError::new_err(format!(
@@ -412,7 +427,8 @@ fn metrics(result: &SimResult, periods_per_year: f64) -> PyResult<Metrics> {
 
 /// Bars per year for a bar length of `bar_ms` milliseconds (365-day years).
 #[pyfunction]
-fn periods_per_year(bar_ms: i64) -> PyResult<f64> {
+fn periods_per_year(bar_ms: Int) -> PyResult<f64> {
+    let bar_ms: i64 = bar_ms.get("bar_ms")?;
     if bar_ms <= 0 {
         return Err(PyValueError::new_err(format!(
             "bar length must be positive, got {bar_ms} ms"
@@ -423,8 +439,8 @@ fn periods_per_year(bar_ms: i64) -> PyResult<f64> {
 
 /// Largest peak-to-trough loss of an equity curve, in [0, 1].
 #[pyfunction]
-fn max_drawdown(equity: PyReadonlyArray1<'_, f64>) -> f64 {
-    bm::max_drawdown(&vec1(&equity))
+fn max_drawdown(equity: PyReadonlyArray1<'_, f64>) -> PyResult<f64> {
+    Ok(bm::max_drawdown(&vec1(&equity, "equity")?))
 }
 
 pub(super) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {

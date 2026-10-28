@@ -67,7 +67,7 @@ Matrix stores every entry `(zᵢ, yᵢ, tᵢ)` in time order.
   ```
   S = (n, Σz, Σzzᵀ, Σyzᵀ, Σy, Σy²).
   ```
-- **Roll-up.** When two sibling nodes are finished, they merge into their parent, like the carries of a binary counter. The statistics are sums, so merging is addition.
+- **Roll-up.** When two sibling nodes are finished, they merge into their parent, like the carries of a binary counter. The statistics are sums, so merging is addition. The raw entries stay in the log: the tree is built over them, and the per-entry weights need them.
 - **Ranges.** A range of entries `[l, r)` is covered by at most two partial blocks, scanned directly, plus O(log n) nodes.
 
 For any period R, this gives:
@@ -75,7 +75,7 @@ For any period R, this gives:
 - the exact signed contribution of any sub-period, down to a single day;
 - a one-line summary of the period: its own regression `β_R`, its mean outcome and its residual variance.
 
-This is OptMem's idea — an append-only log whose older entries are rolled up into a binary tree of summaries — with summaries that are exact instead of written by a model.
+This is OptMem's idea — an append-only log with a binary tree of summaries built over it — with summaries that are exact instead of written by a model. Unlike OptMem, nothing is compacted away.
 
 **Causality.** A decision taken at t over horizon h has an outcome known only at t + h. The entry joins Matrix then, never before.
 
@@ -99,11 +99,11 @@ Tokens embed (asset × time patch) pairs from a window that lies entirely in the
 W = Q (KᵀK + λI)⁻¹ Kᵀ,     O = W V.
 ```
 
-The rows of W sum to one under the two conditions of §1, and not otherwise:
+The rows of W sum to one under the two conditions of §1:
 - the constant key coordinate is unpenalized, `Λ = diag(0, λ, …, λ)` rather than `λI`;
 - every query has 1 in that coordinate.
 
-A constant key column under `λI` gives rows that do not sum to one.
+In general they do not otherwise. Take a constant key column under `λI`, and a query q with 1 in that coordinate. Since `Kᵀ1 = KᵀK e₀`, its row sums to `1 − λ·e₀ᵀ(KᵀK + λI)⁻¹ q`, where e₀ picks the constant coordinate. That is 1 only at λ = 0, or in special cases such as a dual direction `(KᵀK + λI)⁻¹ q` with no constant component.
 
 Design constraints:
 - `T ≫ d_head`; otherwise `K (KᵀK)⁻¹ Kᵀ ≈ I` and the head copies its input;
@@ -145,7 +145,7 @@ Matrix already adapts without gradients: every realized outcome joins the memory
 - Each one counts as a variant for the deflated Sharpe.
 - H10–H12 register them.
 
-**λ from the statistics alone.** Ridge has a closed form for every λ once `G = VDVᵀ` is diagonalized, at O(p³) once and O(p) per λ (for q = 1, with `c̃ = Vᵀc`):
+**λ from the statistics alone.** With the penalty `Λ = λI`, ridge has a closed form for every λ once `G = VDVᵀ` is diagonalized, at O(p³) once and O(p) per λ (for q = 1, with `c̃ = Vᵀc`). With the free intercept of §1, `Λ = diag(0, λ, …)`, `G + Λ` is no longer a shift of G's spectrum, so the formulas apply only to statistics centred first. These are the centred nodes planned in §3, with the intercept solved apart.
 - `tr H(λ) = Σⱼ dⱼ/(dⱼ + λ)`;
 - `RSS(λ) = Σy² − Σⱼ c̃ⱼ²·(dⱼ + 2λ)/(dⱼ + λ)²`.
 
@@ -177,3 +177,8 @@ Two timescales follow: Matrix and the readout weights at every bar, gradient-fre
   - §3 records the cancellation in the residual sum of squares, which the code clamped silently, and the overlap of outcomes when h > 1. Centred nodes are planned for iteration 3.
   - §4 accumulates prefix sums in fp64.
   - §5 makes label smoothing an ablation and recalibrates the rule's probabilities inside the fold.
+  - §7 adds the adaptation loops, after a second review, on self-improvement. They are registered as H10–H12.
+- 2026-10-28: after Audit B of iteration 2.
+  - §3 says that the raw entries stay in the log. Unlike OptMem's, Matrix's tree compacts nothing away.
+  - §4 states the row sum under `λI` exactly: `1 − λ·e₀ᵀ(KᵀK + λI)⁻¹q`.
+  - §7 limits the closed form for GCV to `Λ = λI`, or to centred statistics.

@@ -6,14 +6,18 @@ libraries that calls a reader). A file that may read data is therefore named her
 with a reason, and both guards agree.
 
 Keys are paths relative to ``python/``, exact and never patterns. A rule is a name of
-``findings`` in ``test_protocol.py``. The tripwire maps its triggers onto three of them:
+``findings`` in ``test_protocol.py``. The tripwire maps its triggers onto these:
 
 - ``reader``: Parquet, IPC, Feather and Delta entry points of polars, pyarrow, pandas;
+- ``raw-reader``: CSV, JSON and zip readers (the downloaded archives);
 - ``binary-load``: ``numpy.load(allow_pickle=True)``;
 - ``import:pickle``: ``pickle.load``, ``pickle.loads`` and ``torch.load`` (which unpickles).
 """
 
-ALLOWED: dict[str, dict[str, str]] = {
+from collections.abc import Mapping
+from types import MappingProxyType
+
+_RULES: dict[str, dict[str, str]] = {
     "olsprime/protocol.py": {
         "reader": "the one reader of stored klines and universe tables, always followed by seal",
         "seal": "defines and calls the seal",
@@ -27,19 +31,35 @@ ALLOWED: dict[str, dict[str, str]] = {
         "raw-reader": "writes fake archives",
         "import:zipfile": "writes fake archives",
     },
+    "tests/conftest.py": {
+        "seal-patch": "seals the vault for every test: it unsets the key variable and moves the key folder and the data root",
+        "disarm": "installs the tripwire, checks it at each teardown and takes it down at the end of the session",
+    },
+    "tests/test_manifest.py": {"seal-patch": "opens the vault in a fake tree to show that the manifest counts and logs it"},
     "tests/test_binance_vision.py": {"reader": "reads back the Parquet file the build just wrote"},
     "tests/test_universe.py": {"reader": "reads back the universe file the run just wrote"},
     "tests/test_protocol.py": {
         "reader": "shows that the stored file keeps the vault rows",
         "seal": "tests the seal itself",
+        "disarm": "reads the allow-list and checks that the guard names and the tripwire's agree",
     },
     "tests/tripwire.py": {
         "dynamic": "imports the module of each patched entry point by name",
         "import:pyarrow": "patches pyarrow's Parquet, dataset, IPC and Feather entry points",
         "import:importlib": "finds and imports the optional libraries (pandas, torch) when installed",
+        "disarm": "reads the allow-list it enforces, and unwraps classmethod and staticmethod entry points to wrap them",
     },
     "tests/test_tripwire.py": {
         "exec": "executes a string to show that the tripwire sees code built at run time",
+        "dynamic": "puts stand-in libraries in sys.modules to test the patching mechanism",
         "import:importlib": "imports a helper module written to a temporary folder",
+        "import:runpy": "runs the evasion snippets as files in a temporary folder, outside python/",
+        "seal-patch": "forges the vault keys in a fake tree to show that the tripwire refuses the repository's vault",
+        "disarm": "tests the tripwire from inside: its integrity check, its patches, its guard class",
     },
 }
+
+# Frozen: a test that edits the allow-list would silence both guards for its own file. The tripwire
+# compares this object and a snapshot with the originals at the teardown of every test.
+ALLOWED: Mapping[str, Mapping[str, str]] = MappingProxyType({key: MappingProxyType(dict(rules)) for key, rules in _RULES.items()})
+del _RULES

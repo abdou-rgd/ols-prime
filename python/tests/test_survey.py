@@ -76,3 +76,20 @@ def test_the_report_renders_a_table_per_interval(tmp_path):
     store_daily(tmp_path, "LUNAUSDT", with_gap(utc(2022, 1, 1), 20, 18, 20, "LUNAUSDT", jump=0.001))
     text = survey.render(tmp_path)
     assert "### Quality, 1d" in text and "LUNAUSDT" in text and "| pairs |" in text
+
+
+def test_the_report_with_a_universe_splits_members_from_every_stored_pair(tmp_path):
+    from olsprime.protocol import VAULT
+    from olsprime.universe import UNIVERSE_SCHEMA, universe_path
+
+    store_daily(tmp_path, "LUNAUSDT", with_gap(utc(2022, 1, 1), 20, 18, 20, "LUNAUSDT", jump=0.001))
+    store_daily(tmp_path, "OTHERUSDT", bars(utc(2022, 1, 1), 40, DAY_MS, "OTHERUSDT"))
+    rows = [(utc(2022, 1, 1), 1, "LUNAUSDT", 1e6, 30), (utc(2022, 2, 1), 1, "LUNAUSDT", 1e6, 30), (VAULT.start, 1, "LUNAUSDT", 1e6, 30)]
+    universe = pl.DataFrame(rows, schema=list(UNIVERSE_SCHEMA), orient="row").cast(UNIVERSE_SCHEMA)
+    path = universe_path(tmp_path / "parquet", 30)
+    path.parent.mkdir(parents=True)
+    universe.write_parquet(path)
+    text = survey.render(tmp_path)
+    assert "Quality, 1d (universe members)" in text and "Quality, 1d, every stored pair" in text
+    assert "2 rebalances, 2022-01 to 2022-02" in text  # the vault rebalance is sealed away
+    assert "| LUNAUSDT | 2022-01-21 | 18 |" in text

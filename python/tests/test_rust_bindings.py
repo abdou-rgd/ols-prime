@@ -288,6 +288,158 @@ def test_simulate_equals_the_reference_port_bit_for_bit(cfg: dict, seed: int) ->
             assert same_bits(got, want.astype(np.float64))
 
 
+# --- simulate against the compiled crate: the golden file ----------------------------------
+#
+# crates/backtest/examples/golden.rs runs backtest::simulate itself and writes its inputs and
+# outputs as exact bits; crates/backtest/tests/golden.rs keeps the file equal to what the crate
+# computes today. A port can share a bug with the simulator, the crate cannot.
+
+GOLDEN = Path(__file__).parent / "golden" / "simulate.txt"
+GOLDEN_FORMAT = "format olsprime-golden-simulate 1"
+SCALARS = ("initial_cash", "slippage_bps", "min_notional", "step_size", "rebalance_threshold")
+
+
+def _bits(fields) -> np.ndarray:
+    """16-hex-digit bit patterns as uint64; `.view(np.float64)` gives the floats."""
+    assert all(len(h) == 16 for h in fields)
+    return np.array([int(h, 16) for h in fields], dtype=np.uint64)
+
+
+def _float(h: str) -> float:
+    return float(_bits([h]).view(np.float64)[0])
+
+
+def _bits_of(x: float) -> int:
+    return int(np.float64(x).view(np.uint64))
+
+
+def load_golden(path: Path = GOLDEN) -> list[dict]:
+    """The cases of the golden file. Strict: any line out of place is an error."""
+    lines = [ln for ln in path.read_text(encoding="utf-8").splitlines()
+             if ln and not ln.startswith("#")]
+    pos = 0
+
+    def take(key: str, n: int | None = None) -> list[str]:
+        nonlocal pos
+        head, *rest = lines[pos].split(" ")
+        assert head == key, f"line {pos}: expected {key!r}, got {lines[pos]!r}"
+        assert n is None or len(rest) == n, lines[pos]
+        pos += 1
+        return rest
+
+    assert lines[0] == GOLDEN_FORMAT
+    pos = 1
+    cases = []
+    for _ in range(int(take("cases", 1)[0])):
+        case: dict = {"name": take("case", 1)[0]}
+        name, maker, taker = take("fees", 3)
+        case["fees"] = (name, int(maker, 16), int(taker, 16))
+        case["liquidity"] = take("liquidity", 1)[0]
+        case["scalars"] = {k: take(k, 1)[0] for k in SCALARS}
+        bars = [take("b", 6) for _ in range(int(take("bars", 1)[0]))]
+        case["open_time"] = np.array([int(b[0]) for b in bars], dtype=np.int64)
+        case["ohlcv"] = [_bits([b[k] for b in bars]) for k in range(1, 6)]
+        case["targets"] = _bits([take("t", 1)[0] for _ in range(int(take("targets", 1)[0]))])
+        head = lines[pos].split(" ", 1)
+        if head[0] == "error":
+            case["error"] = head[1]
+            pos += 1
+        else:
+            take("ok", 0)
+            r = [take("r", 3) for _ in bars]
+            case["error"] = None
+            case["equity"], case["position"], case["cash"] = (
+                _bits([x[k] for x in r]) for k in range(3))
+            fills = [take("f", 7) for _ in range(int(take("fills", 1)[0]))]
+            case["fills"] = {
+                "bar": np.array([int(f[0]) for f in fills], dtype=np.int64),
+                "time": np.array([int(f[1]) for f in fills], dtype=np.int64),
+                "side": np.array([{"buy": rs.BUY, "sell": rs.SELL}[f[2]] for f in fills],
+                                 dtype=np.int8),
+                **{k: _bits([f[3 + i] for f in fills])
+                   for i, k in enumerate(("qty", "price", "notional", "fee"))},
+            }
+            case["fees_paid"] = int(take("fees_paid", 1)[0], 16)
+        take("end", 0)
+        cases.append(case)
+    assert pos == len(lines), f"trailing lines from {pos}"
+    return cases
+
+
+GOLDEN_CASES = load_golden()
+
+
+def _golden_fees(case: dict):
+    """The case's schedule as the binding takes it: a built-in name, or a custom schedule."""
+    name, maker, taker = case["fees"]
+    if name in rs.FeeSchedule.names():
+        builtin = rs.FeeSchedule.named(name)
+        assert (_bits_of(builtin.maker), _bits_of(builtin.taker)) == (maker, taker), name
+        return name
+    return rs.FeeSchedule(name, _float(f"{maker:016x}"), _float(f"{taker:016x}"))
+
+
+def _golden_run(case: dict) -> rs.SimResult:
+    o, h, l, c, v = (col.view(np.float64) for col in case["ohlcv"])
+    scalars = {k: _float(x) for k, x in case["scalars"].items()}
+    return rs.simulate(case["open_time"], o, h, l, c, v, case["targets"].view(np.float64),
+                       fees=_golden_fees(case), liquidity=case["liquidity"], **scalars)
+
+
+def _u64(x: np.ndarray) -> np.ndarray:
+    assert x.dtype == np.float64
+    return x.view(np.uint64)
+
+
+@pytest.mark.parametrize("case", GOLDEN_CASES, ids=[c["name"] for c in GOLDEN_CASES])
+def test_simulate_equals_the_compiled_crate_bit_for_bit(case: dict) -> None:
+    if case["error"] is not None:
+        with pytest.raises(rs.SimError) as info:
+            _golden_run(case)
+        assert str(info.value) == case["error"]
+        return
+    r = _golden_run(case)
+    for name in ("equity", "position", "cash"):
+        assert np.array_equal(_u64(getattr(r, name)), case[name]), name
+    assert _bits_of(r.fees_paid) == case["fees_paid"]
+    got = r.fills.as_dict()
+    assert got.keys() == case["fills"].keys()
+    for name, want in case["fills"].items():
+        have = got[name] if want.dtype != np.uint64 else _u64(got[name])
+        assert have.dtype == want.dtype and np.array_equal(have, want), name
+
+
+def test_the_golden_file_covers_errors_trades_and_edges() -> None:
+    names = {c["name"] for c in GOLDEN_CASES}
+    assert len(names) == len(GOLDEN_CASES) >= 40
+    errors = [c for c in GOLDEN_CASES if c["error"] is not None]
+    assert len(errors) >= 20
+    assert sum(len(c["fills"]["bar"]) for c in GOLDEN_CASES if c["error"] is None) >= 200
+    # NaN, -0.0 and a subnormal reach the binding as bits.
+    every_target = np.concatenate([c["targets"] for c in GOLDEN_CASES])
+    assert {0x8000_0000_0000_0000, 1} <= set(every_target.tolist())
+    assert any(np.isnan(c["targets"].view(np.float64)).any() for c in errors)
+    assert any(c["fees"][0] not in rs.FeeSchedule.names() for c in GOLDEN_CASES)
+
+
+@pytest.mark.parametrize("case", [c for c in GOLDEN_CASES if c["error"] is None],
+                         ids=[c["name"] for c in GOLDEN_CASES if c["error"] is None])
+def test_the_reference_port_equals_the_compiled_crate(case: dict) -> None:
+    """The port above is only as good as its agreement with the crate; check it here too."""
+    o, h, l, c, v = (col.view(np.float64) for col in case["ohlcv"])
+    _, maker, taker = case["fees"]
+    scalars = {k: _float(x) for k, x in case["scalars"].items()}
+    eq, pos, cash, fills, fees_paid = reference_simulate(
+        {"open": o, "close": c}, case["targets"].view(np.float64),
+        maker=_float(f"{maker:016x}"), taker=_float(f"{taker:016x}"),
+        liquidity=case["liquidity"], **scalars)
+    assert np.array_equal(_u64(eq), case["equity"])
+    assert np.array_equal(_u64(pos), case["position"])
+    assert np.array_equal(_u64(cash), case["cash"])
+    assert _bits_of(fees_paid) == case["fees_paid"]
+    assert [f[0] for f in fills] == case["fills"]["bar"].tolist()
+
+
 @pytest.mark.parametrize("seed", range(20))
 def test_documented_invariants_hold(seed: int) -> None:
     rng = np.random.default_rng(100 + seed)
@@ -750,6 +902,262 @@ def test_wrong_names_and_lengths_are_value_errors() -> None:
         rs.Matrix(1, 1).push(0, np.ones(1, dtype=np.float32), np.ones(1))
     with pytest.raises(rs.OlsError, match="expected 3, got 2"):
         rs.Matrix(3, 1).extend(np.zeros(2, dtype=np.int64), np.ones((2, 2)), np.ones((2, 1)))
+
+
+def test_the_audit_examples_of_overflow_are_value_errors() -> None:
+    """Audit B: these raised PyO3's OverflowError, which is not a ValueError."""
+    for call, name in [
+        (lambda: rs.Matrix(1, 1).range_stats(-1, 2), "start"),
+        (lambda: rs.Matrix(1, 1).time_range(2**63, 0), "from_time"),
+        (lambda: rs.Matrix(2, 1, block_log2=-1), "block_log2"),
+        (lambda: rs.periods_per_year(2**70), "bar_ms"),
+    ]:
+        with pytest.raises(ValueError, match=rf"^{name} ") as info:
+            call()
+        assert type(info.value) is ValueError, type(info.value)
+
+
+def _two_entries() -> rs.Matrix:
+    m = rs.Matrix(1, 1)
+    m.extend(np.array([0, 1], dtype=np.int64), np.ones((2, 1)), np.ones((2, 1)))
+    return m
+
+
+_RIDGE = rs.RidgeConfig(1.0)
+_ACCOUNT = {"equity": 1, "peak_equity": 1, "day_start_equity": 1, "position": 0,
+            "bars_since_order": 0}
+_LIMITS = {"max_position": 1, "max_order": 1, "min_order": 1, "lot_step": 1,
+           "max_daily_loss": 1, "max_drawdown_bps": 1, "cooldown_bars": 1}
+
+# Every int and float parameter of the stubs, as a call that passes `v` there and valid values
+# everywhere else. With v = 1 (an int) or 0.5 (a float) each call succeeds.
+SCALAR_PARAMS = {
+    ("FeeSchedule.__init__", "maker"): lambda v: rs.FeeSchedule("v", v, 0.0),
+    ("FeeSchedule.__init__", "taker"): lambda v: rs.FeeSchedule("v", 0.0, v),
+    **{("simulate", k): (lambda v, k=k: run(THREE_BARS, np.zeros(3), **{k: v})) for k in SCALARS},
+    ("metrics", "periods_per_year"): lambda v: rs.metrics(run(THREE_BARS, np.zeros(3)), v),
+    ("periods_per_year", "bar_ms"): lambda v: rs.periods_per_year(v),
+    ("RidgeConfig.__init__", "lam"): lambda v: rs.RidgeConfig(v),
+    ("RidgeConfig.with_intercept", "lam"): lambda v: rs.RidgeConfig.with_intercept(v),
+    ("SuffStats.__init__", "p"): lambda v: rs.SuffStats(v, 1),
+    ("SuffStats.__init__", "q"): lambda v: rs.SuffStats(1, v),
+    ("SuffStats.push", "w"): lambda v: rs.SuffStats(1, 1).push(np.ones(1), np.ones(1), v),
+    **{("Rls.__init__", k): (lambda v, k=k: rs.Rls(**{"p": 1, "q": 1, "lam": 1.0, "gamma": 1.0,
+                                                      k: v}))
+       for k in ("p", "q", "lam", "gamma")},
+    **{("Matrix.__init__", k): (lambda v, k=k: rs.Matrix(**{"p": 1, "q": 1, "block_log2": 2,
+                                                            k: v}))
+       for k in ("p", "q", "block_log2")},
+    ("Matrix.push", "time"): lambda v: _two_entries().push(v, np.ones(1), np.ones(1)),
+    **{("Matrix.time_range", k): (lambda v, k=k: _two_entries().time_range(
+        **{"from_time": 0, "as_of": 1, k: v})) for k in ("from_time", "as_of")},
+    **{("Matrix.range_stats", k): (lambda v, k=k: _two_entries().range_stats(
+        **{"start": 0, "end": 2, k: v})) for k in ("start", "end")},
+    **{("Matrix.query", k): (lambda v, k=k: _two_entries().query(
+        np.ones(1), **{"start": 0, "end": 2, k: v}, cfg=_RIDGE)) for k in ("start", "end")},
+    **{("Matrix.contribution", k): (lambda v, k=k: (lambda m: m.contribution(
+        m.query(np.ones(1), 0, 2, _RIDGE), **{"start": 0, "end": 2, k: v}))(_two_entries()))
+       for k in ("start", "end")},
+    **{("Matrix.summarize", k): (lambda v, k=k: _two_entries().summarize(
+        **{"start": 0, "end": 2, k: v}, cfg=_RIDGE)) for k in ("start", "end")},
+    **{("Account.__init__", k): (lambda v, k=k: rs.Account(**{**_ACCOUNT, k: v}))
+       for k in _ACCOUNT},
+    **{("Limits.__init__", k): (lambda v, k=k: rs.Limits(**{**_LIMITS, k: v})) for k in _LIMITS},
+    **{("OrderRequest.__init__", k): (lambda v, k=k: rs.OrderRequest(
+        side=rs.Side.BUY, **{"qty": 1, "price": 1, k: v})) for k in ("qty", "price")},
+}
+
+
+def _stub_scalar_params() -> dict[tuple[str, str], str]:
+    """(qualified name, parameter) -> "int" or "float", for every scalar parameter of the stubs."""
+    tree = ast.parse((Path(rs.__file__).parent / "__init__.pyi").read_text(encoding="utf-8"))
+    out = {}
+
+    def walk(body, prefix=""):
+        for node in body:
+            if isinstance(node, ast.ClassDef):
+                walk(node.body, node.name + ".")
+            elif isinstance(node, ast.FunctionDef):
+                a = node.args
+                for arg in a.posonlyargs + a.args + a.kwonlyargs:
+                    if arg.annotation is not None and ast.unparse(arg.annotation) in ("int", "float"):
+                        out[(prefix + node.name, arg.arg)] = ast.unparse(arg.annotation)
+
+    walk(tree.body)
+    return out
+
+
+STUB_SCALARS = _stub_scalar_params()
+INT_OUT_OF_RANGE = [2**64, -(2**64), 2**200, -(2**200)]
+FLOAT_OUT_OF_RANGE = [2**1024, -(2**1024), 10**400]
+
+
+def test_every_scalar_parameter_of_the_stubs_is_checked_below() -> None:
+    assert set(SCALAR_PARAMS) == set(STUB_SCALARS)
+
+
+@pytest.mark.parametrize("key", sorted(STUB_SCALARS), ids="{0[0]}:{0[1]}".format)
+def test_out_of_range_scalars_are_value_errors_naming_the_argument(key) -> None:
+    call, kind = SCALAR_PARAMS[key], STUB_SCALARS[key]
+    call(1 if kind == "int" else 0.5)  # the other arguments are valid
+    for bad in INT_OUT_OF_RANGE if kind == "int" else FLOAT_OUT_OF_RANGE:
+        with pytest.raises(ValueError, match=rf"^{key[1]} ") as info:
+            call(bad)
+        assert type(info.value) is ValueError, (bad, type(info.value))
+    for bad in (True, "1", None, [1]) + ((1.0, np.float64(1.0)) if kind == "int" else ()):
+        with pytest.raises(TypeError, match=rf"^{key[1]} must be an? {kind}, got ") as info:
+            call(bad)
+        assert type(info.value) is TypeError, (bad, type(info.value))
+
+
+def test_numpy_scalars_are_accepted_where_ints_and_floats_are() -> None:
+    m = rs.Matrix(np.int64(1), np.uint8(1), block_log2=np.int32(2))
+    m.push(np.int64(5), np.ones(1), np.ones(1))
+    assert m.time_range(np.int64(0), np.uint64(5)) == (0, 1)
+    assert m.range_stats(np.intp(0), np.int64(1)).count == 1
+    assert rs.RidgeConfig(np.float32(0.5)).lam == 0.5
+    assert rs.periods_per_year(np.int64(60_000)) == rs.periods_per_year(60_000)
+    # Ints where floats go are converted, as Python itself would.
+    assert rs.RidgeConfig(2).lam == 2.0
+
+
+def test_microsecond_bar_times_are_refused() -> None:
+    """Spot files switched to microseconds on 2025-01-01: a µs series must not pass as ms."""
+    ms = 1_735_689_600_000 + 60_000 * np.arange(3, dtype=np.int64)  # 2025-01-01, in ms
+    run({**THREE_BARS, "open_time": ms}, np.zeros(3))
+    with pytest.raises(ValueError, match=r"^open_time\[0\] = 1735689600000000 looks like "
+                                         r"microseconds") as info:
+        run({**THREE_BARS, "open_time": ms * 1000}, np.zeros(3))
+    assert type(info.value) is ValueError
+    # The boundary is 10**14 (the year 5138 in ms), and the error names the first time beyond.
+    last = np.array([0, 60_000, 10**14 - 1], dtype=np.int64)
+    assert len(run({**THREE_BARS, "open_time": last}, np.zeros(3))) == 3
+    with pytest.raises(ValueError, match=r"^open_time\[1\] = 100000000000000 looks like"):
+        run({**THREE_BARS, "open_time": np.array([0, 10**14, 2**62], dtype=np.int64)},
+            np.zeros(3))
+    # Unit before order: the simulator would also refuse this decreasing series.
+    with pytest.raises(ValueError, match=r"^open_time\[0\] = 9223372036854775807 looks like"):
+        run({**THREE_BARS, "open_time": np.array([2**63 - 1, 0, 1], dtype=np.int64)},
+            np.zeros(3))
+
+
+def test_matrix_refuses_microsecond_times() -> None:
+    """Matrix times are milliseconds too: push and extend refuse a time >= 10**14."""
+    assert rs.MICROSECOND_TIMES_FROM == 10**14
+    m = rs.Matrix(1, 1)
+    m.push(rs.MICROSECOND_TIMES_FROM - 1, np.ones(1), np.ones(1))
+    with pytest.raises(ValueError, match=r"^time = 100000000000000 looks like microseconds: "
+                                         r"Matrix times are milliseconds since the epoch") as info:
+        m.push(rs.MICROSECOND_TIMES_FROM, np.ones(1), np.ones(1))
+    assert type(info.value) is ValueError
+    assert "  " not in str(info.value)
+    m = rs.Matrix(1, 1)
+    times = np.array([0, 1_735_689_600_000_000, 1_735_689_600_000_001], dtype=np.int64)
+    with pytest.raises(ValueError, match=r"^times\[1\] = 1735689600000000 looks like "
+                                         r"microseconds") as info:
+        m.extend(times, np.ones((3, 1)), np.ones((3, 1)))
+    assert type(info.value) is ValueError
+    assert len(m) == 0  # all or nothing
+    m.extend(times // 1000, np.ones((3, 1)), np.ones((3, 1)))
+    assert len(m) == 3
+
+
+def test_matrix_time_range_refuses_microsecond_bounds() -> None:
+    """An as_of in microseconds would expose every entry: a silent look-ahead."""
+    m = rs.Matrix(1, 1)
+    times = 1_735_689_600_000 + 60_000 * np.arange(3, dtype=np.int64)  # 2025-01-01, in ms
+    m.extend(times, np.ones((3, 1)), np.ones((3, 1)))
+    assert m.time_range(0, int(times[0])) == (0, 1)
+    assert m.time_range(-(2**63), rs.MICROSECOND_TIMES_FROM - 1) == (0, 3)
+    for kwargs, name in [({"from_time": 0, "as_of": 1_735_689_600_000_000}, "as_of"),
+                         ({"from_time": rs.MICROSECOND_TIMES_FROM, "as_of": 0}, "from_time"),
+                         ({"from_time": 0, "as_of": 2**63 - 1}, "as_of")]:
+        with pytest.raises(ValueError, match=rf"^{name} = {kwargs[name]} looks like "
+                                             r"microseconds: Matrix times are milliseconds") as info:
+            m.time_range(**kwargs)
+        assert type(info.value) is ValueError
+
+
+def test_the_microsecond_message_of_simulate_is_one_line() -> None:
+    ms = 1_735_689_600_000 + 60_000 * np.arange(3, dtype=np.int64)
+    with pytest.raises(ValueError, match=r"since the epoch, and every time") as info:
+        run({**THREE_BARS, "open_time": ms * 1000}, np.zeros(3))
+    assert "  " not in str(info.value)
+
+
+# --- sizes --------------------------------------------------------------------------------
+# A failed allocation aborts the interpreter instead of raising, so every allocation sized by a
+# caller's shape is refused first. These run in-process on purpose: the refusal happens before
+# anything is allocated, and an abort would still fail the run, loudly.
+
+_P = 2**20  # a 2**20 x 2**20 Gram matrix is 8 TiB
+
+
+def _wide(rows: int, cols: int) -> np.ndarray:
+    """A float64 array of any logical shape that costs 8 bytes: a zero-stride view."""
+    return np.broadcast_to(np.zeros(1), (rows, cols))
+
+
+_LIMIT = r"above the limit MAX_ALLOC_BYTES = 1073741824 \(1 GiB\)$"
+
+OVERSIZE = [
+    ("SuffStats", lambda: rs.SuffStats(_P, 1),
+     r"^SuffStats\(p=1048576, q=1\) would take 8796109799448 bytes, "),
+    # The largest p and q an int can pass: the byte count leaves u128, and is still refused.
+    ("SuffStats:usize", lambda: rs.SuffStats(2**64 - 1, 2**64 - 1),
+     r"^SuffStats\(p=18446744073709551615, q=18446744073709551615\) would take more than "
+     r"2\^128 bytes, "),
+    ("SuffStats.from_rows", lambda: rs.SuffStats.from_rows(np.zeros((0, _P)), np.zeros((0, 1))),
+     r"^SuffStats\(p=1048576, q=1\) from xs of shape \(0, 1048576\) and ys of shape \(0, 1\) "
+     r"would take 8796109799448 bytes, "),
+    ("SuffStats.from_rows:xs", lambda: rs.SuffStats.from_rows(_wide(2**28, 1), _wide(2**28, 1)),
+     r"^xs of shape \(268435456, 1\) would take 2147483648 bytes, "),
+    ("ols_attention:gram", lambda: rs.ols_attention(np.zeros((1, _P)), np.zeros((1, 1)),
+                                                   np.zeros((1, _P)), _RIDGE),
+     r"^ols_attention: the Gram matrix of keys of shape \(1048576, 1048576\), for keys "
+     r"\(1, 1048576\), values \(1, 1\) and queries \(1, 1048576\), would take "),
+    ("ols_attention:weights", lambda: rs.ols_attention(np.zeros((2**17, 1)), np.zeros((2**17, 1)),
+                                                      np.zeros((2**17, 1)), _RIDGE),
+     r"^ols_attention: the weights of shape \(131072, 131072\), .* would take 137438953472 "),
+    ("ols_attention:keys", lambda: rs.ols_attention(_wide(2**28, 1), _wide(2**28, 1),
+                                                   np.zeros((0, 1)), _RIDGE),
+     r"^keys of shape \(268435456, 1\) would take 2147483648 bytes, "),
+    ("Rls", lambda: rs.Rls(_P, 1, 1.0),
+     r"^Rls\(p=1048576, q=1\) would take 8796101410816 bytes, "),
+    ("Matrix", lambda: rs.Matrix(_P, 1),
+     r"^Matrix\(p=1048576, q=1\): one tree node would take 8796109799448 bytes, "),
+    ("Matrix.push:x", lambda: rs.Matrix(1, 1).push(0, _wide(1, 2**28)[0], np.ones(1)),
+     r"^x \(268435456 values\) would take 2147483648 bytes, "),
+    ("Matrix.extend:xs", lambda: rs.Matrix(1, 1).extend(np.broadcast_to(np.zeros(1, np.int64),
+                                                                         (2**28,)),
+                                                         _wide(2**28, 1), _wide(2**28, 1)),
+     r"^times \(268435456 values\) would take 2147483648 bytes, "),
+    ("max_drawdown", lambda: rs.max_drawdown(_wide(1, 2**40)[0]),
+     r"^equity \(1099511627776 values\) would take 8796093022208 bytes, "),
+    ("simulate", lambda: run({k: np.broadcast_to(v[:1], (2**25,)) for k, v in THREE_BARS.items()},
+                             np.broadcast_to(np.zeros(1), (2**25,))),
+     r"^open_time \(33554432 bars\) would take 1610612736 bytes, "),
+]
+
+
+@pytest.mark.parametrize("name,call,message", OVERSIZE, ids=[c[0] for c in OVERSIZE])
+def test_oversize_shapes_are_value_errors_before_any_allocation(name, call, message) -> None:
+    with pytest.raises(ValueError, match=message + ".*" + _LIMIT) as info:
+        call()
+    assert type(info.value) is ValueError, type(info.value)
+
+
+def test_the_size_limit_is_exported_and_real_shapes_pass() -> None:
+    assert rs.MAX_ALLOC_BYTES == 2**30
+    # A protocol-sized state passes everywhere the limit applies.
+    assert rs.SuffStats(64, 4).p == 64
+    assert rs.Rls(64, 4, 1.0).updates == 0
+    assert rs.Matrix(64, 4).p == 64
+    keys = np.random.default_rng(0).normal(size=(50, 3))
+    att = rs.ols_attention(keys, np.ones((50, 1)), keys[:4], _RIDGE)
+    assert att.weights.shape == (4, 50)
+    # A zero-stride view under the limit is read, in its logical order, like any array.
+    assert rs.max_drawdown(np.broadcast_to(np.ones(1), (1000,))) == 0.0
 
 
 def test_fee_schedules() -> None:
