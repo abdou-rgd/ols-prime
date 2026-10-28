@@ -1135,7 +1135,8 @@ def test_spelled_paths_map_onto_the_file_system_paths(tmp_path):
     roots = (os.path.normcase(os.path.realpath(tmp_path / "data")) + os.sep,)
     assert wire.data_paths((inside.as_uri(),), {}, roots) == [inside.as_uri()]
     assert wire.data_paths((EXTENDED + str(inside),), {}, roots) == [EXTENDED + str(inside)]
-    assert wire.spelled_path(EXTENDED + "UNC\\server\\share\\f") == "\\\\server\\share\\f"
+    # The UNC root takes the platform's separator. Off Windows the prefix is stripped too, which errs towards a trip.
+    assert wire.spelled_path(EXTENDED + "UNC\\server\\share\\f") == os.sep * 2 + "server\\share\\f"
     assert wire.spelled_path("plain/relative.parquet") == "plain/relative.parquet"
     if os.name == "nt":
         assert wire.spelled_path("file:///C:/a%20b/c") == "C:\\a b\\c"

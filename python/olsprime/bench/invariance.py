@@ -14,12 +14,17 @@ A row that differs under either direction is a **violation**; the flags are kept
 An honest model has none at any cut.
 
 **Controls.** H1 holds only if the bench also catches what it must, exactly where the design
-predicts (:func:`predicted`), and can see a signal when there is one:
+predicts (:func:`predicted`), and can see a signal when there is one. A control is **caught** at a
+cut only where an output moves by more than :data:`CAUGHT_ABOVE`, or turns missing, or stops being
+missing: a change at the level of rounding carries no leak, so it never counts as a catch. (Before
+this rule, a control whose leak its inner model undid exactly was caught by rounding alone, at every
+cut on Windows and at all but one on Linux.)
 
 - the cheater (reads the next bar's candle), the next-bar peekers on ``trades``, ``quote_volume``
   and the taker share, and the price off-by-one (:mod:`olsprime.bench.leaks`): every cut;
-- the transductive scaler (features scaled with the whole test month): every cut whose month
-  goes on after it, never at the last bar of a month;
+- the transductive scaler (features scaled with the whole test month, ahead of a ridge that
+  centres but does not rescale them): every cut whose month goes on after it, never at the last
+  bar of a month;
 - the models fitted without purge or embargo (:func:`olsprime.bench.pipeline.unpurged`): exactly
   the cuts at the first bar of a test month. A model fitted at ``fit_time`` without the purge
   trains on the label of the bar just before the fit, whose exit price is the open of the second
@@ -107,6 +112,10 @@ FLAG_EVERY_CUT = "flag-every-cut"
 FLAG_FIRST_BAR = "flag-first-bar-of-test-month"  # the planted purge leak
 FLAG_UNLESS_MONTH_END = "flag-unless-last-bar-of-month"  # the transductive scaler
 FLAG_BY_CELL = "flag-where-a-run-changes-its-cell"  # the colour x size probes, cut by cut
+
+# A control is caught at a cut only where an output moves by more than this (see compare()). Rounding moves
+# them by about 1e-16; the weakest real catch on the synthetic bars moves a probability by 2.7e-3.
+CAUGHT_ABOVE = 1e-9
 
 LAST_BEFORE_FOLD = "last-bar-before-fold-start"
 FIRST_OF_MONTH = "first-bar-of-test-month"
@@ -278,20 +287,33 @@ def outputs(spec: ModelSpec, bars: pl.DataFrame, cfg: H1Config, *, before: datet
     return out.with_columns([pl.Series(f"target_{v}", pp.targets(preds, v), dtype=pl.Float64) for v in cfg.venues])
 
 
+def _values(series: pl.Series) -> np.ndarray:
+    return series.cast(pl.Float64).fill_null(np.nan).to_numpy()
+
+
 def _bits(series: pl.Series) -> np.ndarray:
-    return series.cast(pl.Float64).fill_null(np.nan).to_numpy().view(np.uint64)
+    return _values(series).view(np.uint64)
 
 
 def compare(original: pl.DataFrame, perturbed: pl.DataFrame, until: datetime) -> dict[str, Any]:
-    """Bit-for-bit comparison of the rows decided at or before ``until``; ``mask`` marks the differing rows."""
+    """Bit-for-bit comparison of the rows decided at or before ``until``.
+
+    ``mask`` marks the rows that differ by a single bit (``violations``). ``caught_mask`` marks the
+    rows where an output moves by more than :data:`CAUGHT_ABOVE`, turns missing or stops being missing
+    (``caught``). ``largest`` is the largest change between two present values (``inf`` when the rows
+    themselves differ).
+    """
     a = original.filter(pl.col("decision_time") <= until)
     b = perturbed.filter(pl.col("decision_time") <= until)
     if a.height == 0:
         raise ValueError(f"no output decided at or before {until}: the cut is outside the scored window")
     if not a["decision_time"].equals(b["decision_time"]):
-        return {"rows": a.height, "violations": a.height, "columns": {"decision_time": a.height}, "first": None,
-                "mask": np.ones(a.height, dtype=bool)}  # fmt: skip
+        every = np.ones(a.height, dtype=bool)
+        return {"rows": a.height, "violations": a.height, "caught": a.height, "largest": float("inf"),
+                "columns": {"decision_time": a.height}, "first": None, "mask": every, "caught_mask": every}  # fmt: skip
     differs = np.zeros(a.height, dtype=bool)
+    above = np.zeros(a.height, dtype=bool)
+    largest = 0.0
     per_column = {}
     for c in a.columns:
         if c == "decision_time":
@@ -299,13 +321,22 @@ def compare(original: pl.DataFrame, perturbed: pl.DataFrame, until: datetime) ->
         d = _bits(a[c]) != _bits(b[c])
         per_column[c] = int(d.sum())
         differs |= d
+        x, y = _values(a[c]), _values(b[c])
+        both = ~np.isnan(x) & ~np.isnan(y)
+        change = np.abs(x[both] - y[both])
+        above[both] |= change > CAUGHT_ABOVE
+        above |= np.isnan(x) != np.isnan(y)
+        largest = max(largest, float(change.max(initial=0.0)))
     first = a["decision_time"][int(np.argmax(differs))] if differs.any() else None
     return {
         "rows": a.height,
         "violations": int(differs.sum()),
+        "caught": int(above.sum()),
+        "largest": largest,
         "columns": {k: v for k, v in per_column.items() if v},
         "first": None if first is None else first.isoformat(),
         "mask": differs,
+        "caught_mask": above,
     }
 
 
@@ -313,7 +344,8 @@ def run_model(spec: ModelSpec, bars: pl.DataFrame, cuts: Sequence[Cut], cfg: H1C
     """One model, every cut, both directions: the comparison record of each cut.
 
     ``violations`` counts the rows that differ under either direction; ``by_direction`` gives
-    the count under each (``x3``, ``/3``).
+    the count under each (``x3``, ``/3``). ``caught`` and ``caught_by_direction`` count the rows
+    that move by more than rounding (:func:`compare`), and ``largest_change`` is the largest move.
     """
     original = outputs(spec, bars, cfg)
     records = []
@@ -329,6 +361,7 @@ def run_model(spec: ModelSpec, bars: pl.DataFrame, cuts: Sequence[Cut], cfg: H1C
             perturbed = outputs(spec, perturb_after(bars, cut.index, seed=seed, config=config), cfg, before=cut.known_at)
             results[_direction(shift)] = compare(original, perturbed, cut.known_at)
         union = np.logical_or.reduce([r["mask"] for r in results.values()])
+        caught = np.logical_or.reduce([r["caught_mask"] for r in results.values()])
         columns: dict[str, int] = {}
         for r in results.values():
             for c, v in r["columns"].items():
@@ -343,6 +376,9 @@ def run_model(spec: ModelSpec, bars: pl.DataFrame, cuts: Sequence[Cut], cfg: H1C
                 "rows": next(iter(results.values()))["rows"],
                 "violations": int(union.sum()),
                 "by_direction": {d: r["violations"] for d, r in results.items()},
+                "caught": int(caught.sum()),
+                "caught_by_direction": {d: r["caught"] for d, r in results.items()},
+                "largest_change": max(r["largest"] for r in results.values()),
                 "columns": columns,
                 "first": min(firsts) if firsts else None,
                 "unknown_reason": unknown,
@@ -378,11 +414,17 @@ def realised_cells(bars: pl.DataFrame, cuts: Sequence[Cut], cfg: H1Config) -> li
 
 
 def verdict(spec: ModelSpec, records: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    """Whether the model showed exactly its predicted pattern: flagged at the predicted cuts and nowhere else."""
-    flagged = [r["violations"] > 0 for r in records]
+    """Whether the model showed exactly its predicted pattern: flagged at the predicted cuts and nowhere else.
+
+    An honest model is flagged by a single differing bit. A control is flagged only where it is caught,
+    an output moving by more than :data:`CAUGHT_ABOVE`: a control flagged by rounding alone is off its pattern.
+    """
+    honest = spec.expect == PASS
+    count, per_direction = ("violations", "by_direction") if honest else ("caught", "caught_by_direction")
+    flagged = [r[count] > 0 for r in records]
     # ``?``: a declared reason, predicted from the original bars, that the probe cannot cross at that cut.
     expected = [None if r.get("unknown_reason") else predicted(spec.expect, r) for r in records]
-    directions = list(records[0]["by_direction"]) if records else []
+    directions = list(records[0][per_direction]) if records else []
     known = [(f, e) for f, e in zip(flagged, expected, strict=True) if e is not None]
     return {
         "model": spec.name,
@@ -391,9 +433,13 @@ def verdict(spec: ModelSpec, records: Sequence[dict[str, Any]]) -> dict[str, Any
         "predicted_cuts": int(sum(bool(e) for e in expected)),
         "unknown_cuts": [r["cut"] for r, e in zip(records, expected, strict=True) if e is None],
         "unknown_reasons": {str(r["cut"]): r["unknown_reason"] for r in records if r.get("unknown_reason")},
-        "flagged_by_direction": {d: int(sum(r["by_direction"][d] > 0 for r in records)) for d in directions},
+        "flagged_by_direction": {d: int(sum(r[per_direction][d] > 0 for r in records)) for d in directions},
         "cuts": len(records),
         "violations": int(sum(r["violations"] for r in records)),
+        "caught_rows": int(sum(r["caught"] for r in records)),
+        # A control's weakest catch: over its caught cuts, the smallest of each cut's largest move.
+        "smallest_catch": None if honest else min((r["largest_change"] for r, f in zip(records, flagged, strict=True) if f), default=None),
+        "rounding_only_cuts": [r["cut"] for r in records if r["violations"] > 0 and r["caught"] == 0],
         "pattern": "".join("X" if f else "." for f in flagged),
         "predicted_pattern": "".join("?" if e is None else "X" if e else "." for e in expected),
         "ok": all(f == e for f, e in known),
@@ -667,10 +713,16 @@ def render_md(result: dict[str, Any]) -> str:
         f"the test months {cfg['start'][0]}-{cfg['start'][1]:02d} -> {cfg['end'][0]}-{cfg['end'][1]:02d}, fit, predict, "
         "the long/flat rule at every venue. A violation is a row decided at or before the cut whose p_*, exp_return or "
         "target at any venue differs by a single bit after every value of every later bar is perturbed, in either "
-        f"direction ({' and '.join(directions)}: the future multiplied by 3 or divided by 3, each with its own walk).",
+        f"direction ({' and '.join(directions)}: the future multiplied by 3 or divided by 3, each with its own walk). "
+        "An honest model is flagged by a single violation. A control is flagged (caught) at a cut only where one of "
+        f"these outputs moves by more than {CAUGHT_ABOVE:g}, turns missing or stops being missing: a change at the level "
+        "of rounding carries no leak and never counts as a catch.",
         "",
         "Patterns read cut by cut, in the order listed: X flagged, . not flagged. A model is ok when its pattern equals "
-        "the predicted one exactly.",
+        "the predicted one exactly. Rows flagged: the violating rows of an honest model, the caught rows of a control, "
+        "summed over the cuts. A control's smallest catch is, over its caught cuts, the smallest of each cut's largest "
+        "change; rounding-only cuts are those where an output differs by some bits but by no more than "
+        f"{CAUGHT_ABOVE:g}.",
         "",
         LIMIT,
         "",
@@ -696,15 +748,19 @@ def render_md(result: dict[str, Any]) -> str:
         head = " | ".join(f"flagged {d}" for d in directions)
         lines += [
             "",
-            f"| model | must | {head} | flagged (either) | pattern | predicted | violating rows | ok |",
-            "|---|---|" + "---|" * len(directions) + "---|---|---|---|---|",
+            f"| model | must | {head} | flagged (either) | pattern | predicted | rows flagged | smallest catch | "
+            "rounding-only cuts | ok |",
+            "|---|---|" + "---|" * len(directions) + "---|---|---|---|---|---|---|",
         ]
         for name, m in data["models"].items():
             v = m["verdict"]
             per = " | ".join(f"{v['flagged_by_direction'][d]}/{v['cuts']}" for d in directions)
+            honest = v["expect"] == PASS
+            catch = "" if honest or v["smallest_catch"] is None else f"{v['smallest_catch']:.2g}"
             lines.append(
                 f"| {name} | {v['expect']} | {per} | {v['flagged_cuts']}/{v['cuts']} | `{v['pattern']}` | "
-                f"`{v['predicted_pattern']}` | {v['violations']} | {'yes' if v['ok'] else 'NO'} |"
+                f"`{v['predicted_pattern']}` | {v['violations'] if honest else v['caught_rows']} | {catch} | "
+                f"{len(v['rounding_only_cuts'])} | {'yes' if v['ok'] else 'NO'} |"
             )
         unknown = {name: m["verdict"].get("unknown_reasons", {}) for name, m in data["models"].items()}
         unknown = {k: v for k, v in unknown.items() if v}

@@ -13,7 +13,7 @@ from olsprime.bench import invariance as inv
 from olsprime.bench import leaks
 from olsprime.bench.perturb import PERTURBED_COLUMNS, PRICE_COLUMNS, UNCHANGED_COLUMNS, Perturbation, check_coverage, perturb_after
 from olsprime.bench.synthetic import synthetic_bars
-from olsprime.models.baselines import TEST_COLUMNS, check_test_frame
+from olsprime.models.baselines import TEST_COLUMNS, Ridge, check_test_frame
 
 CFG = inv.H1Config(start=(2018, 3), end=(2018, 6), venues=("zero", "binance-spot", "kraken-pro-entry"))
 
@@ -199,7 +199,7 @@ def test_a_declared_reason_read_on_the_original_bars_gives_a_question_mark(bars,
     assert "bound" in record["unknown_reason"]
     v = inv.verdict(spec, [record])
     assert v["predicted_pattern"] == "?" and v["unknown_cuts"] == [cut] and str(cut) in v["unknown_reasons"]
-    fake = [dict(record), {**record, "cut": 400, "unknown_reason": None, "violations": 0}]
+    fake = [dict(record), {**record, "cut": 400, "unknown_reason": None, "violations": 0, "caught": 0}]
     assert not inv.verdict(spec, fake)["ok"]  # the known cut still decides
 
 
@@ -317,6 +317,22 @@ def test_compare_sees_a_single_bit():
     res = inv.compare(a, b, t[2])
     assert res["violations"] == 1 and res["columns"] == {"exp_return": 1}
     assert inv.compare(a, b, t[0])["violations"] == 0  # after the cut: not compared
+    # One bit is a violation, not a catch: rounding carries no leak.
+    assert res["caught"] == 0 and 0 < res["largest"] < 1e-15
+
+
+def test_compare_catches_a_move_above_rounding_or_a_missing_value():
+    t = pl.Series("decision_time", [1, 2, 3]).cast(pl.Datetime("ms", "UTC"))
+    a = pl.DataFrame({"decision_time": t, "exp_return": [0.1, 0.2, None], "p_up": [0.3, 0.3, 0.3]})
+    moved = a.with_columns(pl.Series("p_up", [0.3, 0.3 + 2 * inv.CAUGHT_ABOVE, 0.3]))
+    res = inv.compare(a, moved, t[2])
+    assert res["violations"] == 1 and res["caught"] == 1 and res["largest"] > inv.CAUGHT_ABOVE
+    almost = a.with_columns(pl.Series("p_up", [0.3, 0.3 + inv.CAUGHT_ABOVE / 2, 0.3]))
+    assert inv.compare(a, almost, t[2])["caught"] == 0  # at or below the threshold: not a catch
+    for values in ([None, 0.2, None], [0.1, 0.2, 0.0]):  # a value turns missing, or a missing one appears
+        res = inv.compare(a, a.with_columns(pl.Series("exp_return", values)), t[2])
+        assert res["violations"] == 1 and res["caught"] == 1, values
+        assert res["largest"] == 0.0  # no two present values differ
 
 
 # --- Honest models pass, leaks are flagged -------------------------------------------------
@@ -381,14 +397,54 @@ def test_each_planted_peeker_is_flagged_at_every_cut(name, bars, cuts):
 def test_the_transductive_scaler_is_flagged_unless_its_month_is_over(bars, cuts):
     (spec,) = _specs(["transductive-scaler"])
     records = inv.run_model(spec, bars, cuts, CFG)
-    assert [r["violations"] > 0 for r in records] == [c.month_continues for c in cuts]
+    assert [r["caught"] > 0 for r in records] == [c.month_continues for c in cuts]
     assert not all(c.month_continues for c in cuts)  # the last-bar-before-fold cuts end their month
+    assert all(r["violations"] == 0 for r in records if not r["month_continues"])  # not a bit at a month's end
+    # A real leak, far above rounding: on these bars its weakest catch moves an output by 8e-3.
+    assert min(r["largest_change"] for r in records if r["month_continues"]) > 1e-4
     assert inv.verdict(spec, records)["ok"]
+
+
+class _AbsorbedScaler(leaks.TransductiveScaler):
+    """The transductive scaler before the fix: its ridge standardizes again, which undoes the leak exactly."""
+
+    def predict(self, test: pl.DataFrame) -> pl.DataFrame:
+        check_test_frame(test)
+        assert self._train is not None
+        feats = [c for c in test.columns if c.startswith("f_")]
+        both = pl.concat([self._train.select(feats), test.select(feats)])
+        mean, std = both.select(pl.col(feats).mean()).row(0), both.select(pl.col(feats).std(ddof=0)).row(0)
+        scale = [(pl.col(c) - m) / (s if s else 1.0) for c, m, s in zip(feats, mean, std, strict=True)]
+        inner = Ridge()
+        inner.fit(self._train.with_columns(scale))
+        return inner.predict(test.with_columns(scale))
+
+
+def test_a_control_caught_by_rounding_alone_is_off_its_pattern(bars, cuts):
+    """The absorbed scaler moves its outputs by about 1e-16 at most: a catch on one platform, not on
+    another. Counted as no catch at all, it is off its pattern everywhere, and H1 says so."""
+    spec = inv.ModelSpec("absorbed-scaler", lambda b: _AbsorbedScaler, expect=inv.FLAG_UNLESS_MONTH_END)
+    records = inv.run_model(spec, bars, cuts, CFG)
+    assert all(r["caught"] == 0 and r["largest_change"] < 1e-12 for r in records)
+    v = inv.verdict(spec, records)
+    assert v["pattern"] == "." * len(cuts) and not v["ok"]
+    assert v["rounding_only_cuts"] == [r["cut"] for r in records if r["violations"] > 0]
+
+
+def test_an_honest_model_is_flagged_by_a_single_bit():
+    """Rounding never excuses an honest model: one differing bit is a violation."""
+    (spec,) = _specs(["ridge"])
+    record = {"cut": 1, "violations": 1, "by_direction": {"x3": 1, "/3": 0}, "caught": 0,
+              "caught_by_direction": {"x3": 0, "/3": 0}, "largest_change": 1e-17, "opens_fold": False,
+              "month_continues": True}  # fmt: skip
+    v = inv.verdict(spec, [record])
+    assert v["pattern"] == "X" and not v["ok"] and v["rounding_only_cuts"] == [1]
 
 
 def test_a_control_flagged_off_its_pattern_is_not_ok(cuts):
     (spec,) = _specs(["ridge-unpurged"])
-    records = [{"violations": 1, "by_direction": {"x3": 1, "/3": 0}, "opens_fold": c.opens_fold,
+    records = [{"cut": c.index, "violations": 1, "by_direction": {"x3": 1, "/3": 0}, "caught": 1,
+                "caught_by_direction": {"x3": 1, "/3": 0}, "largest_change": 0.5, "opens_fold": c.opens_fold,
                 "month_continues": c.month_continues} for c in cuts]  # fmt: skip
     assert not inv.verdict(spec, records)["ok"]  # flagged everywhere, but predicted only at the fold openings
 

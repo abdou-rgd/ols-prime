@@ -50,8 +50,10 @@ Fixed before any model is trained. Any change gets a dated entry in the change l
   - models that use the next bar's range or VWAP as their forecast;
   - a model that compares the next close with an older one;
   - a return shifted the wrong way;
-  - a scaler fitted on the whole test month;
+  - a scaler fitted on the whole test month, ahead of a ridge that does not rescale;
   - models fitted without the purge.
+
+  A planted leak is caught at a cut only where an output moves by more than 10⁻⁹, turns missing or stops being missing. A change at the level of rounding carries no leak, so it never counts as a catch. An honest model, by contrast, must not differ by a single bit.
 - **Positive control:** ridge fitted on labels shifted one bar early must beat climatology with a Brier skill score above 0.5. The pipeline must see a signal when there is one.
 - **The limits.**
   - A model that reads the time stamps, such as a calendar learned from the future, passes the perturbation. Code review and the seal stop it, not this test.
@@ -118,6 +120,11 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
     - It watches the seal. A test may not rebind the seal's names, and a sealed read that returns a vault row fails the test.
     - The static guard now flags `sys.modules`, edits of `sys.path`, and any patch of the seal.
     - The tripwire runs only under pytest. The command-line runs rely on the seal in `olsprime.protocol` and on the static guard.
+- 2026-10-28, after the first official H1 run (commit 9c414ca), which held:
+  - CI on Linux found a control caught by rounding alone. The transductive scaler fed its scaled features to the baseline ridge, which standardizes again on its training rows and so undoes the scaling exactly. Its outputs moved by 10⁻¹⁶ at most. The bit-for-bit rule counted that as a catch at every cut on Windows, and at all but one cut on Linux.
+  - Now a control is caught only where an output moves by more than 10⁻⁹ (see Leakage tests). Measured on the synthetic bars, every other control's weakest catch moves an output by at least 2.7 · 10⁻³ or flips a target.
+  - The transductive scaler's ridge now centres the features but keeps their scale, so the test month's spread reaches the penalty. Its catches move an output by 8 · 10⁻³ to 2.5 · 10⁻² on the synthetic bars.
+  - H1 and Report n°1 are run again on the corrected code. The first run's record stays in `runs/2026-10-28-h1/`; the rows of `docs/RESULTS.md` come from the second run. The registered hypothesis H1 does not change.
   - A second audit of the guards found three more ways around them and eight smaller holes. Each is closed, or stated as a limit in `docs/DATA.md`.
     - Every test gets an empty data root of its own. With both keys forged, the two file loaders still refuse the repository's `data/`.
     - A raw archive under `data/raw/` is read only when every file on the call stack holds the allowance, the test file included.

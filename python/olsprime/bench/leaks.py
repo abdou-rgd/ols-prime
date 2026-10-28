@@ -15,7 +15,8 @@ permanent controls, beside :class:`olsprime.models.baselines.Cheater`:
   wrong way. Flagged at every cut.
 - :class:`TransductiveScaler`: ridge on features standardized with the training rows **and the
   whole test month**. Flagged at every cut whose month goes on after it, and never at the last
-  bar of a month, where the month's features are all in the past.
+  bar of a month, where the month's features are all in the past. Its ridge centres the features
+  but does not rescale them, so the test month's spread reaches the penalty.
 
 Never report one as a result, never copy one into a model.
 """
@@ -242,8 +243,23 @@ class OffByOneReturn:
         return _output(test, exp_return=r)
 
 
+class _RidgeAtGivenScale(Ridge):
+    """Ridge that centres its features on its training rows but keeps the scale it is given."""
+
+    @staticmethod
+    def _standardizer(x: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        return x.mean(axis=0), np.ones(x.shape[1])
+
+
 class TransductiveScaler:
-    """!!! LEAKS: ridge on features standardized on the training rows plus the whole test month. !!!"""
+    """!!! LEAKS: ridge on features standardized on the training rows plus the whole test month. !!!
+
+    The inner ridge centres the features on its training rows but does not rescale them, so the
+    test month's spread reaches its penalty, as in any pipeline that scales before a penalized fit.
+    The baseline :class:`Ridge` standardizes again on its training rows, which undoes this scaling
+    exactly: the leak then showed only as rounding, which H1 does not count as a catch (iteration 2,
+    caught at every cut on Windows and missed at one on Linux).
+    """
 
     name = "transductive-scaler"
 
@@ -267,6 +283,6 @@ class TransductiveScaler:
                 [(pl.col(c) - m) / (s if s and s > 0 else 1.0) for c, m, s in zip(feats, mean, std, strict=True)]
             )
 
-        inner = Ridge()
+        inner = _RidgeAtGivenScale()
         inner.fit(scale(self._train))
         return inner.predict(scale(test))
