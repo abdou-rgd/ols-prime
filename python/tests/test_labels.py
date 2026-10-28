@@ -46,8 +46,8 @@ def test_fwd_return_uses_open_of_t_plus_1_and_open_of_t_plus_1_plus_h(h):
     labels = forward_labels(bars, "1d", h)
     opens = bars["open"].to_numpy()
     for t in (0, 10, 50, 90 - h):
-        # NumPy's log may run SIMD code (SVML on AVX-512 Linux runners) that differs from math.log by an
-        # ulp, so allow 1e-14 relative. The usual mistakes below are more than 1e-6 away.
+        # NumPy's log may take a SIMD path (AVX-512 on some Linux runners) that differs from math.log by
+        # an ulp, so allow 1e-14 relative. The usual mistakes below are more than 1e-6 away.
         assert labels["fwd_return"][t] == pytest.approx(math.log(opens[t + 1 + h] / opens[t + 1]), rel=1e-14, abs=0)
         assert labels["entry_time"][t] == at(t + 1)
         assert labels["exit_time"][t] == at(t + 1 + h)
