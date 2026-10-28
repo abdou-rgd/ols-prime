@@ -51,7 +51,7 @@ uv run python -m olsprime.bench.invariance
 uv run python -m olsprime.bench.report1
 ```
 
-The first command downloads and checks the archives. The second runs H1, the future-invariance test, in about eight minutes. The third writes [Report n°1](docs/reports/report-1.md) in about a minute and a half. `report1 --check <run folder>` re-runs a report and compares it byte for byte.
+The first command downloads and checks the archives. On the development machine, the second runs H1, the future-invariance test, in seven to eight minutes with its default four processes. The third writes [Report n°1](docs/reports/report-1.md) in about 75 seconds. `report1 --check <run folder>` re-runs a report and compares it byte for byte.
 
 The Kani proofs need Linux (WSL2 works). Four of the twenty-one harnesses finish. On the development machine they take 14 to 16 minutes run four at a time (`-j 4 --output-format=terse`), or 18 minutes one after another:
 - the two of iteration 1: every buy gate blocks every buy, and sells are never gated;

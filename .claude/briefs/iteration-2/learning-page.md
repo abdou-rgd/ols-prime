@@ -599,3 +599,15 @@ This section supersedes section (4)'s colour design, its H1 table and its run. E
   - the 2022-11-21 breakout still does not flip.
 
 **The arc of §7 now has four rounds:** columns; ratios inside a bar; the candle's shape, with the vacuous `?`; colour × size. Each one was found by planting a leak the bench had never seen. The ml-engineer's bolder idea for iteration 3, an idea only: make H1 adaptive. Learn where the perturbation is least sure to catch a leak, and add a designed run there.
+
+**Update, 2026-10-28, after the official runs (orchestrator).**
+- The first official H1 run (commit 9c414ca) held. CI on Linux then showed that the transductive-scaler control was caught by rounding alone: its ridge standardized the features again, which undid the leak exactly, so its outputs moved by 1e-16 at most. See `rounding-fix.md`.
+- **The fix.** A control is caught at a cut only where an output moves by more than 1e-9, turns missing or stops being missing. An honest model must still not move by a single bit. The scaler now feeds a ridge that centres its features but keeps the scale it is given.
+- **The second official run** (commit 881a63c, `runs/2026-10-28-h1-2/`, 7 min 39 s with 4 processes) holds.
+  - Honest models: 0 violations, and no output moved at all.
+  - 27 controls on their predicted pattern, none with a rounding-only cut.
+  - Smallest catch: 7.1e-4 on BTC and 7.3e-4 on ETH (climatology-unpurged). The transductive scaler's is 1.8e-3 and 8.0e-4.
+  - The cheater is caught at 16 of 16 cuts.
+- **Report n°1** does not use the changed code. Re-run at 881a63c with `--check`, only its commit and code digest lines differ. It takes about 75 s with 2 processes.
+- **The page** gained a section on the control caught by rounding and a ninth question in « Teste-toi ». It cites H1 at 881a63c and Report n°1 at 9c414ca.
+- **Published** after the orchestrator's checks: https://claude.ai/artifact/VDdujVgLyyi2PcMBnaM1Sd.
