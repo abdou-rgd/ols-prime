@@ -10,6 +10,22 @@
 #   finishes moves to `proven`, here and in the Verification section of
 #   CLAUDE.md.
 #
+# Every harness runs with the same flags, `KANI_FLAGS` below:
+# - `-Z function-contracts -Z stubbing`: the arithmetic helpers of lib.rs carry
+#   contracts (src/spec.rs). Each `*_contract` harness proves one contract
+#   with `proof_for_contract`; the `check_order_*`, `approval_*` and
+#   `sell_outcome_*` harnesses replace the helpers by their contracts with
+#   `stub_verified`, so their verdicts hold only as far as those contracts
+#   are proven.
+#   On 2026-10-28 only `product`'s contract is proven (`product_contract`).
+#   The contracts of `notional_floor`, `notional_ceil`, `max_qty_within` and
+#   `round_down_to_lot` are NOT proven: their harnesses are in `open`, and
+#   only the proptests in src/spec.rs sample them. A stubbed harness that
+#   finishes proves its property modulo those four contracts.
+# - `--no-assert-contracts`: a harness that calls a helper without stubbing it
+#   runs the helper's code, as in iteration 1, instead of also re-proving the
+#   helper's contract inline at every call.
+#
 # There is no schedule. One run of `open` costs up to (minutes + 5) runner
 # minutes per harness, which a private repository pays for. If Kani becomes a
 # required check, drop the `paths` filters: a required check that never starts
@@ -50,6 +66,7 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   KANI_VERSION: "0.68.0"
+  KANI_FLAGS: -Z function-contracts -Z stubbing --no-assert-contracts
 
 jobs:
   proven:
@@ -69,11 +86,18 @@ jobs:
           cargo kani setup
       # With --exact, Kani 0.68.0 exits 1 on any name that matches no harness
       # (checked locally), so a renamed harness fails this job.
+      # Local wall times on the iteration 2 code, Kani 0.68.0, CaDiCaL, each
+      # harness in its own process with 5 others on a 12-thread machine:
+      # buy_gates_block_every_buy 1,300 s, sells_are_never_gated 28 s,
+      # product_contract 112 s, exact_never_wraps 185 s.
       - name: Prove
+        # KANI_FLAGS is unquoted on purpose: it holds several arguments.
         run: >-
-          cargo kani -p risk --exact
+          cargo kani -p risk --exact $KANI_FLAGS
           --harness proofs::buy_gates_block_every_buy
           --harness proofs::sells_are_never_gated
+          --harness proofs::product_contract
+          --harness proofs::exact_never_wraps
 
   open:
     name: Kani, open (${{ matrix.harness }})
@@ -85,11 +109,21 @@ jobs:
       fail-fast: false
       matrix:
         harness:
+          # Contracts of the helpers: everything stubbed below rests on them.
+          # Not proven on 2026-10-28; only the proptests of src/spec.rs
+          # sample them.
+          - notional_floor_contract
+          - notional_ceil_contract
+          - max_qty_within_contract
+          - round_down_to_lot_contract
+          # check_order, with the helpers replaced by their contracts.
+          - check_order_core_full
           - check_order_full
           - check_order_market
           - check_order_tiny
           - approval_is_maximal_and_stable_tiny
           - sell_outcome_ignores_trip_wires
+          # Helpers, checked on their own code.
           - notional_helpers_full
           - ceil_is_subadditive_full
           - max_qty_within_exact_full
@@ -119,7 +153,7 @@ jobs:
           fi
           status=0
           timeout --kill-after=5m "${MINUTES}m" \
-            cargo kani -p risk --exact --harness "proofs::$NAME" || status=$?
+            cargo kani -p risk --exact $KANI_FLAGS --harness "proofs::$NAME" || status=$?
           # 124: the time limit ran out. Any other failure is a real one.
           if (( status == 124 )); then
             echo "::warning title=$NAME::No verdict within $MINUTES minutes."

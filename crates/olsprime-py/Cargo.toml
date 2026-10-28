@@ -1,0 +1,38 @@
+[package]
+name = "olsprime-py"
+description = "Python bindings (module `olsprime_rs`) for the simulator, the OLS core and the risk kernel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+# Built and published by maturin, never by `cargo publish`.
+publish = false
+
+[lib]
+name = "olsprime_rs"
+# cdylib: the Python extension; rlib: the pure helpers, for the Rust tests.
+crate-type = ["cdylib", "rlib"]
+
+[features]
+# The Python module itself. Off by default, so that `cargo test --workspace`, the MSRV check
+# and `cargo kani -p risk` never build PyO3 or link libpython: a plain `cargo test` would
+# otherwise need a Python shared library at link and load time on every machine. maturin turns
+# it on (`pyproject.toml`), and CI lints it with `--features python`.
+python = ["dep:pyo3", "dep:numpy"]
+
+[dependencies]
+backtest = { path = "../backtest" }
+ols-core = { path = "../ols-core" }
+risk = { path = "../risk" }
+thiserror = "2.0.21"
+# Exact pins: rust-numpy releases in lockstep with PyO3, and the pair must match.
+# abi3-py312: one wheel for CPython 3.12 and later. No `extension-module` feature: it is
+# deprecated, and maturin (>= 1.9.4) sets PYO3_BUILD_EXTENSION_MODULE instead.
+pyo3 = { version = "=0.30.1", optional = true, features = ["abi3-py312"] }
+numpy = { version = "=0.30.0", optional = true }
+
+[dev-dependencies]
+proptest = "1.12"
+
+[lints]
+workspace = true

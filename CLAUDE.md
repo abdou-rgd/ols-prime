@@ -70,10 +70,14 @@ Delegation rules:
 ```bash
 cargo fmt --all --check
 cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy -p olsprime-py --all-targets --features python -- -D warnings
 cargo test --workspace
-cargo kani -p risk --exact --harness proofs::buy_gates_block_every_buy \
-  --harness proofs::sells_are_never_gated   # WSL2 only
+cargo kani -p risk --exact -Z function-contracts -Z stubbing --no-assert-contracts \
+  --harness proofs::buy_gates_block_every_buy --harness proofs::sells_are_never_gated \
+  --harness proofs::product_contract --harness proofs::exact_never_wraps   # WSL2 only
 cd python && uv run pytest
 ```
 
-Kani runs only the proven harnesses. The `proven` job of `.github/workflows/kani.yml` keeps the list. `cargo kani -p risk` runs all fourteen, and in iteration 1 twelve of them ran out of time at one hour each, on a shared machine.
+Kani runs only the proven harnesses, with the flags of `KANI_FLAGS` in `.github/workflows/kani.yml`. The `proven` job of that file keeps the list. `cargo kani -p risk` with the same flags runs all twenty-one harnesses.
+- In iteration 1, twelve of them ran out of time at one hour each, on a shared machine.
+- In iteration 2, so did the contracts of the four dividing helpers, at 40 minutes each, and every harness that stubs them. No verdict rests on an unproven contract.

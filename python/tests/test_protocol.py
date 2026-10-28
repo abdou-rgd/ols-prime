@@ -32,6 +32,7 @@ from olsprime.protocol import (
     seal,
     vault_open,
 )
+from tests.allowlist import ALLOWED
 from tests.fakes import DAY_MS, HOUR_MS, FakeBucket, kline_rows, klines_csv, month_rows
 
 PACKAGE = Path(protocol.__file__).parent
@@ -397,16 +398,39 @@ RAW_READERS = frozenset(
     }
 )
 # Names that load code or attributes by string, which no name filter can follow.
-DYNAMIC_NAMES = frozenset({"import_module", "__import__"})
+DYNAMIC_NAMES = frozenset(
+    {"import_module", "__import__", "__builtins__", "attrgetter", "methodcaller", "__getattribute__"}
+)  # a name or an attribute reached by a string, past every name filter
 # ``seal`` is protocol's own lock: other code reaches data through load_klines, which computes ``known_at`` itself.
 SEAL = "seal"
 BANNED_MODULES = (
     "pyarrow", "fastparquet", "duckdb", "pandas", "csv", "zipfile", "importlib",
     "subprocess",  # shelling out to parquet-tools, duckdb, ...
     "pickle", "joblib", "shelve", "marshal",  # a cached object holding vault rows
+    "runpy",  # runs a file by path, outside the static walk and the allow-list
+    "zipimport",  # zipimporter(archive).get_data(member) reads a zip member without zipfile
+    "gc", "ctypes",  # gc.get_referents finds the originals behind a wrapper, ctypes rewrites memory
 )  # fmt: skip
 DATA_LIBRARIES = ("polars", "pyarrow", "pandas", "numpy", "duckdb")  # getattr/vars on these is dynamic access
 FILE_SUFFIXES = (".parquet", ".zip")
+# The guards' own handles. Reaching them from a test is how a test would switch them off.
+DISARM_ATTRIBUTES = frozenset(
+    {
+        "__globals__", "__wrapped__", "__closure__", "__bases__", "__base__", "__mro__", "__subclasses__",
+        "__code__", "__defaults__", "__kwdefaults__", "__func__",  # the original behind a wrapper
+        "undo", "reload",  # MonkeyPatch.undo(), importlib.reload()
+    }
+)  # fmt: skip
+# Test files that hold the seal allowances. A helper imported from one of them puts that file on the stack of
+# the call, and the loaders' exemption for files that may open a fake vault would cover the caller too.
+EXEMPT_TESTS = frozenset({"test_tripwire", "test_protocol", "test_manifest"})
+# What other tests may take from them: data builders and readers of a log, nothing that runs a loader.
+SAFE_TEST_HELPERS = frozenset({"bars", "store", "utc", "access_lines", "open_vault"})  # open_vault: a seal-patch of its own
+GUARD_MODULES = frozenset({"conftest", "tripwire", "allowlist"})  # tests/conftest.py, tests/tripwire.py, tests/allowlist.py
+# Keys of the vault. Forging both opens it: ``open_vault`` (test_protocol), ``vault_key_file`` and ``OPEN_ENV``
+# (protocol), and the variable's name as a string, spelled out or built by concatenation.
+VAULT_KEY_NAMES = frozenset({"open_vault", "vault_key_file", "OPEN_ENV"})
+VAULT_KEY_STRING = "OLSPRIME_OPEN_VAULT"
 # Code run from a string: the bare builtins only, since ``re.compile`` and ``expr.list.eval`` are ordinary
 # (olsprime/universe.py compiles a regular expression). ``builtins.eval`` is caught through MODULE_ATTRIBUTES.
 EXEC_BUILTINS = frozenset({"eval", "exec", "compile"})
@@ -423,27 +447,7 @@ MODULE_ATTRIBUTES: dict[str, tuple[str, frozenset[str]]] = {
 # but still scanned for these data tokens, so that ``!parquet-tools cat x.parquet`` does not slip through.
 MAGIC_DATA_TOKENS = re.compile(r"parquet|\.zip\b|duckdb|\.ipc\b|\.arrow\b|vault", re.I)
 
-# Where a rule is allowed, by file relative to python/, each with its reason. Exact, not by pattern.
-ALLOWED: dict[str, dict[str, str]] = {
-    "olsprime/protocol.py": {
-        "reader": "the one reader of stored klines, always followed by seal",
-        "seal": "defines and calls the seal",
-    },
-    "olsprime/data/binance_vision.py": {
-        "raw-reader": "parses the downloaded archives into the stored schema",
-        "import:zipfile": "opens the downloaded archives",
-    },
-    "tests/fakes.py": {
-        "raw-reader": "writes fake archives",
-        "import:zipfile": "writes fake archives",
-    },
-    "tests/test_binance_vision.py": {"reader": "reads back the Parquet file the build just wrote"},
-    "tests/test_universe.py": {"reader": "reads back the universe file the run just wrote"},
-    "tests/test_protocol.py": {
-        "reader": "shows that the stored file keeps the vault rows",
-        "seal": "tests the seal itself",
-    },
-}
+# Where a rule is allowed, by file: tests/allowlist.py (shared with the run-time tripwire, tests/tripwire.py).
 
 
 def _root_name(node: ast.AST) -> str | None:
@@ -489,6 +493,228 @@ def _module_aliases(tree: ast.AST) -> dict[str, str]:
                 if a.name.split(".")[0] in MODULE_ATTRIBUTES:
                     bound[a.asname or a.name.split(".")[0]] = a.name.split(".")[0]
     return bound
+
+
+def _data_package_aliases(tree: ast.AST) -> set[str]:
+    """Local names bound to ``olsprime``, ``olsprime.data`` or a module of it (``binance_vision``, ``survey``, ...).
+
+    ``getattr(binance_vision, "read_" + "klines_zip")`` reaches an unsealed reader by a string, like
+    ``getattr(pl, ...)`` on a data library.
+    """
+    bound = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] == "olsprime":
+                    bound.add(a.asname or "olsprime")
+        elif isinstance(node, ast.ImportFrom):
+            module = node.module or ""
+            if node.level:  # from . import binance_vision, from .data import survey
+                bound |= {a.asname or a.name for a in node.names}
+            elif module == "olsprime":
+                bound |= {a.asname or a.name for a in node.names if a.name == "data"}
+            elif module == "olsprime.data" or module.startswith("olsprime.data."):
+                bound |= {a.asname or a.name for a in node.names}
+    return bound
+
+
+def _call_functions(tree: ast.AST) -> set[int]:
+    """``id`` of every node that is called (``f`` in ``f(x)``): a name that is not in it is passed as a value."""
+    return {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
+
+
+# What olsprime.protocol holds that nobody may rebind: patching any of them switches the seal off.
+PROTOCOL_NAMES = frozenset({"seal", "vault_open", "VAULT", "load_klines", "load_klines_file", "load_universe"})
+PATCHERS = frozenset({"setattr", "delattr", "patch"})  # setattr(...), monkeypatch.setattr, mock.patch, patch(...)
+SYS_PATH_MUTATORS = frozenset({"insert", "append", "extend"})
+
+
+def _bound_names(tree: ast.AST, module: str) -> set[str]:
+    """Local names bound to ``module`` (``sys``) or to a submodule that was imported from a package.
+
+    ``import sys``, ``import sys as s``, ``from olsprime import protocol as p``, ``import olsprime.protocol as p``
+    and the relative ``from . import protocol`` bind a name.
+    """
+    package, _, leaf = module.rpartition(".")
+    bound = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name == module and (a.asname or not package):
+                    bound.add(a.asname or a.name)
+        elif isinstance(node, ast.ImportFrom) and package:
+            from_package = (node.module or "") == package or (node.level and (node.module or "") in ("", package))
+            if from_package:
+                bound |= {a.asname or a.name for a in node.names if a.name == leaf}
+    return bound
+
+
+def _is_protocol(node: ast.AST, protocol_names: set[str], olsprime_names: set[str]) -> bool:
+    """Whether ``node`` is the module olsprime.protocol: a name bound to it, or ``olsprime.protocol`` spelled out."""
+    if isinstance(node, ast.Name):
+        return node.id in protocol_names
+    return (
+        isinstance(node, ast.Attribute)
+        and node.attr == "protocol"
+        and isinstance(node.value, ast.Name)
+        and node.value.id in olsprime_names
+    )
+
+
+def _text(node: ast.AST) -> str | None:
+    """The string a literal, a concatenation of literals or an f-string of literals spells; ``None`` if unknown."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        left, right = _text(node.left), _text(node.right)
+        return None if left is None or right is None else left + right
+    if isinstance(node, ast.JoinedStr):
+        parts = [_text(v) for v in node.values]
+        return None if None in parts else "".join(parts)  # type: ignore[arg-type]
+    return None
+
+
+def _patcher(call: ast.Call) -> str | None:
+    """``setattr``, ``delattr`` or ``patch`` for ``setattr(...)``, ``mp.setattr(...)``, ``mock.patch(...)``, ``patch.object(...)``."""
+    func = call.func
+    if isinstance(func, ast.Attribute) and func.attr == "object":  # mock.patch.object, patch.object
+        inner = func.value
+        inner_name = inner.id if isinstance(inner, ast.Name) else inner.attr if isinstance(inner, ast.Attribute) else None
+        return "patch.object" if inner_name == "patch" else None
+    name = func.id if isinstance(func, ast.Name) else func.attr if isinstance(func, ast.Attribute) else None
+    return name if name in PATCHERS else None
+
+
+def _extra_findings(tree: ast.AST, add) -> None:
+    """Rules added after audit A: ``sys.modules``, ``sys.path`` and patching of the seal."""
+    sys_names = _bound_names(tree, "sys")
+    protocol_names = _bound_names(tree, "olsprime.protocol")
+    olsprime_names = {"olsprime"}  # ``import olsprime`` / ``import olsprime.protocol`` bind this name
+    olsprime_names |= {a.asname for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names if a.name == "olsprime" and a.asname}
+
+    def is_sys(node: ast.AST, attribute: str) -> bool:
+        return isinstance(node, ast.Attribute) and node.attr == attribute and _root_name(node.value) in sys_names
+
+    for node in ast.walk(tree):
+        # sys.modules[...] and sys.modules.get(...) reach a module by a string, past the name filter.
+        if is_sys(node, "modules"):
+            add("dynamic", node, "sys.modules reaches a module by its name")
+        if isinstance(node, ast.ImportFrom) and not node.level and node.module == "sys":
+            for a in node.names:
+                if a.name in ("modules", "path"):
+                    add("dynamic", node, f"from sys import {a.name}")
+        # sys.path edits put a folder outside python/ (a helper written to tmp_path) on the import path.
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute):
+            if node.func.attr in SYS_PATH_MUTATORS and is_sys(node.func.value, "path"):
+                add("dynamic", node, f"sys.path.{node.func.attr} imports code from outside python/")
+            if node.func.attr in ("syspath_prepend", "addsitedir"):
+                add("dynamic", node, f"{node.func.attr} imports code from outside python/")
+        stores: list[ast.AST] = []
+        if isinstance(node, ast.AugAssign | ast.AnnAssign):
+            stores = [node.target]
+        elif isinstance(node, ast.Assign):
+            stores = list(node.targets)
+        elif isinstance(node, ast.Delete):
+            stores = list(node.targets)
+        for target in stores:
+            base = target.value if isinstance(target, ast.Subscript) else target
+            if is_sys(base, "path"):
+                add("dynamic", node, "sys.path is rebound or edited")
+            # protocol.vault_open = ..., protocol.VAULT = ..., del protocol.load_klines
+            if isinstance(target, ast.Attribute) and (
+                _is_protocol(target.value, protocol_names, olsprime_names) or target.attr in PROTOCOL_NAMES - {"seal"}
+            ):
+                add("seal-patch", node, f"rebinds {target.attr}")
+        if isinstance(node, ast.Call):
+            patcher = _patcher(node)
+            if patcher and node.args:
+                target = node.args[0]
+                attribute = node.args[1] if len(node.args) > 1 else None
+                target_text = _text(target)
+                attribute_text = _text(attribute) if attribute is not None else None
+                if _is_protocol(target, protocol_names, olsprime_names):
+                    add("seal-patch", node, f"{patcher} on olsprime.protocol")
+                elif target_text is not None and (
+                    "olsprime.protocol" in target_text or target_text.rsplit(".", 1)[-1] in PROTOCOL_NAMES
+                ):
+                    add("seal-patch", node, f"{patcher} of {target_text!r}")
+                elif attribute_text in PROTOCOL_NAMES:
+                    add("seal-patch", node, f"{patcher} of the attribute {attribute_text!r}")
+            # vars(protocol), getattr(protocol, ...), protocol.__dict__ are dynamic access, like on a data library.
+            if isinstance(node.func, ast.Name) and node.func.id in ("getattr", "vars", "setattr", "delattr"):
+                if node.args and _is_protocol(node.args[0], protocol_names, olsprime_names):
+                    add("dynamic", node, f"{node.func.id} on olsprime.protocol")
+        if isinstance(node, ast.Attribute) and node.attr == "__dict__" and _is_protocol(node.value, protocol_names, olsprime_names):
+            add("dynamic", node, "__dict__ of olsprime.protocol")
+        # getattr(sys, "mod" + "ules") and vars(sys) are sys.modules by another road.
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("getattr", "vars"):
+            if node.args and _root_name(node.args[0]) in sys_names:
+                add("dynamic", node, f"{node.func.id} on sys")
+        if isinstance(node, ast.Attribute) and node.attr == "__dict__" and _root_name(node.value) in sys_names:
+            add("dynamic", node, "__dict__ of sys")
+
+    data_names = _data_package_aliases(tree)
+    called = _call_functions(tree)
+    for node in ast.walk(tree):
+        # getattr(binance_vision, "read_" + "klines_zip") and vars(binance_vision): the data package by a string.
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id in ("getattr", "vars"):
+            if node.args and _root_name(node.args[0]) in data_names:
+                add("dynamic", node, f"{node.func.id} on a module of olsprime.data")
+        if isinstance(node, ast.Attribute) and node.attr == "__dict__" and _root_name(node.value) in data_names:
+            add("dynamic", node, "__dict__ of a module of olsprime.data")
+        # functools.reduce(getattr, path, obj): getattr handed over as a value is a getattr nobody can follow.
+        if isinstance(node, ast.Name) and node.id in ("getattr", "vars") and isinstance(node.ctx, ast.Load) and id(node) not in called:
+            add("dynamic", node, f"{node.id} passed as a value")
+
+        # The guards' handles: the original behind a wrapper, the patches' undo, a reload of the seal.
+        if isinstance(node, ast.Attribute) and node.attr in DISARM_ATTRIBUTES:
+            add("disarm", node, f".{node.attr} reaches behind a guard")
+        if isinstance(node, ast.Name) and node.id == "reload":
+            add("disarm", node, "reload")
+        if isinstance(node, ast.alias) and node.name.rsplit(".", 1)[-1] == "reload":
+            add("disarm", node, "reload")
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] == "tests" and GUARD_MODULES & set(a.name.split(".")[1:]):
+                    add("disarm", node, f"import {a.name}")
+                elif a.name in GUARD_MODULES:
+                    add("disarm", node, f"import {a.name}")
+        # Importing from a test file that holds the seal allowances: its helpers carry the exemption to the caller.
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.name.split(".")[0] == "tests" and EXEMPT_TESTS & set(a.name.split(".")[1:]):
+                    add("disarm", node, f"import {a.name}")
+        if isinstance(node, ast.ImportFrom):
+            parts = (node.module or "").split(".") if node.module else []
+            in_tests = parts[:1] == ["tests"] or node.level > 0
+            leaf = parts[-1] if parts else ""
+            if in_tests and leaf in EXEMPT_TESTS and any(a.name not in SAFE_TEST_HELPERS for a in node.names):
+                add("disarm", node, f"from {node.module} import a helper that carries the seal exemption")
+            elif in_tests and (not parts or parts == ["tests"]) and any(a.name in EXEMPT_TESTS for a in node.names):
+                add("disarm", node, "from tests import a test file that holds the seal allowances")
+        if isinstance(node, ast.ImportFrom):
+            parts = (node.module or "").split(".") if node.module else []
+            brings = any(a.name in GUARD_MODULES for a in node.names)
+            if parts[:1] == ["tests"] and (GUARD_MODULES & set(parts[1:]) or (len(parts) == 1 and brings)):
+                add("disarm", node, f"from {node.module} import ...")
+            elif node.level and (GUARD_MODULES & set(parts) or brings):
+                add("disarm", node, f"from {'.' * node.level}{node.module or ''} import ...")
+            elif not node.level and len(parts) == 1 and parts[0] in GUARD_MODULES:
+                add("disarm", node, f"from {node.module} import ...")
+        if isinstance(node, ast.Attribute) and node.attr in GUARD_MODULES and _root_name(node.value) == "tests":
+            add("disarm", node, f"tests.{node.attr}")
+
+        # The vault's keys: forging both opens the real vault. Rebinding the seal is a ``seal-patch`` too.
+        if isinstance(node, ast.Name | ast.Attribute):
+            name = node.id if isinstance(node, ast.Name) else node.attr
+            if name in VAULT_KEY_NAMES:
+                add("seal-patch", node, f"{name} forges a key of the vault")
+        elif isinstance(node, ast.alias) and node.name.rsplit(".", 1)[-1] in VAULT_KEY_NAMES:
+            add("seal-patch", node, f"{node.name} forges a key of the vault")
+        if isinstance(node, ast.Constant | ast.BinOp | ast.JoinedStr):
+            text = _text(node)
+            if text is not None and VAULT_KEY_STRING in text:
+                add("seal-patch", node, f"the name {VAULT_KEY_STRING} forges a key of the vault")
 
 
 def notebook_code(text: str) -> tuple[str, list[str]]:
@@ -542,6 +768,7 @@ def findings(source: str, filename: str) -> list[tuple[str, str]]:
         return [*found, ("unparseable", f"{filename}:{error.lineno}: [unparseable] {error.msg}")]
     aliases = _library_aliases(tree)
     module_aliases = _module_aliases(tree)
+    _extra_findings(tree, add)
 
     for node in ast.walk(tree):
         names = []
@@ -598,7 +825,9 @@ def findings(source: str, filename: str) -> list[tuple[str, str]]:
 def violations(source: str, filename: str) -> list[str]:
     """What ``source``, living at ``filename`` (relative to python/), may not do; the allow-list applied."""
     allowed = ALLOWED.get(filename, {})
-    return [text for rule, text in findings(source, filename) if rule not in allowed]
+    # A file that holds the seal allowance (it defines, calls or tests the seal) may patch it.
+    exempt = {"seal-patch"} if "seal" in allowed else set()
+    return [text for rule, text in findings(source, filename) if rule not in allowed and rule not in exempt]
 
 
 def python_files(root: Path = PYTHON_ROOT) -> list[Path]:
@@ -700,6 +929,78 @@ CHEATERS = [
     ("shutil-copy2", "import shutil as sh\nsh.copy2(src, dst)", {"copy"}),
     ("shutil-copytree", "import shutil\nshutil.copytree(src, dst)", {"copy"}),
     ("from-shutil-copy", "from shutil import copy as c\nc(src, dst)", {"copy"}),
+    # --- Audit A, D1: the two paths that passed both guards ---
+    (
+        "audit-a-helper-on-sys-path",  # bypass2/test_evasion.py: a helper written to tmp_path, then imported
+        "import sys\nfrom pathlib import Path\n(tmp_path / 'helper_audit_a.py').write_text(HELPER)\n"
+        "sys.path.insert(0, str(tmp_path))\nimport helper_audit_a\ndf = helper_audit_a.raw(RAW_VAULT)",
+        {"dynamic"},
+    ),
+    (
+        "audit-a-sys-modules-fragment",  # bypass2/test_evasion.py: pyarrow's fragment API through sys.modules
+        "import sys\nds = sys.modules['pyarrow.dataset']\nfs = sys.modules['pyarrow.fs']\n"
+        "t = ds.ParquetFileFormat().make_fragment(PQ_1D, filesystem=fs.LocalFileSystem()).to_table()",
+        {"dynamic"},
+    ),
+    ("sys-modules-get", "import sys\nds = sys.modules.get('pyarrow.dataset')", {"dynamic"}),
+    ("sys-modules-aliased", "import sys as s\nm = s.modules['polars']", {"dynamic"}),
+    ("from-sys-import-modules", "from sys import modules\nm = modules['polars']", {"dynamic"}),
+    ("getattr-on-sys", "import sys\nm = getattr(sys, 'mod' + 'ules')['polars']", {"dynamic"}),
+    ("vars-of-sys", "import sys\nm = vars(sys)['mod' + 'ules']", {"dynamic"}),
+    ("sys-path-append", "import sys\nsys.path.append(str(tmp_path))", {"dynamic"}),
+    ("sys-path-extend", "import sys\nsys.path.extend([str(tmp_path)])", {"dynamic"}),
+    ("sys-path-augmented", "import sys\nsys.path += [str(tmp_path)]", {"dynamic"}),
+    ("sys-path-slice", "import sys\nsys.path[0:0] = [str(tmp_path)]", {"dynamic"}),
+    ("sys-path-rebound", "import sys\nsys.path = [str(tmp_path)]", {"dynamic"}),
+    ("pytest-syspath-prepend", "monkeypatch.syspath_prepend(str(tmp_path))", {"dynamic"}),
+    (
+        "raw-zip-and-read_csv-of-an-archive",
+        "import io, zipfile\nimport polars as pl\n"
+        "z = zipfile.ZipFile('data/raw/spot/monthly/klines/BTCUSDT/1d/BTCUSDT-1d-2026-03.zip')\n"
+        "df = pl.read_csv(io.BytesIO(z.read(z.namelist()[0])), has_header=False)",
+        {"import:zipfile", "raw-reader"},
+    ),
+    (
+        "make_fragment-and-to_table",
+        "import pyarrow.dataset as ds\nds.ParquetFileFormat().make_fragment(p).to_table()",
+        {"import:pyarrow"},
+    ),
+    ("from_paths", "from pyarrow import dataset as ds\nds.FileSystemDataset.from_paths(paths)", {"import:pyarrow"}),
+    # --- Audit A, D2: switching the seal off ---
+    (
+        "monkeypatch-vault_open",
+        "from olsprime import protocol\nmonkeypatch.setattr(protocol, 'vault_open', lambda: True)",
+        {"seal-patch"},
+    ),
+    (
+        "monkeypatch-computed-name",
+        "from olsprime import protocol\nmonkeypatch.setattr(protocol, 'vault_' + 'open', lambda: True)",
+        {"seal-patch"},
+    ),
+    (
+        "monkeypatch-fstring-name",
+        "from olsprime import protocol\nname = 'open'\nmonkeypatch.setattr(protocol, f'vault_{name}', lambda: True)",
+        {"seal-patch"},
+    ),
+    ("monkeypatch-VAULT", "from olsprime import protocol as p\nmonkeypatch.setattr(p, 'VAULT', other_period)", {"seal-patch"}),
+    ("monkeypatch-the-seal", "from olsprime import protocol\nmonkeypatch.setattr(protocol, 'seal', lambda f, **k: f)", {"seal-patch"}),
+    ("monkeypatch-string-target", "monkeypatch.setattr('olsprime.protocol.vault_open', lambda: True)", {"seal-patch"}),
+    ("monkeypatch-load_klines-elsewhere", "monkeypatch.setattr(universe, 'load_klines', fake)", {"seal-patch"}),
+    ("builtin-setattr", "import olsprime.protocol\nsetattr(olsprime.protocol, 'VAULT', other_period)", {"seal-patch", "dynamic"}),
+    ("mock-patch-string", "from unittest import mock\nmock.patch('olsprime.protocol.load_klines_file')", {"seal-patch"}),
+    ("mock-patch-concatenated-string", "from unittest import mock\nmock.patch('olsprime.' + 'protocol.vault_open')", {"seal-patch"}),
+    (
+        "mock-patch-object",
+        "from unittest import mock\nfrom olsprime import protocol\nmock.patch.object(protocol, 'vault_open', return_value=True)",
+        {"seal-patch"},
+    ),
+    ("assign-vault_open", "import olsprime.protocol as protocol\nprotocol.vault_open = lambda: True", {"seal-patch"}),
+    ("assign-through-the-package", "import olsprime.protocol\nolsprime.protocol.VAULT = other_period", {"seal-patch"}),
+    ("delete-load_universe", "from olsprime import protocol\ndel protocol.load_universe", {"seal-patch"}),
+    ("vars-of-protocol", "from olsprime import protocol\nvars(protocol)['vault_open'] = lambda: True", {"dynamic"}),
+    ("dict-of-protocol", "from olsprime import protocol\nprotocol.__dict__['vault_open'] = lambda: True", {"dynamic"}),
+    ("getattr-on-protocol", "from olsprime import protocol\ngetattr(protocol, 'vault_' + 'open')", {"dynamic"}),
+    ("relative-import-of-protocol", "from . import protocol\nmonkeypatch.setattr(protocol, 'seal', None)", {"seal-patch"}),
 ]
 
 
@@ -745,12 +1046,79 @@ CONTROLS = [
     ("copy-module-and-frame-copy", "import copy\ncopy.copy(x)\ncopy.deepcopy(x)\nframe = df.clone()\nrows = lst.copy()"),
     ("numpy-save-and-compute", "import numpy as np\nnp.save('w.npy', np.zeros(3))\nnp.linalg.lstsq(a, b)"),
     ("json-loads", "import json\njson.loads(text)\nvalue = json.load(handle)"),
+    ("sys-reads", "import sys\nprint(sys.argv, sys.platform, sys.version_info, sys.path)\nsys.exit(0)\nsys.stdout.write('x')"),
+    ("sys-getattr-frozen", "import json\nvalue = getattr(config, 'frozen', False)"),
+    ("monkeypatch-env-and-other-modules", "monkeypatch.setenv('X', '1')\nmonkeypatch.setattr(universe, 'build_universe', f)\nmonkeypatch.setattr(socket.socket, 'connect', f)"),
+    ("calling-the-protocol", "from olsprime import protocol\nprotocol.load_klines('BTCUSDT', '1h', caller='x')\nprotocol.vault_open()\nprotocol.VAULT.start"),
+    ("setattr-on-own-object", "import olsprime.protocol\nsetattr(self, 'value', 1)\nmock.patch.object(thing, 'size', 3)"),
+    ("assign-own-attributes", "self.total = 1\nconfig.seal_length = 2\nobj.vault = 3"),
 ]
 NOTEBOOK_CONTROLS = [
     ("nb-plain-load_klines", notebook("from olsprime.protocol import load_klines", "df = load_klines('BTCUSDT', '1h')")),
     ("nb-magics-only", notebook("%matplotlib inline\n!pip install -q torch\nimport numpy as np\nnp.zeros(3)")),
     ("nb-markdown-mentions-parquet", notebook("x = 1", markdown="we read x.parquet with pl.read_parquet here")),
     ("nb-empty", notebook()),
+]
+
+
+# Round 2: the second audit's evasions that a static rule can see (the runtime ones are in test_tripwire.py).
+CHEATERS += [
+    ("e10-read_klines_zip", "from olsprime.data import binance_vision as bv\nbv.read_klines_zip(z, 'BTCUSDT')", {"raw-reader"}),
+    ("e10b-getattr-on-a-data-module", "from olsprime.data import binance_vision as bv\ngetattr(bv, 'read_' + 'klines_zip')(z, 'BTCUSDT')", {"dynamic"}),
+    ("e10c-vars-on-a-data-module", "from olsprime.data import binance_vision\nvars(binance_vision)['read_' + 'klines_zip']", {"dynamic"}),
+    ("e10d-dict-of-a-data-module", "import olsprime.data.survey as sv\nsv.__dict__['x']", {"dynamic"}),
+    ("e10e-relative-data-module", "from . import binance_vision as bv\ngetattr(bv, name)", {"dynamic"}),
+    ("e16-forge-keys-by-hand", "monkeypatch.setenv('OLSPRIME_OPEN_VAULT', '1')", {"seal-patch"}),
+    ("e16a-forge-keys-concatenated", "import os\nos.environ['OLSPRIME_OPEN_' + 'VAULT'] = '1'", {"seal-patch"}),
+    ("e16b-open_vault-helper", "from tests.test_protocol import open_vault\nopen_vault(monkeypatch)", {"seal-patch"}),
+    ("e16c-vault_key_file", "from olsprime.protocol import vault_key_file\nvault_key_file().write_text('2026-11-01')", {"seal-patch"}),
+    ("e16d-OPEN_ENV", "from olsprime import protocol\nmonkeypatch.setenv(protocol.OPEN_ENV, '1')", {"seal-patch"}),
+    ("e1-wrapped-seal", "protocol.seal = protocol.seal.__wrapped__", {"disarm", "seal"}),
+    ("e2-globals-of-load_klines", "g = load_klines.__globals__\ng['vault_open'] = lambda: True", {"disarm"}),
+    ("e4-patch-is_allowed", "from tests import tripwire\nmonkeypatch.setattr(tripwire, 'is_allowed', lambda f, r: True)", {"disarm"}),
+    ("e4a-import-tests.tripwire", "import tests.tripwire as tw", {"disarm"}),
+    ("e4b-from-tests.tripwire", "from tests.tripwire import is_allowed", {"disarm"}),
+    ("e4c-from-tests.allowlist", "from tests.allowlist import ALLOWED\nALLOWED['tests/x.py'] = {'reader': 'mine'}", {"disarm"}),
+    ("e4d-import-allowlist-from-tests", "from tests import allowlist", {"disarm"}),
+    ("e4e-relative-tripwire", "from .tripwire import is_allowed", {"disarm"}),
+    ("e4f-relative-conftest", "from . import conftest", {"disarm"}),
+    ("f2-helper-of-an-exempt-test", "from tests.test_tripwire import run_source", {"disarm"}),
+    ("f2a-helper-of-test_manifest", "from tests.test_manifest import anything", {"disarm"}),
+    ("f2b-unsafe-helper-of-test_protocol", "from tests.test_protocol import findings", {"disarm"}),
+    ("f2c-import-the-test-module", "import tests.test_tripwire as tt", {"disarm"}),
+    ("f2d-from-tests-import-test-file", "from tests import test_tripwire", {"disarm"}),
+    ("f2e-relative-test-module", "from .test_tripwire import run_source", {"disarm"}),
+    ("e5-reload", "import importlib\nimportlib.reload(protocol)", {"import:importlib", "disarm"}),
+    ("e5a-reload-by-name", "from importlib import reload\nreload(protocol)", {"import:importlib", "disarm"}),
+    ("e6-wrapped-reader", "import polars as pl\npl.read_parquet.__wrapped__(p)", {"disarm", "reader"}),
+    ("e6b-closure", "import polars as pl\ncells = pl.read_parquet.__closure__", {"disarm"}),
+    ("e7-bases", "import pyarrow.parquet as pq\nbase = pq.ParquetFile.__bases__[0]", {"disarm"}),
+    ("e7a-base", "base = SomeClass.__base__", {"disarm"}),
+    ("e7b-mro", "cls = SomeClass.__mro__[1]", {"disarm"}),
+    ("e7c-subclasses", "classes = SomeClass.__subclasses__()", {"disarm"}),
+    ("e7d-code-object", "wrapper.__code__ = original.__code__", {"disarm"}),
+    ("e15-runpy", "import runpy\nrunpy.run_path(helper)", {"import:runpy"}),
+    ("e15a-from-runpy", "from runpy import run_path", {"import:runpy"}),
+    ("n1-zipimporter", "import zipimport\nzipimport.zipimporter(archive).get_data('m.csv')", {"import:zipimport"}),
+    ("n1a-from-zipimport", "from zipimport import zipimporter", {"import:zipimport"}),
+    ("undo-then-runpy", "from tests.conftest import PATCHES\nPATCHES.undo()", {"disarm"}),
+    ("undo-by-any-name", "patches = pytest.MonkeyPatch()\npatches.undo()", {"disarm"}),
+    ("gc-referents", "import gc\ngc.get_referents(wrapper)", {"import:gc"}),
+    ("ctypes", "import ctypes", {"import:ctypes"}),
+    ("s1-attrgetter", "import operator\noperator.attrgetter('read_' + 'parquet')(pl)", {"dynamic"}),
+    ("s1a-from-operator", "from operator import attrgetter as ag", {"dynamic"}),
+    ("s1b-methodcaller", "import operator\noperator.methodcaller('read_' + 'parquet', p)(pl)", {"dynamic"}),
+    ("s2-reduce-getattr", "import functools\nfunctools.reduce(getattr, ['read_' + 'parquet'], pl)", {"dynamic"}),
+    ("s2a-map-getattr", "list(map(getattr, [pl, pl], ['read_parquet', 'scan_parquet']))", {"dynamic"}),
+    ("s3-getattribute", "import polars as pl\npl.__getattribute__('read_' + 'parquet')", {"dynamic"}),
+    ("s4-builtins-import", "zf = __builtins__['__import__']('zip' + 'file')", {"dynamic"}),
+]
+
+CONTROLS += [
+    ("getattr-called-on-own-object", "value = getattr(config, 'name', None)\nvars(config)"),
+    ("data-module-used-by-name", "from olsprime.data import survey\nsurvey.run(path)"),
+    ("tests-helpers", "from tests.fakes import klines_csv\nfrom tests.test_protocol import bars"),
+    ("dunder-on-own-class", "class A:\n    def __init__(self):\n        self.__dict__['x'] = 1"),
 ]
 
 
@@ -855,3 +1223,20 @@ def test_cargo_lock_has_no_crate_that_reads_data():
 
 def test_the_test_suite_never_touches_the_repository_vault():
     assert not str(runs_dir()).startswith(str(REPO_ROOT))
+
+
+def test_a_file_with_the_seal_allowance_may_patch_it_and_no_other_may():
+    snippet = "from olsprime import protocol\nmonkeypatch.setattr(protocol, 'vault_' + 'open', lambda: True)"
+    assert [rule for rule, _ in findings(snippet, ELSEWHERE)] == ["seal-patch"]
+    assert violations(snippet, ELSEWHERE)
+    assert violations(snippet, "tests/test_models.py")
+    assert violations(snippet, "olsprime/protocol.py") == []  # holds the seal allowance
+    assert violations(snippet, "tests/test_protocol.py") == []
+    assert "seal" in ALLOWED["tests/test_protocol.py"] and "seal-patch" not in ALLOWED["tests/test_protocol.py"]
+
+
+def test_the_protocol_names_the_guard_refuses_are_the_ones_the_tripwire_refuses():
+    from tests.tripwire import SEAL_NAMES
+
+    assert PROTOCOL_NAMES == set(SEAL_NAMES)
+    assert all(hasattr(protocol, name) for name in PROTOCOL_NAMES)

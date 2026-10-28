@@ -43,6 +43,27 @@
 //! bounded harnesses time out like the `_full` ones. The table is in
 //! `docs/ITERATIONS.md`.
 //!
+//! # Contracts (iteration 2)
+//!
+//! `product`, `notional_floor`, `notional_ceil`, `max_qty_within` and
+//! `round_down_to_lot` carry Kani function contracts, written in
+//! `src/spec.rs` without division except for the lot multiple. Each
+//! `*_contract` harness proves one with `proof_for_contract`; the
+//! `check_order_*`, `approval_*` and `sell_outcome_*` harnesses replace the
+//! helpers by their contracts with `stub_verified`. Run every harness with
+//! `-Z function-contracts -Z stubbing --no-assert-contracts`.
+//!
+//! A `stub_verified` verdict is conditional: it holds only as far as the
+//! contracts it uses are proven. In iteration 2 (local runs, shared machine,
+//! 40-minute cap) `product_contract` and `exact_never_wraps` finished; the
+//! contracts of `notional_floor`, `notional_ceil`, `max_qty_within` and
+//! `round_down_to_lot` did not, so they are assumed, with the unit tests of
+//! `spec.rs` as sampled evidence. Stubbing halves the `check_order`
+//! circuits (about 525,000 variables for [`TINY`] against 1.21 M), but what
+//! remains is nonlinear: the lot multiple `(n·l) mod l = 0`, the order cap
+//! `a ≤ b ⇒ a·p ≤ b·p`, and P2's `(a + b)·p = a·p + b·p`, each across
+//! distinct multiplier circuits. [`assert_core`] leaves those three out.
+//!
 //! # Covers
 //!
 //! Every `kani::cover!` below is expected to be SATISFIED. One that is not
@@ -101,8 +122,23 @@ fn buy_gated(account: &Account, limits: &Limits) -> bool {
         || account.bars_since_order < limits.cooldown_bars
 }
 
-/// P1–P5 for one call of `check_order`.
+/// P1–P5 for one call of `check_order`: [`assert_core`] and
+/// [`assert_arithmetic`].
 fn assert_contract(
+    account: &Account,
+    limits: &Limits,
+    request: &OrderRequest,
+    result: Result<Approved, Rejection>,
+) {
+    assert_core(account, limits, request, result);
+    assert_arithmetic(account, limits, request, result);
+}
+
+/// The part of P1–P5 that needs no nonlinear arithmetic once the helpers are
+/// replaced by their contracts: the side, `0 < qty ≤ request`, the notional
+/// is `notional_ceil(qty)`, the floor meets `min_order`, P3, P4, P5, and the
+/// two reachable `Overflow` sites.
+fn assert_core(
     account: &Account,
     limits: &Limits,
     request: &OrderRequest,
@@ -110,14 +146,12 @@ fn assert_contract(
 ) {
     match result {
         Ok(ok) => {
-            // P1
+            // P1, without the lot multiple and the order cap.
             assert!(ok.side == request.side);
             assert!(ok.qty.0 > 0);
             assert!(limits.lot_step.0 > 0);
-            assert!(ok.qty.0 % limits.lot_step.0 == 0);
             assert!(ok.qty <= request.qty);
             assert!(notional_ceil(ok.qty, request.price) == Some(ok.notional));
-            assert!(ok.notional <= limits.max_order);
             match notional_floor(ok.qty, request.price) {
                 Some(floor) => {
                     assert!(floor >= limits.min_order);
@@ -128,16 +162,6 @@ fn assert_contract(
                 Side::Buy => {
                     // P4
                     assert!(!buy_gated(account, limits));
-                    // P2
-                    match account.position.0.checked_add(ok.qty.0) {
-                        Some(next) => match notional_ceil(Qty(next), request.price) {
-                            Some(n) => {
-                                assert!(n <= limits.max_position);
-                            }
-                            None => panic!("post-buy notional overflows"),
-                        },
-                        None => panic!("post-buy position overflows"),
-                    }
                 }
                 // P3
                 Side::Sell => {
@@ -162,6 +186,35 @@ fn assert_contract(
                     e,
                     Rejection::KillSwitch | Rejection::DailyLoss | Rejection::Cooldown
                 ));
+            }
+        }
+    }
+}
+
+/// The part of P1–P2 that rests on nonlinear integer facts, which SAT
+/// solvers find hard at 64 bits: the lot multiple (`(n·l) mod l = 0`), the
+/// order cap (`a ≤ b ⇒ a·p ≤ b·p`) and P2 (`(a + b)·p = a·p + b·p`).
+fn assert_arithmetic(
+    account: &Account,
+    limits: &Limits,
+    request: &OrderRequest,
+    result: Result<Approved, Rejection>,
+) {
+    if let Ok(ok) = result {
+        // P1
+        assert!(limits.lot_step.0 > 0);
+        assert!(ok.qty.0 % limits.lot_step.0 == 0);
+        assert!(ok.notional <= limits.max_order);
+        // P2
+        if ok.side == Side::Buy {
+            match account.position.0.checked_add(ok.qty.0) {
+                Some(next) => match notional_ceil(Qty(next), request.price) {
+                    Some(n) => {
+                        assert!(n <= limits.max_position);
+                    }
+                    None => panic!("post-buy notional overflows"),
+                },
+                None => panic!("post-buy position overflows"),
             }
         }
     }
@@ -218,6 +271,10 @@ fn cover_position_overflow(
 /// to be the heaviest (128-bit symbolic division over full i64 ranges).
 #[kani::proof]
 #[kani::solver(cadical)]
+#[kani::stub_verified(notional_floor)]
+#[kani::stub_verified(notional_ceil)]
+#[kani::stub_verified(max_qty_within)]
+#[kani::stub_verified(round_down_to_lot)]
 fn check_order_full() {
     let account: Account = kani::any();
     let limits: Limits = kani::any();
@@ -232,6 +289,10 @@ fn check_order_full() {
 /// P1–P5, and P6 for these inputs, on the [`MARKET`] domain.
 #[kani::proof]
 #[kani::solver(cadical)]
+#[kani::stub_verified(notional_floor)]
+#[kani::stub_verified(notional_ceil)]
+#[kani::stub_verified(max_qty_within)]
+#[kani::stub_verified(round_down_to_lot)]
 fn check_order_market() {
     let account: Account = kani::any();
     let limits: Limits = kani::any();
@@ -246,6 +307,10 @@ fn check_order_market() {
 /// P1–P5, and P6 for these inputs, on the [`TINY`] domain.
 #[kani::proof]
 #[kani::solver(cadical)]
+#[kani::stub_verified(notional_floor)]
+#[kani::stub_verified(notional_ceil)]
+#[kani::stub_verified(max_qty_within)]
+#[kani::stub_verified(round_down_to_lot)]
 fn check_order_tiny() {
     let account: Account = kani::any();
     let limits: Limits = kani::any();
@@ -256,12 +321,36 @@ fn check_order_tiny() {
     assert_contract(&account, &limits, &request, result);
 }
 
+/// [`assert_core`] on fully arbitrary inputs, with every helper replaced by
+/// its contract. Sound only as far as those contracts are proven: see the
+/// `*_contract` harnesses.
+#[kani::proof]
+#[kani::solver(cadical)]
+#[kani::stub_verified(notional_floor)]
+#[kani::stub_verified(notional_ceil)]
+#[kani::stub_verified(max_qty_within)]
+#[kani::stub_verified(round_down_to_lot)]
+fn check_order_core_full() {
+    let account: Account = kani::any();
+    let limits: Limits = kani::any();
+    let request: OrderRequest = kani::any();
+    let result = check_order(&account, &limits, &request);
+    cover_outcomes(&result);
+    cover_held_overflow(&account, &request, &result);
+    cover_position_overflow(&account, &request, &result);
+    assert_core(&account, &limits, &request, result);
+}
+
 /// Beyond P1: the approval is the *largest* acceptable lot multiple (one
 /// more lot breaks the request, the position, the cap or i64), and
 /// re-submitting it returns it unchanged. [`TINY`] domain, since it runs the
 /// kernel twice.
 #[kani::proof]
 #[kani::solver(cadical)]
+#[kani::stub_verified(notional_floor)]
+#[kani::stub_verified(notional_ceil)]
+#[kani::stub_verified(max_qty_within)]
+#[kani::stub_verified(round_down_to_lot)]
 fn approval_is_maximal_and_stable_tiny() {
     let account: Account = kani::any();
     let limits: Limits = kani::any();
@@ -366,6 +455,10 @@ fn sells_are_never_gated() {
 /// for any other valid values leaves it unchanged.
 #[kani::proof]
 #[kani::solver(cadical)]
+#[kani::stub_verified(notional_floor)]
+#[kani::stub_verified(notional_ceil)]
+#[kani::stub_verified(max_qty_within)]
+#[kani::stub_verified(round_down_to_lot)]
 fn sell_outcome_ignores_trip_wires() {
     let account: Account = kani::any();
     let limits: Limits = kani::any();
@@ -397,6 +490,57 @@ fn sell_outcome_ignores_trip_wires() {
         result.is_ok() && buy_gated(&account, &limits) && !buy_gated(&other_account, &other_limits),
         "same approved sell with and without the gates"
     );
+}
+
+// ---- Contracts of the helpers ----------------------------------------------
+
+/// `spec::exact` never wraps: the checked 128-bit product of two `i64`
+/// exists and equals it. This is what lets the contracts use `wrapping_mul`.
+#[kani::proof]
+#[kani::solver(cadical)]
+fn exact_never_wraps() {
+    let a: i64 = kani::any();
+    let b: i64 = kani::any();
+    assert!(i128::from(a).checked_mul(i128::from(b)) == Some(spec::exact(a, b)));
+}
+
+/// `product` meets [`spec::product_spec`].
+#[kani::proof_for_contract(product)]
+#[kani::solver(cadical)]
+fn product_contract() {
+    let _ = product(kani::any(), kani::any());
+}
+
+/// `notional_floor` meets [`spec::floor_spec`], given `product`'s contract.
+#[kani::proof_for_contract(notional_floor)]
+#[kani::stub_verified(product)]
+#[kani::solver(cadical)]
+fn notional_floor_contract() {
+    let _ = notional_floor(kani::any(), kani::any());
+}
+
+/// `notional_ceil` meets [`spec::ceil_spec`], given `product`'s contract.
+#[kani::proof_for_contract(notional_ceil)]
+#[kani::stub_verified(product)]
+#[kani::solver(cadical)]
+fn notional_ceil_contract() {
+    let _ = notional_ceil(kani::any(), kani::any());
+}
+
+/// `max_qty_within` meets [`spec::max_qty_spec`]: P7 stated without
+/// division. Its 128-bit division by a symbolic price is bit-blasted here
+/// once, and replaced by the contract everywhere else.
+#[kani::proof_for_contract(max_qty_within)]
+#[kani::solver(cadical)]
+fn max_qty_within_contract() {
+    let _ = max_qty_within(kani::any(), kani::any());
+}
+
+/// `round_down_to_lot` meets [`spec::lot_spec`] under its precondition.
+#[kani::proof_for_contract(round_down_to_lot)]
+#[kani::solver(cadical)]
+fn round_down_to_lot_contract() {
+    let _ = round_down_to_lot(kani::any(), kani::any());
 }
 
 // ---- Helpers --------------------------------------------------------------

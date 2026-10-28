@@ -6,14 +6,24 @@ requires-python = ">=3.12"
 dependencies = [
     "httpx>=0.27",
     "numpy>=2.0",
+    # The Rust core (crates/olsprime-py), built by maturin; see [tool.uv.sources].
+    "olsprime-rs",
     "polars>=1.20",
     "pyarrow>=17",
+    "scipy>=1.18.1",
     # Windows has no system time zone database; zoneinfo needs it for UTC datetimes.
     "tzdata>=2024.1; sys_platform == 'win32'",
+    # The CPU build: the baselines are small, and CI downloads no CUDA runtime.
+    "xgboost-cpu>=3.4.1",
 ]
 
 [dependency-groups]
 dev = ["pytest>=8"]
+
+[tool.uv.sources]
+# A regular (non-editable) install, built from the crate by maturin. The crate's pyproject
+# declares cache-keys on every Rust source compiled in, so `uv sync` rebuilds after any edit.
+olsprime-rs = { path = "../crates/olsprime-py" }
 
 [build-system]
 requires = ["hatchling"]

@@ -16,9 +16,15 @@ Results go to [RESULTS.md](RESULTS.md), appended and never edited. Unless stated
 | H6 | The Brier term improves calibration without hurting log-loss. | Expected calibration error down by at least 20 % relative; log-loss not worse beyond seed noise. | 2026-10-25 |
 | H7 | News tokens improve forecasts. | Brier skill score up, Diebold-Mariano p < 0.05. | 2026-10-25 |
 | H8 | Return-to-go conditioning (Decision Transformer) does not help when our orders do not move prices. | No improvement over the same model without return-to-go. | 2026-10-25 |
+| H9 | At the entry-tier taker fees of the venues open to French residents (Coinbase Advanced, Kraken Pro), no active baseline beats buy and hold on BTCUSDT or ETHUSDT on daily bars with h = 1 day, over the walk-forward test months 2019-01 → 2024-12 of the development period. Active baselines: moving-average momentum (10, 30, 90 days), random with matched turnover, climatology, ridge, XGBoost. | For each venue, pair and active baseline: its net annualized Sharpe minus buy and hold's, with a 95 % paired stationary-bootstrap interval. H9 holds at a venue if no interval lies entirely above 0. Refuted if one does. | 2026-10-27 |
+| H10 | For Matrix on hand-made features, a λ chosen at each step by its prequential error, computed from Matrix's own statistics, beats a fixed λ chosen in validation (`docs/DESIGN.md` §7). | Log-loss difference, Diebold-Mariano p < 0.05. | 2026-10-27 |
+| H11 | Stacking Matrix's 30-day, one-year and all-history readouts, with three weights fitted on prequential errors, beats the best single window chosen in validation. | Log-loss difference, Diebold-Mariano p < 0.05. | 2026-10-27 |
+| H12 | Refitting when a CUSUM on Matrix's standardized recursive residuals alarms, at a false-alarm rate fixed in advance, is no worse than monthly refits, with fewer refits. | Log-loss non-inferiority, margin 0.5 % of climatology's log-loss, and fewer refits. | 2026-10-27 |
 
 Prior expectations, written down so they can be proven wrong:
 - H1 holds by construction once the tests exist.
 - H2 and H5 may well fail at daily horizons on crypto, where little signal survives costs.
 - H6 probably holds.
 - H8 should hold, following Paster et al. (2022).
+- H9 should hold: a round trip costs 1.04 % at Coinbase and 1.64 % at Kraken (taker plus 2 bps of slippage per side), against a daily standard deviation of about 3–5 % for these pairs. With six years of daily test data, an interval that excludes 0 would also need a large edge.
+- H10–H12 come from an external review on 2026-10-27 (`docs/DESIGN.md` §7). Each adaptive loop is a fitted choice, so it may just as well chase noise. H11, with three weights, is the most likely to hold.

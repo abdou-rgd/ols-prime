@@ -14,6 +14,11 @@ The vault opens only with two keys at once:
   the final models. An empty file, or a first line that is not a date, raises
   :class:`VaultSealed`: the file is a decision, not a ``touch``.
 
+The universe file is a stored table too: :func:`load_universe` seals it on its
+``rebalance_time``. The read helpers for the vault manifest (:func:`stored_row_count`,
+:func:`sealed_klines_span`, :func:`sealed_universe_span`) live here for the same reason:
+no other module opens a Parquet file.
+
 Each read with the vault open appends a line to ``<runs>/vault/ACCESS.log``.
 Downloading and the structural checks of ``build_parquet`` are not reads for
 modelling and stay outside this lock.
@@ -28,6 +33,7 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import polars as pl
+import pyarrow.parquet as pq
 
 from olsprime.data.binance_vision import parquet_path
 from olsprime.data.klines import TIMESTAMP, interval_ms
@@ -201,3 +207,46 @@ def load_klines(
     root = data_dir if data_dir is not None else paths.data_dir()
     path = parquet_path(root / "parquet", symbol, interval)
     return load_klines_file(path, interval, columns=columns, caller=caller or f"load_klines({symbol},{interval})")
+
+
+# --- Universe and manifest helpers ---------------------------------------------------
+
+
+def load_universe(path: Path, *, columns: list[str] | None = None, caller: str) -> pl.DataFrame:
+    """Read a universe Parquet file and seal it on ``rebalance_time``.
+
+    Sealed: only rebalances with ``rebalance_time < VAULT.start`` come back (a rebalance
+    at 2026-01-01 00:00 UTC belongs to the vault). Open: every row comes back and the
+    read is logged, as in :func:`seal`. ``rebalance_time`` is always read for the cut
+    and dropped afterwards when ``columns`` leaves it out.
+    """
+    if columns is None:
+        frame = pl.read_parquet(path)
+        out_columns = list(frame.columns)
+    else:
+        out_columns = list(columns)
+        frame = pl.read_parquet(path, columns=out_columns if "rebalance_time" in out_columns else [*out_columns, "rebalance_time"])
+    return seal(frame, time_col="rebalance_time", caller=caller).select(out_columns)
+
+
+def stored_row_count(path: Path) -> int:
+    """Rows in a Parquet file as the file's own metadata states them, vault rows included.
+
+    No row is read and nothing is sealed: a count discloses no value. Use
+    :func:`sealed_klines_span` or :func:`sealed_universe_span` for what a model may see.
+    """
+    return pq.read_metadata(path).num_rows
+
+
+def _span(times: pl.Series) -> tuple[int, datetime | None, datetime | None]:
+    return times.len(), times.min(), times.max()  # min and max of an empty series are None
+
+
+def sealed_klines_span(path: Path, interval: str, *, caller: str) -> tuple[int, datetime | None, datetime | None]:
+    """``(rows, first open_time, last open_time)`` of a klines file once sealed (see :func:`load_klines_file`)."""
+    return _span(load_klines_file(path, interval, columns=["open_time"], caller=caller)["open_time"])
+
+
+def sealed_universe_span(path: Path, *, caller: str) -> tuple[int, datetime | None, datetime | None]:
+    """``(rows, first rebalance_time, last rebalance_time)`` of a universe file once sealed."""
+    return _span(load_universe(path, columns=["rebalance_time"], caller=caller)["rebalance_time"])
