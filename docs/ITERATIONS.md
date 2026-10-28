@@ -208,6 +208,7 @@ The first official run of H1 (commit 9c414ca) also held. CI on Linux then showed
   - A WIP commit caught files mid-edit and turned CI red.
   - `uv run` rebuilds the extension after a Rust edit, so use `--no-sync`.
   - Heredocs eat backslashes, twice in this iteration. Write scripts with a file tool.
+  - Exact equality between two libraries is not portable. After the merge, the push to `main` failed on one Linux runner: a label test compared `np.log` with `math.log` at zero tolerance, and they differed by one ulp. The pull request's runners had passed the same tree. The test now allows 1e-14 relative (pull request #2).
   - Headless Edge will not render narrower than about 477 px.
   - Several Fable auditors in parallel hit the session's usage limit, so run at most three agents at once.
 

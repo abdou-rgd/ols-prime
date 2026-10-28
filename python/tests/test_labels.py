@@ -46,7 +46,9 @@ def test_fwd_return_uses_open_of_t_plus_1_and_open_of_t_plus_1_plus_h(h):
     labels = forward_labels(bars, "1d", h)
     opens = bars["open"].to_numpy()
     for t in (0, 10, 50, 90 - h):
-        assert labels["fwd_return"][t] == pytest.approx(math.log(opens[t + 1 + h] / opens[t + 1]), abs=0)
+        # NumPy's log may take a SIMD path (AVX-512 on some Linux runners) that differs from math.log by
+        # an ulp, so allow 1e-14 relative. The usual mistakes below are more than 1e-6 away.
+        assert labels["fwd_return"][t] == pytest.approx(math.log(opens[t + 1 + h] / opens[t + 1]), rel=1e-14, abs=0)
         assert labels["entry_time"][t] == at(t + 1)
         assert labels["exit_time"][t] == at(t + 1 + h)
         assert labels["label_known_at"][t] == labels["exit_time"][t]
@@ -116,7 +118,7 @@ def test_bars_are_found_by_time_not_by_row_offset():
     opens = {ms: o for ms, o in zip(bars["open_time"].dt.epoch("ms").to_list(), bars["open"].to_list(), strict=True)}
     row = labels.filter(pl.col("open_time") == at(8)).row(0, named=True)
     assert row["exit_time"] == at(14)
-    assert row["fwd_return"] == pytest.approx(math.log(opens[T0 + 14 * DAY_MS] / opens[T0 + 9 * DAY_MS]), abs=0)
+    assert row["fwd_return"] == pytest.approx(math.log(opens[T0 + 14 * DAY_MS] / opens[T0 + 9 * DAY_MS]), rel=1e-14, abs=0)
     # an exit bar that is itself the hole is null, and so is an entry bar that is the hole
     assert labels.filter(pl.col("open_time") == at(6))["exit_time"][0] is None  # t+1+5 = 12
     assert labels.filter(pl.col("open_time") == at(11))["entry_time"][0] is None  # t+1 = 12
