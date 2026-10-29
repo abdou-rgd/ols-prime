@@ -7,9 +7,12 @@ One row per (member, hour) in the months when the pair is a member of the univer
 Rules, each pre-registered:
 
 - **Membership.** A pair is a member of month M if it is in the rebalance at M's first day,
-  ranked on data before M. Rows exist only in member months. A pair's months before it first
-  joins never appear: they would carry its later selection (survivorship). A delisted pair
-  keeps its rows until its last bar; its later member months have no bars, so no rows.
+  ranked on data before M. Rows exist only in member months. A row's month is the month of its
+  bar's open, even when a late close puts its decision time in the next month (the bar of
+  2017-09-06 15:00 closes 1 ms late, so one at a month's last hour would). A pair's months
+  before it first joins never appear: they would carry its later selection (survivorship). A
+  delisted pair keeps its rows until its last bar; its later member months have no bars, so
+  no rows.
 - **Features** are computed on each pair's whole hourly history up to t, so their windows
   count hours, and the first member hour already has its warm-up behind it.
 - **Labels** are ``forward_labels(bars, "1h", 24)``: entry at the open of t + 1, exit at the
@@ -134,7 +137,7 @@ def h1_subpanel_members(universe: pl.DataFrame, *, size: int = SUBPANEL_SIZE) ->
 
 
 def _month_expr() -> pl.Expr:
-    return pl.col("decision_time").dt.truncate("1mo").cast(TIMESTAMP).alias("month")
+    return pl.col("open_time").dt.truncate("1mo").cast(TIMESTAMP).alias("month")
 
 
 def pair_rows(bars: pl.DataFrame, months: Sequence[datetime], *, h: int = HORIZON) -> pl.DataFrame:
@@ -193,7 +196,7 @@ def hourly_panel(
     """The panel: one row per (member, hour) in member months, sorted by ``(decision_time, symbol)``.
 
     Columns, in order: ``symbol``, ``open_time``, ``decision_time`` (bar t's ``known_at``), ``month``
-    (the month of ``decision_time``, which is a member month of the symbol), the 15
+    (the month of ``open_time``, which is a member month of the symbol), the 15
     :data:`FEATURE_COLUMNS`, ``threshold``, the label columns (``entry_time``, ``exit_time``,
     ``label_known_at``, ``fwd_return``, ``label``) and ``complete`` (every feature and the label
     non-null).

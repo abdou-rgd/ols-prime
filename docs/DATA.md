@@ -197,12 +197,13 @@ Remaining limits, stated plainly:
 - **Ticker reuse.** `LUNAUSDT` is the old LUNA until 2022-05-13 and the new LUNA from 2022-05-31. Cut every series at its gaps before computing returns. The survey above lists the likely cases among the members.
 
 **Hourly panel (iteration 3).** `uv run python -m olsprime.features.panel --summary` builds the panel that Matrix reads (`python/olsprime/features/panel.py`) in memory, and writes `runs/<UTC date>-panel/summary.json`. On 2026-10-29:
-- **Runtime.** 18 to 41 s, depending on the load of the machine, with peak memory near 2 GB. The command does not measure memory on Windows: `peak_rss_mb` is null there.
+- **Runtime.** 12 to 41 s, depending on the load of the machine, with peak memory near 2 GB. The command does not measure memory on Windows: `peak_rss_mb` is null there.
 - **Rows.** Rows exist only in the months when a pair is a member of the universe: 2,273 member months, 1,655,881 hourly rows from 2017-10 to 2024-12.
 - **Pairs.** 233 distinct pairs. The other 41 of the 274 members first join in 2025, so they have no row in the development period. Months have between 2 members (1,440 rows, 2017-11) and 30 (22,320 rows).
 - **The cut.** Bars come through `load_klines`, which keeps the vault out. They are then cut to `known_at < 2025-01-01` before features and labels, so a label that needs a 2025 bar is null. The validation year's bars are loaded into memory and dropped there: none reaches a feature, a label or a model.
 - **Labels.** 1,631,784 rows are labelled (24,097 have no exit bar), and 1,591,462 are complete (every feature and the label). The complete rows split into down 29.4 %, neutral 43.6 % and up 27.1 %.
 - **The sub-panel** of the panel's future-invariance test: BTCUSDT, ETHUSDT, BNBUSDT, XRPUSDT, ADAUSDT, LTCUSDT, TRXUSDT, LINKUSDT, MATICUSDT and DOGEUSDT.
+- **Months.** A row's month is the month of its bar's open, after audit pass 1a. Before, it was the month of the decision time, which a late close at a month's last hour would move into the next month. Rebuilt with the new rule, the panel has the same fingerprint: no member's bar closes late at a month's last hour.
 - **Fingerprint** (SHA-256 over every column): `e64b39d8784af6039dc4810a1247fd957af94a8fe76240563855c45ba0442508`.
 - **Files.** Nothing is cached in Parquet, so only `olsprime.protocol` opens a file.
 - **License.** The panel is derived from Binance Vision, so it keeps CC BY-NC-SA 4.0: non-commercial, never redistributed.

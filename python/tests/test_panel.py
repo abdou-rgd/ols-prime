@@ -27,7 +27,7 @@ from olsprime.features.panel import (
     summarize,
 )
 from olsprime.labels import LABEL_COLUMNS, forward_labels
-from olsprime.protocol import DEVELOPMENT, VaultSealed, load_klines
+from olsprime.protocol import DEVELOPMENT, VaultSealed, known_at_expr, load_klines
 from olsprime.universe import UNIVERSE_SCHEMA, universe_path
 from tests.test_protocol import store, utc
 
@@ -360,6 +360,22 @@ def test_subpanel_takes_the_most_member_months_and_breaks_ties_by_symbol():
 
 
 # --- Rows from bars (the panel H1) ---------------------------------------------------
+
+
+def test_a_row_belongs_to_the_month_of_its_bars_open_even_when_it_closes_late():
+    last_hour = utc(2024, 11, 30, 23)
+    late = pl.col("open_time") == last_hour
+    bars = fake_bars("AAAUSDT", 104 * 24, seed=0)
+    bars = bars.with_columns(  # closes 1 ms late, at 2024-12-01 00:00:00.000, as the bar of 2017-09-06 15:00 does
+        pl.when(late).then(pl.col("close_time") + timedelta(milliseconds=1)).otherwise(pl.col("close_time")).alias("close_time")
+    ).with_columns(known_at_expr("1h"))
+    assert bars.filter(late)["known_at"].item() == utc(2024, 12, 1)
+    november = panel_module.pair_rows(bars, [utc(2024, 11, 1)])
+    december = panel_module.pair_rows(bars, [utc(2024, 12, 1)])
+    row = november.filter(late)
+    assert row["month"].item() == utc(2024, 11, 1) and row["decision_time"].item() == utc(2024, 12, 1)
+    assert december.filter(late).is_empty()
+    assert (november.height, december.height) == (30 * 24, 31 * 24)
 
 
 def test_pair_rows_and_assemble_rebuild_the_panel_from_bars(fake_store, panel):
