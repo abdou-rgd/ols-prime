@@ -28,3 +28,9 @@ Prior expectations, written down so they can be proven wrong:
 - H8 should hold, following Paster et al. (2022).
 - H9 should hold: a round trip costs 1.04 % at Coinbase and 1.64 % at Kraken (taker plus 2 bps of slippage per side), against a daily standard deviation of about 3–5 % for these pairs. With six years of daily test data, an interval that excludes 0 would also need a large edge.
 - H10–H12 come from an external review on 2026-10-27 (`docs/DESIGN.md` §7). Each adaptive loop is a fitted choice, so it may just as well chase noise. H11, with three weights, is the most likely to hold.
+
+## Change log
+
+- 2026-10-29, before any run: H2, H3 and H10–H12 are tested on the hourly bars of the universe members, over the development period. `docs/PROTOCOL.md`, "Matrix on hourly bars (iteration 3)", gives their arms and decision rules. No claim changes. One wording is made precise.
+  - In H10 and H11, "chosen in validation" means chosen inside each fold, on the prequential errors of the rows whose labels are known at the fit.
+  - The validation year stays closed until model selection. Choosing on it and then testing on 2019–2024 would be a look-ahead.

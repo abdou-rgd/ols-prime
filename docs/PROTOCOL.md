@@ -61,6 +61,94 @@ Fixed before any model is trained. Any change gets a dated entry in the change l
   - A threshold on bar t + 1 flips by construction only inside the design's bands: a body between 0.4 % and 10 %, a range between 0.5 % and 50 %, a fill between 0.2 and 0.8, a close location between 0.25 and 0.75.
   - A cut where a quantity cannot cross is marked `?`, for example a taker share already at 1, or a bar without volume. The `?` is predicted from the original bars, before perturbing, and only for a declared reason. It is reported and left out of the verdict; it never counts as a pass. A failure to cross without a declared reason fails the test, and so does a control that is `?` at every cut.
 
+**The adversary (iteration 3).** Beside the designed controls, H1 reports how many random leaks it catches.
+- A seeded generator plants random leaks: functions of the next bars' levels, ratios and shapes, alone or combined, and compared with the past, with other future bars or with thresholds.
+- Each leak runs through H1's own perturbation, at H1's cuts and at a longer schedule of cuts.
+- The report gives the share caught with a 95 % Wilson interval, overall, per family and per cut. It also gives the size of each catch and the list of misses.
+- Every leak has an honest twin, the same expression moved into the past. A twin must never be caught: one catch is a bench bug.
+- The result is descriptive. It measures this generator's detection rate, not all leaks. H1's registered rule does not change.
+
+## Matrix on hourly bars (iteration 3)
+
+Fixed on 2026-10-29, before any Matrix run. It defines H2, H3 and H10–H12 for the development period.
+
+**Panel.**
+- Hourly bars of the universe members (`docs/DATA.md`), read through the seal, which keeps the vault out. 233 of the 274 members have a member month in the development period; the other 41 first join in 2025.
+- The bars are cut to `known_at` < 2025-01-01 before any feature or label is computed. The validation year's bars are loaded and dropped there, so none reaches a feature, a label or a model, and a label that needs a 2025 bar is null.
+- A row (pair, hour t) exists only in the months when the pair is a member of the universe. Membership is the rebalance at the first day of t's month, ranked on data before that month.
+  - Rows from other months are neither entries nor queries.
+  - A pair's months before it first joins would carry its later selection, a survivorship leak.
+- Features: the 15 `FEATURE_COLUMNS`, computed on each pair's whole hourly history up to t, so their windows count hours.
+- Labels: three classes over h = 24 bars (one day). Entry is at the open of t + 1 and exit at the open of t + 25. The threshold is max(0.5·σ̂·√24, 0.0024), with σ̂ = `f_vol_30`. A label is known at its exit bar's open.
+- Test months: 2019-01 → 2024-12, as H9. Decisions are hourly.
+
+**Matrix.**
+- One pooled memory over all members.
+  - An entry is (x, y): x holds the 15 features, y the one-hot class followed by `fwd_return`.
+  - It is stamped with `label_known_at`.
+  - A row with a null feature or label gives no entry.
+- A readout at decision time d over window w uses the entries with d − w < time ≤ d. The windows are 30 days, 365 days and all history.
+- Ridge in centred form, with a free intercept. Feature j gets the penalty ρ·n_w·σⱼ², where n_w is the window's entry count and σⱼ² the variance of feature j over the entries the fold's fit may use (see Folds). ρ ∈ {10⁻⁴, 10⁻³, 10⁻², 10⁻¹, 1, 10}. This is ridge on features standardized inside the fold, solved exactly from the statistics.
+- Probabilities, for every arm: pₖ = max(ŷₖ, 10⁻³) / Σⱼ max(ŷⱼ, 10⁻³).
+- A readout the solver refuses (an empty or singular window) falls back to the arm's climatology for that row. The count is reported.
+
+**Folds.**
+- Monthly refits, at 00:00 UTC on the first day of each test month.
+- A choice fitted at the fit time (σ, a window, ρ, stacking weights, a kernel width or k) uses only:
+  - rows whose label is known by the fit time minus 24 h (purge and embargo of h);
+  - and those rows' prequential forecasts, which each arm made at the row's own decision time.
+- Matrix itself takes every entry once it is known, inside the test month too.
+
+**Arms.** Each arm is one variant of the deflated Sharpe ratio.
+
+| Arm | Hypothesis | Definition |
+|---|---|---|
+| `climatology-panel` | reference | Class frequencies of the rows known at the fit. |
+| `matrix-select` | H2, and the reference of H10–H12 | At each fit, the window and ρ with the lowest mean prequential log-loss over the known rows of the last 365 days. |
+| `matrix-1y` | H3 | Window 365 days; ρ selected at each fit the same way. |
+| `softmax-1y` | H3 | Nadaraya-Watson on the entries of the 365-day window, weights ∝ exp(−‖u_q − uᵢ‖²/(2τ²)), where u holds the 15 features divided by their fold σ, and τ ∈ {0.5, 1, 2}·√15 is selected at each fit. |
+| `knn-1y` | H3 | The mean one-hot label of the k nearest entries of the 365-day window (Euclidean on u), ties broken by entry order, k ∈ {50, 200, 1000} selected at each fit. |
+| `matrix-adaptive` | H10 | `matrix-select`'s window. At each decision time d, the ρ with the lowest mean prequential log-loss over the rows whose labels are known by d and whose decisions fall after d − 30 days. |
+| `matrix-stack` | H11 | p = Σ_w α_w p_w over the three windows, each at its own selected ρ. α lies on the simplex, fitted at each fit on the prequential log-loss of the known rows of the last 365 days, on a grid of step 0.05. |
+| `matrix-cusum` | H12 | `matrix-select`, refitted at the first fit and then only after a CUSUM alarm, instead of every month (detailed below). |
+
+- The CUSUM's input is one value per day d, built from the 00:00 UTC decisions, so the daily labels do not overlap. Each decision's recursive residual of the `fwd_return` readout, its realized `fwd_return` minus the forecast made at the decision time, is divided by its predictive standard deviation, σ̂·√(1 + 1/n_w + x̃ᵀ(M_xx + Λ)⁻¹x̃). Here x̃ is the query's features minus the window's means, M_xx the window's centred cross-products, and σ̂² the window's residual mean square at the decision time. The day's value is the mean over members.
+- A two-sided Page CUSUM runs on these values with k = 0.5. Its threshold is set by simulation, before any result, to give an average run length of 30 days under independent N(0, 1) values.
+- After an alarm, the arm refits at the next 00:00 UTC and the CUSUM restarts.
+
+If the exact kernel readouts cannot run over the 365-day window within the iteration, H3 runs at the 30-day window for all three of its arms. This fallback is fixed here, before any result.
+
+**Scoring.**
+- Scored rows are the test rows with a label and complete features. They are the same for every arm.
+- Each score is averaged over the scored rows of each decision hour. Every statistic is computed on these hourly series, so the dependence across pairs stays inside the hour. A reported mean is a mean over hours.
+- Metrics: log-loss, Brier, Brier skill score against `climatology-panel`, expected calibration error.
+- Diebold-Mariano runs on the hourly loss differences, two-sided, with the rectangular kernel, h − 1 = 23 lags and the Harvey-Leybourne-Newbold correction.
+- Intervals: stationary block bootstrap of the hourly series, block length by Politis-White, 2,000 resamples, 95 % percentile.
+
+**Decision rules.**
+- **H2** holds if the Brier skill score of `matrix-select` is above 0 and its 95 % interval lies above 0.
+- **H3** holds if `matrix-1y` has a lower log-loss than `softmax-1y` and than `knn-1y`, each with Diebold-Mariano p < 0.05. Each comparison is reported.
+- **H10** holds if `matrix-adaptive` has a lower log-loss than `matrix-select`, with p < 0.05.
+- **H11** holds if `matrix-stack` has a lower log-loss than `matrix-select`, with p < 0.05.
+- **H12** holds if two conditions both hold:
+  - the 95 % one-sided upper bound of the mean log-loss of `matrix-cusum` minus that of `matrix-select` is below 0.005 times climatology's log-loss. The bound is the mean difference plus the 95 % quantile of Student's t with T − 1 degrees of freedom, times the Diebold-Mariano standard error above (HLN-corrected), where T is the number of hours;
+  - `matrix-cusum` refits fewer than 72 times.
+
+**Future invariance on the panel.** Before any result, every arm passes H1 on a sub-panel.
+- The sub-panel: the 10 members with the most member months in the development period.
+- The cuts: 8 cut hours, drawn with a fixed seed in the test months, one of them at a month's first hour and one at its last.
+- Every bar of every member after the cut is perturbed in both directions, as in H1. Every output at or before the cut is compared bit for bit.
+- Planted online leaks must each be caught where predicted:
+  - entries stamped with their decision time instead of `label_known_at`;
+  - a window that ends one hour after the decision;
+  - σ fitted on the whole test month;
+  - a fit-time selection on rows whose labels are not yet known (no purge);
+  - a kernel readout whose candidates reach one label horizon past the decision.
+
+**The readout, described.** For a seeded sample of 1,000 test decisions of `matrix-1y`, the report gives the share of negative weights. It also gives the signed contribution of the last 30 days, and that of the older entries.
+
+**Out of scope here.** Trading metrics of the Matrix arms wait for a portfolio simulator. Each arm still counts as a variant.
+
 ## Metrics
 
 - **Primary, forecast quality:**
@@ -137,3 +225,9 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
     - **What the tests show.** They assert row counts. One of them prints the first bar of the 2026-03 archive when it succeeds.
     - **Why it does not reach a model.** The auditor writes no model code, and no feature, model or decision of the project uses these rows.
     - **What follows.** The vault stays the final test set. This exposure is stated in every report that uses it. Proofs of a hole now run against fake data only, and the new guards stop both paths.
+- 2026-10-29, before any run of iteration 3:
+  - The design of "Matrix on hourly bars (iteration 3)" is fixed: panel, arms, folds, scoring and decision rules for H2, H3 and H10–H12. It includes a fallback for H3 to the 30-day window, should the one-year kernels not run in time.
+  - H1 gains the adversary, a descriptive measure. Its registered rule does not change.
+  - Two clarifications of the panel, the same day and before any Matrix run. They come from building it, and change nothing in the design.
+    - 233 of the 274 members have rows in the development period; the other 41 first join in 2025.
+    - The validation year's bars are loaded through the seal, then cut before features and labels. The earlier wording said they were not read at all.

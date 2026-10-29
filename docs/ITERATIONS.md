@@ -223,3 +223,65 @@ The first official run of H1 (commit 9c414ca) also held. CI on Linux then showed
 - **Matrix at scale.** Matrix and the OLS-attention readout run on the hourly bars of all 274 members, and H2, H3 and H10–H12 are tested on the development period.
 
 **Learning page.** [Le banc honnête](https://claude.ai/artifact/VDdujVgLyyi2PcMBnaM1Sd), in French, written by `teacher` and checked by the orchestrator. It is private to Abdou's account.
+
+## Iteration 3 — Matrix at scale, behind a physical seal (2026-10-29)
+
+**Goal.** This is roadmap phase 2, "Matrix on hand-made features", made bolder as iteration 2's outcome proposes:
+- Matrix and its OLS-attention readout on the hourly bars of every universe member, testing H2, H3 and H10–H12;
+- an adversary that measures how many random leaks H1 catches;
+- the vault moved out of `data/`.
+
+**Deliverables.**
+1. **A physical seal.**
+   - `olsprime.vault` moves the vault months out of `data/` into a vault tree outside the repository: the raw archives, and the Parquet files that hold vault rows.
+   - It rebuilds those Parquet files from the remaining archives, and checks that every sealed read is unchanged.
+   - The downloader and `build_parquet` refuse vault months.
+   - Encryption of the vault tree to an age recipient is written and tested on fake trees.
+   - The move is designed and tested on fake trees first. The real move runs once `leakage-auditor` has reviewed the tool.
+   - Encrypting the real vault needs a private key that never touches this machine, so that step waits for Abdou.
+2. **An adversary for H1.** `python -m olsprime.bench.adversary` runs a seeded generator of random leaks: functions of the next bars' levels, ratios and shapes. Each leak goes through H1's perturbation, at H1's cuts and at a longer schedule.
+   - It reports the share caught, with a Wilson interval, per family and per cut; the size of each catch; and the misses.
+   - Every leak has an honest twin, which must never be caught.
+3. **Matrix at scale.**
+   - `ols-core`: nodes in centred form (Chan, Golub and LeVeque), and the ridge solved in centred form with a free intercept and a penalty per coordinate. Batch readouts over many queries, windows and penalties, and exact kernel readouts (softmax and kNN) for H3, all with Python bindings.
+   - A point-in-time hourly panel of the universe members: rows only in member months, features on each pair's own history, labels with h = 24 hours, and the validation year and the vault left out.
+   - The Matrix arms of H2, H3, H10, H11 and H12, and a future-invariance test on the panel with planted online leaks.
+   - Report n°2 as one command.
+4. **Kani.** The `open` run of 2026-10-28 proved `max_qty_within_contract`. It moves to `proven`.
+
+**Scope, fixed before any result.** `docs/PROTOCOL.md`, "Matrix on hourly bars (iteration 3)", holds the full pre-registration.
+- **Data.** All 274 members, in their member months only: at most 30 pairs in any hour. About 1.8 M labelled rows were expected in the development period. The built panel has 1.63 M, from the 233 members that have a member month before 2025 (`docs/DATA.md`).
+  - The workload was sized first: about 2 M entries and 2 M queries, each read under 3 windows and 6 penalties, plus exact kernels over about 263 k candidates per query. It fits in the Rust core in well under an hour, so no subset of members is needed.
+  - The fallback that keeps it within the session is fixed in advance: if the one-year kernels cannot run in time, H3 runs at the 30-day window.
+- **Design.** Hourly decisions, h = 24 bars, test months 2019-01 → 2024-12, as for H9. One pooled memory over all members.
+- **Metrics.** Forecast quality only, the protocol's primary metric. Trading metrics of the Matrix arms wait for a portfolio simulator, and each arm still counts as a variant.
+- **Priority if time runs out.** H2 and H3 first, then H10, H11 and H12. A hypothesis that was not run is reported as not run.
+
+**Hypotheses touched.** H1 (the adversary, and invariance of the Matrix arms on the panel), H2, H3, H10, H11, H12.
+
+**Done when.**
+- Every check of `CLAUDE.md` is green, locally and in GitHub Actions, on Windows and Linux.
+- On the panel, H1 holds for every Matrix arm, and its planted online leaks are caught where predicted.
+- The adversary and Report n°2 each run as one command, and a second run reproduces each of them.
+- `RESULTS.md` has the rows of the adversary, the panel H1 and H2, H3, H10–H12, each with its variant count.
+- `leakage-auditor` passes.
+- The vault months are out of `data/` with every sealed read unchanged, or the reason they are not is recorded.
+- The pull request is merged into `main` with a local merge commit and pushed. Abdou authorized commit, merge, push and installs for this iteration on 2026-10-29.
+
+**Plan.** Briefs are in `.claude/briefs/iteration-3/`. At most three agents run at once.
+
+| Wave | Task | Agent | Brief |
+|---|---|---|---|
+| 1 | Centred nodes, batch and kernel readouts, bindings | `rust-engineer` | `matrix-core.md` |
+| 1 | Hourly panel of the members | `data-engineer` | `panel.md` |
+| 1 | H1 adversary | `ml-engineer` | `adversary.md` |
+| 2 | Physical seal | `data-engineer` | `seal.md` |
+| 2 | Matrix arms, panel H1, Report n°2 | `ml-engineer` | `matrix-arms.md` |
+| 3 | Official runs and rows | `experiment-runner` | `runs.md` |
+| 4 | Audit | `leakage-auditor` | `audit.md` |
+| 5 | Learning page | `teacher` | `learning-page.md` |
+
+**Set up by the orchestrator before wave 1.**
+- `main` holds iteration 2 (merge commit `ae716a0`, pull request abdou-rgd/ols-prime#1) and the label-test fix (pull request abdou-rgd/ols-prime#2). Work happens on the branch `iteration-3`.
+- The Kani `open` run of 2026-10-28 (run 40636068905, 17 harnesses, 340 minutes each) is recorded in the outcome below. Its one proof moves to the `proven` job of `kani.yml`, to the Verification section of `CLAUDE.md` and to `README.md`. The `proven` job's time limit rises from 60 to 150 minutes.
+- A `scout` read Liquid AI's LFM3 announcement at Abdou's request. See the outcome.
