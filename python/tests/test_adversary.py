@@ -211,6 +211,74 @@ def test_a_constant_miss_is_counted_apart(bench):
     assert s["misses"]["count"] == 1 and s["misses"]["constant_on_original_rows"] == 1
 
 
+def test_constant_twins_are_counted(bench, population):
+    """``close[s] > close[s]``, the twin of a next-bar comparison with bar s, is constant: it cannot be caught."""
+    assert adv.evaluate_fast(NEXT_CLOSE.honest_twin(), bench).constant
+    assert adv.evaluate_fast(VOLUME_RETURN.honest_twin(), bench).constant  # ln(volume[s] / volume[s]) = 0
+    ev = adv.evaluate_all(population, bench)
+    s = adv.summarize(population, bench, ev, CFG)
+    tw = s["twins"]
+    assert tw["constant_at_compared_rows"] == int(ev.twin_constant.sum()) > 0
+    assert tw["non_constant"] == len(population) - tw["constant_at_compared_rows"] > 0
+    assert tw["non_constant_caught"] == 0 and tw["constant_share"]["n"] == len(population)
+
+
+# --- Attenuation ------------------------------------------------------------------------------------
+
+
+def test_eps_one_returns_the_outputs_bit_for_bit_and_eps_scales_the_contribution(bars, population):
+    view = adv.SeriesView(adv.quantities(bars))
+    for leak in population[:100]:
+        a, b = leak.outputs(view), leak.attenuated(1.0).outputs(view)
+        assert all(np.array_equal(a[k].view(np.uint64), b[k].view(np.uint64)) for k in a)
+        w = leak.attenuated(1e-3).outputs(view)
+        if leak.output == "probs":
+            for k in ("p_down", "p_up"):
+                ok = ~np.isnan(a[k])
+                assert np.allclose(w[k][ok] - 0.4, 1e-3 * (a[k][ok] - 0.4), atol=1e-15)
+            total = w["p_down"] + w["p_neutral"] + w["p_up"]
+            assert np.allclose(total[~np.isnan(total)], 1.0)
+        else:
+            (k,) = a
+            assert np.array_equal(np.isnan(w[k]), np.isnan(a[k]))
+            ok = ~np.isnan(a[k])
+            assert np.array_equal(w[k][ok], 1e-3 * a[k][ok])
+    with pytest.raises(ValueError):
+        NEXT_CLOSE.attenuated(0.0)
+    assert NEXT_CLOSE.attenuated(1e-10).render() == "target = 1e-10 x close[s+1] > close[s]"
+
+
+def test_the_auditors_probe_at_the_rules_edge_in_both_paths(bars, bench):
+    """1e-10 x (close[s+1] > close[s]) moves its target by 1e-10, below the rule: caught at 0 of 8 cuts by the fast path
+    and by H1's own path. At 2e-9 it is above the rule: 8 of 8 in both."""
+    rows = _h1_rows(bench)
+    cuts = bench.h1_cuts["BTCUSDT"]
+    for eps, expected in ((1e-10, 0), (2e-9, len(cuts))):
+        leak = NEXT_CLOSE.attenuated(eps)
+        fast = adv.evaluate_fast(leak, bench).caught[rows].any(axis=1)
+        full = adv.full_path(leak, bars, cuts, H1)
+        assert int(fast.sum()) == expected == sum(any(c) for c in full["caught"]), eps
+    eq = adv.check_equivalence([NEXT_CLOSE.attenuated(1e-10), NEXT_CLOSE.attenuated(2e-9), VOLUME_RETURN.attenuated(1e-10)],
+                               bench, {"BTCUSDT": bars}, CFG, twins=False)  # fmt: skip
+    assert eq["agree"] and eq["units_compared"] == 3, eq
+
+
+def test_the_attenuation_curve_reproduces_the_run_at_eps_one_and_falls(bench, population):
+    ev = adv.evaluate_all(population, bench)
+    curve = adv.attenuation_curve(population, bench, ev)
+    assert [r["eps"] for r in curve] == list(adv.EPSILONS)
+    s = adv.summarize(population, bench, ev, CFG)
+    assert curve[0]["any_h1_cut"] == s["h1_cuts"]["overall"] and curve[0]["per_cut_rate_h1"] == s["h1_cuts"]["per_cut_rate"]
+    assert all(r["reproduces_unattenuated"] for r in curve)
+    shares = [r["any_h1_cut"]["share"] for r in curve]
+    assert shares == sorted(shares, reverse=True) and shares[-1] < shares[0]
+    # Below the rule, a target leak moves by eps < 1e-9: never caught.
+    assert curve[-1]["any_h1_cut_by_output"]["target"]["caught"] == 0
+    broken = adv.Evaluated(~ev.caught, ev.size, ev.twin_caught, ev.twin_violated, ev.constant, ev.twin_constant)
+    with pytest.raises(AssertionError, match="eps = 1"):
+        adv.attenuation_curve(population[:20], bench, replace(broken, caught=broken.caught[:20]), epsilons=(1.0,))
+
+
 def test_a_continuous_leak_is_caught_at_every_cut_in_both_directions(bench):
     r = adv.evaluate_fast(VOLUME_RETURN, bench)
     assert r.caught.all()
@@ -262,9 +330,19 @@ def test_the_run_reports_every_part(bars):
     assert o["n"] == 60 and o["wilson95"][0] <= o["share"] <= o["wilson95"][1]
     assert len(result["h1_cuts"]["per_cut"]) == 8 and result["long_schedule"]["cuts"] == cfg.long_cuts
     assert len(result["leaks"]) == 60 and all(len(r["h1_pattern"]) == 8 for r in result["leaks"])
+    assert result["equivalence"]["attenuated"]["agree"] and result["equivalence"]["attenuated"]["scales"] == [1e-8, 1e-10]
+    assert [r["eps"] for r in result["attenuation"]] == list(adv.EPSILONS)
+    assert result["never_produced"] == list(adv.NEVER_PRODUCED)
     text = adv.render_md(result)
-    for part in ("Equivalence", "Honest twins", "Share caught at H1's cuts", "Per-cut rate", "Size of the catches", "The misses"):
+    for part in ("Equivalence", "Near the rule's edge", "Honest twins", "a constant twin cannot be caught",
+                 "Share caught at H1's cuts", "Two headline rates", "**Any cut:**", "**Per cut:**", "Per-cut rate",
+                 "Size of the catches", "not H1's sensitivity", "Attenuation curve", "| 1e-10 |", "The misses",
+                 "at the compared rows they carry no information", "What the generator never produces", "hysteresis",
+                 "s+25", "Row for `docs/RESULTS.md`", "Mean per-cut rate (closer to H1's per-cut rule)"):  # fmt: skip
         assert part in text, part
+    assert "on these series" not in text
+    per_cut_rows = [line for line in text.splitlines() if line.startswith("| BTCUSDT |")]
+    assert len(per_cut_rows) == 8 and all(line.count("[") >= 1 for line in per_cut_rows)  # each with its Wilson interval
     again = adv.run({"BTCUSDT": bars}, cfg)
     again.pop("_timings"), result.pop("_timings")
     assert again == result  # deterministic

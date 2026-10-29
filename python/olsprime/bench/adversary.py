@@ -95,19 +95,35 @@ H1): a row before ``t - 10`` reads only bars ``<= t``, which ``perturb_after`` r
 A leak is **caught** at a cut under H1's rule (:data:`olsprime.bench.invariance.CAUGHT_ABOVE`): an
 output moves by more than 1e-9, turns missing or stops being missing, in either direction. A
 catch's **size** is the largest move of the leak's own outputs at that cut (0 when it is caught
-through a missing value only).
+through a missing value only). The sizes describe the scale of the generator's outputs, O(1) by
+construction, not H1's sensitivity.
+
+**Two headline rates.** The share caught at one of H1's cuts at least (Wilson), and the mean
+per-cut rate (normal interval over leaks), which is closer to H1's own rule.
+
+**Attenuation curve** (:func:`attenuation_curve`). The share caught when every leak's contribution
+is multiplied by ``eps`` in :data:`EPSILONS`: a target becomes ``eps x target``, an ``exp_return``
+``eps x exp_return``, and the probabilities move from the leak-free ``(0.4, 0.2, 0.4)`` by ``eps``
+times their departure from it. ``eps = 1`` returns the outputs untouched and must reproduce the
+unattenuated verdicts exactly. It shows where the 1e-9 rule stops catching weak leaks.
 
 **Checks of the design.** Each missed cut of a ``designed: yes`` leak is matched against H1's
 declared ``?`` reasons, read on the original bars by the probe of the same comparison
 (:func:`declared_reason`); an unexplained one is listed as a candidate hole. A miss whose output is
-the same at every compared row of the original bars is counted apart: on these series it carries
-no information.
+the same at every compared row of the original bars is counted apart: at the compared rows it
+carries no information. So is a twin constant at the compared rows (``close[s] > close[s]``, the
+twin of a next-bar comparison with bar s), which cannot be caught: the report gives their share.
+
+**Never produced** (:data:`NEVER_PRODUCED`, listed in the report): attenuated leaks (measured by
+the curve instead), fitted or transductive leaks, reads beyond ``s + 10``, continuous
+future-to-future functions, time-gated or sparse leaks, leaks that read the time stamps or whether
+a bar exists, cross-pair leaks, and leaks that act only through the long/flat rule's hysteresis.
 
 **Equivalence.** 50 seeded leaks of the population and their twins are wrapped as baselines
 (:class:`LeakModel`) and run through H1's own path (:func:`olsprime.bench.invariance.run_model`:
 ``outputs``, ``compare``, the long/flat rule at every venue). Their caught cuts, per direction, must
-equal the fast path's, and the twins must show no violation. If not, the run stops: no rate is
-reported.
+equal the fast path's, and the twins must show no violation. The first 5 of them, attenuated by
+1e-8 and 1e-10, go through the same check. If any disagree, the run stops: no rate is reported.
 
 Usage::
 
@@ -641,6 +657,7 @@ class Leak:
     output: str  # target, exp_return or probs
     tags: tuple[tuple[str, str], ...]
     twin: bool = False
+    scale: float = 1.0  # the attenuation epsilon: the leak's contribution to its outputs is multiplied by it
 
     @property
     def tag(self) -> dict[str, str]:
@@ -651,30 +668,47 @@ class Leak:
             raise ValueError("a twin has no twin")
         return replace(self, expr=self.expr.twin(), twin=True)
 
+    def attenuated(self, eps: float) -> Leak:
+        """The same leak with its contribution multiplied by ``eps`` (see :meth:`outputs`)."""
+        if not 0.0 < eps <= 1.0:
+            raise ValueError(f"eps must be in (0, 1], got {eps}")
+        return replace(self, scale=float(eps))
+
     def reach(self) -> tuple[int, int]:
         """The smallest and largest offsets the expression reads."""
         o = self.expr.offsets()
         return min(o), max(o)
 
     def render(self) -> str:
-        return f"{self.output} = {self.expr.render()}"
+        scale = "" if self.scale == 1.0 else f"{self.scale:g} x "
+        return f"{self.output} = {scale}{self.expr.render()}"
 
     def outputs(self, view: Any) -> dict[str, np.ndarray]:
-        """The leak's outputs on every row of the view: ``target``, ``exp_return`` or ``p_down``/``p_neutral``/``p_up``."""
+        """The leak's outputs on every row of the view: ``target``, ``exp_return`` or ``p_down``/``p_neutral``/``p_up``.
+
+        With ``scale = eps < 1`` the leak's **contribution** is attenuated: its departure from the leak-free output
+        (target 0, ``exp_return`` 0, the probabilities at ``z = 0``: ``(0.4, 0.2, 0.4)``) is multiplied by ``eps``.
+        At ``eps = 1`` the outputs are returned untouched, bit for bit.
+        """
         v = self.expr.evaluate(view)
         x = np.asarray(v, dtype=np.float64) if self.expr.binary else _clean(v)
+        eps = self.scale
         if self.output == "target":
             if not self.expr.binary:
                 raise ValueError("a target leak must be binary")
-            return {"target": x}
+            return {"target": x if eps == 1.0 else eps * x}
         if self.output == "exp_return":
-            return {"exp_return": x}
+            return {"exp_return": x if eps == 1.0 else eps * x}
         z = 2.0 * x - 1.0 if self.expr.binary else x
         missing = np.isnan(z)
+        half = (1.0 - NEUTRAL) / 2.0  # p_down = p_up at z = 0
+        p_down, p_up = (1.0 - NEUTRAL) * expit(-z), (1.0 - NEUTRAL) * expit(z)
+        if eps != 1.0:
+            p_down, p_up = half + eps * (p_down - half), half + eps * (p_up - half)
         return {
-            "p_down": np.where(missing, np.nan, (1.0 - NEUTRAL) * expit(-z)),
+            "p_down": np.where(missing, np.nan, p_down),
             "p_neutral": np.where(missing, np.nan, NEUTRAL),
-            "p_up": np.where(missing, np.nan, (1.0 - NEUTRAL) * expit(z)),
+            "p_up": np.where(missing, np.nan, p_up),
         }
 
 
@@ -971,8 +1005,10 @@ def full_path(leak: Leak, bars: pl.DataFrame, cuts: Sequence[inv.Cut], cfg: inv.
     }
 
 
-def _full_path_task(pair: str, bars: pl.DataFrame, cuts: list[inv.Cut], cfg: inv.H1Config, leaks: list[Leak]) -> list[tuple[str, int, bool, dict[str, Any]]]:
-    return [(pair, leak.id, leak.twin, full_path(leak, bars, cuts, cfg)) for leak in leaks]
+def _full_path_task(
+    pair: str, bars: pl.DataFrame, cuts: list[inv.Cut], cfg: inv.H1Config, leaks: list[Leak]
+) -> list[tuple[str, int, float, bool, dict[str, Any]]]:
+    return [(pair, leak.id, leak.scale, leak.twin, full_path(leak, bars, cuts, cfg)) for leak in leaks]
 
 
 # --- The fast path: every perturbation once, every leak vectorized ---------------------------
@@ -988,6 +1024,9 @@ class AdversaryConfig:
     long_perturbation_seed: int = 11
     equivalence_leaks: int = 50
     equivalence_seed: int = 3
+    # The first of the equivalence leaks, attenuated, through H1's own path too: the 1e-9 rule in both paths.
+    attenuated_equivalence_leaks: int = 5
+    attenuated_equivalence_eps: tuple[float, ...] = (1e-8, 1e-10)
     miss_sample: int = 40
     miss_sample_seed: int = 5
 
@@ -1174,17 +1213,48 @@ class Evaluated:
     twin_caught: np.ndarray  # (leaks, cuts, directions)
     twin_violated: np.ndarray  # (leaks, cuts, directions)
     constant: np.ndarray  # (leaks,): the same output at every compared row of the original bars
+    twin_constant: np.ndarray  # (leaks,): the twin gives the same output at every compared row (it cannot be caught)
 
 
 def evaluate_all(leaks: Sequence[Leak], bench: Bench) -> Evaluated:
     n, c, d = len(leaks), bench.n_cuts, len(bench.directions)
-    out = Evaluated(np.zeros((n, c, d), bool), np.zeros((n, c)), np.zeros((n, c, d), bool), np.zeros((n, c, d), bool), np.zeros(n, bool))
+    out = Evaluated(np.zeros((n, c, d), bool), np.zeros((n, c)), np.zeros((n, c, d), bool), np.zeros((n, c, d), bool),
+                    np.zeros(n, bool), np.zeros(n, bool))  # fmt: skip
     for i, leak in enumerate(leaks):
         r = evaluate_fast(leak, bench)
         out.caught[i], out.size[i], out.constant[i] = r.caught, r.size, r.constant
         t = evaluate_fast(leak.honest_twin(), bench)
-        out.twin_caught[i], out.twin_violated[i] = t.caught, t.violated
+        out.twin_caught[i], out.twin_violated[i], out.twin_constant[i] = t.caught, t.violated, t.constant
     return out
+
+
+EPSILONS: tuple[float, ...] = (1.0, 1e-2, 1e-4, 1e-6, 1e-8, 1e-10)
+
+
+def attenuation_curve(leaks: Sequence[Leak], bench: Bench, ev: Evaluated, epsilons: Sequence[float] = EPSILONS) -> list[dict[str, Any]]:
+    """The share caught when every leak's contribution is multiplied by eps (:meth:`Leak.outputs`).
+
+    At any of H1's cuts (Wilson) and per cut (mean over leaks, at H1's cuts and over the long schedule),
+    overall and per output. ``eps = 1`` must reproduce the unattenuated verdicts exactly, or this raises.
+    """
+    h1_rows, long_rows = bench.rows("h1"), bench.rows("long")
+    output = np.array([leak.output for leak in leaks])
+    rows = []
+    for eps in epsilons:
+        caught = np.stack([evaluate_fast(leak.attenuated(eps), bench).caught for leak in leaks]) if leaks else ev.caught
+        if eps == 1.0 and not np.array_equal(caught, ev.caught):
+            raise AssertionError("eps = 1 does not reproduce the unattenuated run")
+        cut = caught.any(axis=2)
+        any_h1 = cut[:, h1_rows].any(axis=1)
+        rows.append({
+            "eps": float(eps),
+            "any_h1_cut": _share(int(any_h1.sum()), len(leaks)),
+            "per_cut_rate_h1": _mean_rate(cut[:, h1_rows].mean(axis=1)),
+            "per_cut_rate_long": _mean_rate(cut[:, long_rows].mean(axis=1)) if long_rows.size else _mean_rate(np.array([])),
+            "any_h1_cut_by_output": {o: _share(int(any_h1[output == o].sum()), int((output == o).sum())) for o in OUTPUTS if (output == o).any()},
+            "reproduces_unattenuated": bool(eps != 1.0 or np.array_equal(caught, ev.caught)),
+        })  # fmt: skip
+    return rows
 
 
 # The adversary's quantities that H1's probes know (olsprime.bench.leaks.QUANTITIES): their declared ``?`` reasons apply.
@@ -1245,10 +1315,19 @@ def equivalence_ids(n: int, cfg: AdversaryConfig) -> list[int]:
 
 
 def check_equivalence(
-    leaks: Sequence[Leak], bench: Bench, bars_by_pair: dict[str, pl.DataFrame], cfg: AdversaryConfig, *, workers: int = 1
+    leaks: Sequence[Leak],
+    bench: Bench,
+    bars_by_pair: dict[str, pl.DataFrame],
+    cfg: AdversaryConfig,
+    *,
+    workers: int = 1,
+    twins: bool = True,
 ) -> dict[str, Any]:
-    """The fast path against H1's own path, cut for cut and direction for direction, on the leaks and their twins."""
-    units = [unit for leak in leaks for unit in (leak, leak.honest_twin())]
+    """The fast path against H1's own path, cut for cut and direction for direction, on the leaks (and their twins).
+
+    Leaks are told apart by ``(id, scale)``, so the same leak may be checked at several attenuations.
+    """
+    units = [unit for leak in leaks for unit in ((leak, leak.honest_twin()) if twins else (leak,))]
     jobs = []
     chunk = max(1, math.ceil(len(units) / max(1, 3 * workers)))
     for pair, bars in bars_by_pair.items():
@@ -1260,11 +1339,11 @@ def check_equivalence(
             results = [r for f in futures for r in f.result()]
     else:
         results = [r for job in jobs for r in _full_path_task(*job)]
-    by_leak = {leak.id: leak for leak in leaks}
+    by_leak = {(leak.id, leak.scale): leak for leak in leaks}
     mismatches, twin_violations, compared = [], [], 0
-    for pair, leak_id, twin, full in sorted(results, key=lambda r: (r[0], r[1], r[2])):
+    for pair, leak_id, scale, twin, full in sorted(results, key=lambda r: (r[0], r[1], r[2], r[3])):
         rows = np.array([i for i, c in enumerate(bench.cuts) if c["pair"] == pair and c["schedule"] == "h1"])
-        leak = by_leak[leak_id].honest_twin() if twin else by_leak[leak_id]
+        leak = by_leak[(leak_id, scale)].honest_twin() if twin else by_leak[(leak_id, scale)]
         fast = evaluate_fast(leak, bench)
         compared += 1
         f_caught, f_violated = fast.caught[rows].tolist(), fast.violated[rows].tolist()
@@ -1276,6 +1355,7 @@ def check_equivalence(
                                     "full_violated": full["violated"], "fast_violated": f_violated})  # fmt: skip
     return {
         "leaks": [leak.id for leak in leaks],
+        "scales": sorted({leak.scale for leak in leaks}, reverse=True),
         "units_compared": compared,
         "cuts_per_pair": {p: len(c) for p, c in bench.h1_cuts.items()},
         "mismatches": mismatches,
@@ -1343,11 +1423,17 @@ def summarize(
         "long_schedule": _size_summary(sizes_long),
         "smallest_catch_per_caught_leak_h1": _size_summary(smallest),
     }
+    twin_constant = int(ev.twin_constant.sum())
     twins = {
         "evaluated": int(len(leaks)),
         "cuts": int(bench.n_cuts),
         "false_catches": int(ev.twin_caught.any(axis=(1, 2)).sum()),
         "bit_violations": int(ev.twin_violated.any(axis=(1, 2)).sum()),
+        # A twin constant at the compared rows cannot be caught: "0 caught" says nothing about it.
+        "constant_at_compared_rows": twin_constant,
+        "constant_share": _share(twin_constant, len(leaks)),
+        "non_constant": int(len(leaks) - twin_constant),
+        "non_constant_caught": int((ev.twin_caught.any(axis=(1, 2)) & ~ev.twin_constant).sum()),
     }
     missed = ~h1_any
     rng = np.random.default_rng(cfg.miss_sample_seed)
@@ -1384,10 +1470,38 @@ def summarize(
         "by_designed": dict(Counter(leak.tag["designed"] for leak in leaks)),
     }
     out = {"population": population, "h1_cuts": h1, "long_schedule": long_, "catch_sizes": sizes, "twins": twins,
-           "misses": misses, "leaks": per_leak}  # fmt: skip
+           "misses": misses, "never_produced": list(NEVER_PRODUCED), "leaks": per_leak}  # fmt: skip
     if bars_by_pair is not None:
         out["designed_misses"] = designed_misses(leaks, bench, ev, bars_by_pair)
     return out
+
+
+# What this generator never produces (docs/PROTOCOL.md, "The adversary"): the share caught says nothing about these.
+NEVER_PRODUCED: tuple[str, ...] = (
+    "attenuated leaks, whose contribution to the outputs is small: measured by the attenuation curve, not by the population",
+    "fitted or transductive leaks (scalers, hyperparameters, unpurged fits): only H1's designed controls cover them",
+    f"reads beyond s+{FUTURE_REACH} (FUTURE_REACH): the hourly label's exit at s+25 is out of reach",
+    "continuous future-to-future functions, such as the h = 1 label ln(open[s+2] / open[s+1]) or a future volatility",
+    "time-gated or sparse leaks, active at one row per month, or under conditions beyond the 1/4..4 margins",
+    "leaks that read the time stamps or whether a bar exists (H1's stated limit)",
+    "cross-pair leaks: every leak reads its own pair's bars only",
+    "leaks that act only through the long/flat rule's hysteresis",
+)
+
+
+def results_row(result: dict[str, Any]) -> str:
+    """The text of the adversary's row in ``docs/RESULTS.md``: both headline rates, the twins and the attenuation."""
+    o, pc = result["h1_cuts"]["overall"], result["h1_cuts"]["per_cut_rate"]
+    tw = result["twins"]
+    curve = "; ".join(f"eps {r['eps']:g}: {_pct(r['any_h1_cut']['share'])} any cut, {_pct(r['per_cut_rate_h1']['mean'])} per cut"
+                      for r in result.get("attenuation", []))  # fmt: skip
+    return (
+        f"{o['n']} random leaks (seed {result['config']['seed']}) through H1's perturbation at H1's 16 cuts. Caught at one cut at "
+        f"least: {_pct(o['share'])}, 95 % Wilson {_ci(o)}. Mean per-cut rate (closer to H1's per-cut rule): {_pct(pc['mean'])}, 95 % {_ci(pc)} "
+        f"(normal, over leaks). Twins caught: {tw['false_catches']} of {tw['evaluated']}, of which {tw['constant_at_compared_rows']} "
+        f"({_pct(tw['constant_share']['share'])}) are constant at the compared rows and cannot be caught. Attenuation: {curve}. "
+        "Descriptive: this generator's detection rate, not all leaks'."
+    )
 
 
 def _config_json(cfg: AdversaryConfig) -> dict[str, Any]:
@@ -1409,7 +1523,13 @@ def run(bars_by_pair: dict[str, pl.DataFrame], cfg: AdversaryConfig, *, workers:
     bench = build_bench(bars_by_pair, cfg)
     timings["perturbations"] = time.perf_counter() - t0
     t1 = time.perf_counter()
-    eq = check_equivalence([leaks[i] for i in equivalence_ids(cfg.n, cfg)], bench, bars_by_pair, cfg, workers=workers)
+    ids = equivalence_ids(cfg.n, cfg)
+    eq = check_equivalence([leaks[i] for i in ids], bench, bars_by_pair, cfg, workers=workers)
+    weak = [leaks[i].attenuated(e) for i in ids[: cfg.attenuated_equivalence_leaks] for e in cfg.attenuated_equivalence_eps]
+    if weak:  # the 1e-9 rule, near its edge, in both paths
+        eq["attenuated"] = check_equivalence(weak, bench, bars_by_pair, cfg, workers=workers, twins=False)
+        eq["agree"] = bool(eq["agree"] and eq["attenuated"]["agree"])
+        eq["mismatches"] = [*eq["mismatches"], *eq["attenuated"]["mismatches"]]
     timings["equivalence"] = time.perf_counter() - t1
     result: dict[str, Any] = {"config": _config_json(cfg), "cuts": bench.cuts, "equivalence": eq}
     if prov is not None:
@@ -1422,6 +1542,10 @@ def run(bars_by_pair: dict[str, pl.DataFrame], cfg: AdversaryConfig, *, workers:
     ev = evaluate_all(leaks, bench)
     timings["fast_path"] = time.perf_counter() - t2
     result.update(summarize(leaks, bench, ev, cfg, bars_by_pair))
+    t3 = time.perf_counter()
+    result["attenuation"] = attenuation_curve(leaks, bench, ev)
+    timings["attenuation"] = time.perf_counter() - t3
+    result["results_row"] = results_row(result)
     result["_timings"] = timings
     return result
 
@@ -1467,6 +1591,14 @@ def render_md(result: dict[str, Any]) -> str:
         f"{len(eq['twin_violations'])}. **{'The paths agree.' if eq['agree'] else 'THE PATHS DISAGREE: the run stopped.'}**",
         "",
     ]
+    if "attenuated" in eq:
+        at = eq["attenuated"]
+        lines += [
+            f"Near the rule's edge: {len(set(at['leaks']))} of these leaks attenuated by eps in "
+            f"{{{', '.join(f'{e:g}' for e in at['scales'])}}}, {at['units_compared']} (leak, pair) units through the same path: "
+            f"{len(at['mismatches'])} mismatches.",
+            "",
+        ]
     if "stopped" in result:
         lines += [f"**Stopped:** {result['stopped']}.", ""]
         for m in eq["mismatches"][:20]:
@@ -1480,7 +1612,11 @@ def render_md(result: dict[str, Any]) -> str:
         "## Honest twins",
         "",
         f"{twins['evaluated']} twins at {twins['cuts']} cuts each (both schedules), both directions: **{twins['false_catches']} "
-        f"caught, {twins['bit_violations']} differing by a single bit** (each must be 0; one is a bench bug).",
+        f"caught, {twins['bit_violations']} differing by a single bit** (each must be 0; one is a bench bug). "
+        f"{twins['constant_at_compared_rows']} twins ({_pct(twins['constant_share']['share'])}, Wilson {_ci(twins['constant_share'])}) "
+        "give the same output at every compared row of the original bars, such as `close[s] > close[s]`, the twin of a "
+        "next-bar comparison with bar s: a constant twin cannot be caught, so the zero rests on the "
+        f"{twins['non_constant']} others, of which {twins['non_constant_caught']} are caught.",
         "",
     ]
     dm = result.get("designed_misses")
@@ -1502,9 +1638,12 @@ def render_md(result: dict[str, Any]) -> str:
     lines += [
         "## Share caught at H1's cuts",
         "",
-        f"A leak counts as caught if it is caught at one of H1's {len(h1['per_cut'])} cuts at least. **Overall: "
-        f"{o['caught']} of {o['n']}, {_pct(o['share'])}, 95 % Wilson {_ci(o)}.** Caught at every cut: "
-        f"{_pct(h1['caught_at_every_cut']['share'])}. Mean per-cut rate: {_pct(h1['per_cut_rate']['mean'])} {_ci(h1['per_cut_rate'])}.",
+        "Two headline rates. **Any cut:** a leak caught at one of H1's "
+        f"{len(h1['per_cut'])} cuts at least, {o['caught']} of {o['n']}, **{_pct(o['share'])}**, 95 % Wilson {_ci(o)}. This is "
+        "weaker than H1's own rule, which asks a control to be caught at each of its predicted cuts. **Per cut:** the share of "
+        f"H1's cuts at which a leak is caught, averaged over leaks, **{_pct(h1['per_cut_rate']['mean'])}**, 95 % "
+        f"{_ci(h1['per_cut_rate'])} (normal, over leaks; a Wilson interval does not apply to a mean of rates). Caught at every "
+        f"cut: {_pct(h1['caught_at_every_cut']['share'])} {_ci(h1['caught_at_every_cut'])}. The table below gives the any-cut share.",
         "",
         "| group | caught | n | share | 95 % Wilson |",
         "|---|---|---|---|---|",
@@ -1552,7 +1691,10 @@ def render_md(result: dict[str, Any]) -> str:
         "## Size of the catches",
         "",
         "The size of a catch is the largest move of the leak's own outputs at a caught cut (a target moves by 1). A size of 0 is a "
-        f"catch through a missing value only. Within 10x of the rule: at most {10 * cfg['caught_above']:g}.",
+        f"catch through a missing value only. Within 10x of the rule: at most {10 * cfg['caught_above']:g}. **These sizes describe "
+        "the scale of the generator's outputs, which are O(1) by construction (targets in {0, 1}, log-ratios, probabilities), "
+        "not H1's sensitivity**: a share within 10x of 0 is not a margin of the bench. The attenuation curve below measures "
+        "where the rule stops catching weak leaks.",
         "",
         "| set | catches | missing only | within 10x | min | 1 % | 5 % | median | max |",
         "|---|---|---|---|---|---|---|---|---|",
@@ -1565,12 +1707,33 @@ def render_md(result: dict[str, Any]) -> str:
             + " |"
         )
     lines += ["", "Bins of the sizes at H1's cuts: " + ", ".join(f"{k}: {v}" for k, v in sizes["h1_cuts"]["bins"].items()) + ".", ""]
+    curve = result.get("attenuation", [])
+    if curve:
+        outputs = [o_ for o_ in OUTPUTS if o_ in curve[0]["any_h1_cut_by_output"]]
+        lines += [
+            "## Attenuation curve",
+            "",
+            "Every leak's contribution to its outputs multiplied by eps: a target becomes eps x target, an `exp_return` eps x "
+            "exp_return, and the probabilities move from the leak-free (0.4, 0.2, 0.4) by eps times their departure from it. "
+            "Same perturbations, same rule. eps = 1 reproduces the unattenuated run exactly"
+            f"{'' if all(r['reproduces_unattenuated'] for r in curve) else ' (IT DOES NOT: a bench bug)'}.",
+            "",
+            "| eps | any H1 cut | 95 % Wilson | per cut, H1's cuts | 95 % | per cut, long schedule | " + " | ".join(f"any cut, {o_}" for o_ in outputs) + " |",
+            "|---|---|---|---|---|---|" + "---|" * len(outputs),
+        ]
+        for r in curve:
+            lines.append(
+                f"| {r['eps']:g} | {_pct(r['any_h1_cut']['share'])} | {_ci(r['any_h1_cut'])} | {_pct(r['per_cut_rate_h1']['mean'])} | "
+                f"{_ci(r['per_cut_rate_h1'])} | {_pct(r['per_cut_rate_long']['mean'])} | "
+                + " | ".join(_pct(r["any_h1_cut_by_output"][o_]["share"]) for o_ in outputs) + " |"
+            )
+        lines.append("")
     lines += [
         "## The misses",
         "",
         f"{misses['count']} leaks are caught at none of H1's cuts; {misses['long_schedule_also_missed']} of them at none of the "
         f"long schedule's cuts either. {misses['constant_on_original_rows']} of the misses give the same output at every "
-        "compared row of the original bars: on these series they carry no information, whatever they read. "
+        "compared row of the original bars: at the compared rows they carry no information, whatever they read. "
         "Counts by tag (missed of n):",
         "",
     ]
@@ -1579,8 +1742,18 @@ def render_md(result: dict[str, Any]) -> str:
         lines.append(f"- **{key}**: {cells}.")
     lines += ["", "A seeded sample of the missed leaks, with their twins:", ""]
     for m in misses["sample"]:
-        constant = ", constant on the original rows" if m["constant_on_original_rows"] else ""
+        constant = ", constant at the compared rows" if m["constant_on_original_rows"] else ""
         lines.append(f"- #{m['id']} ({m['family']}, long cuts caught {m['long_cuts_caught']}{constant}): `{m['expression']}`; twin `{m['twin']}`")
+    lines += [
+        "",
+        "## What the generator never produces",
+        "",
+        "The shares above say nothing about these families: the population was fixed before the smoke run and is not extended.",
+        "",
+        *(f"- {item}." for item in result.get("never_produced", NEVER_PRODUCED)),
+    ]
+    if "results_row" in result:
+        lines += ["", "## Row for `docs/RESULTS.md`", "", result["results_row"]]
     if "provenance" in result:
         lines += ["", *provenance.render_md(result["provenance"])]
     return "\n".join(lines) + "\n"
