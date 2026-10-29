@@ -16,7 +16,7 @@ Read first:
 
 ## Runs, in this order
 
-Commit under test: **filled in by the orchestrator**. Check that `git rev-parse HEAD` equals it and `git status --porcelain` is empty before each run. If either fails, stop.
+Commit under test: `3a22daa` for runs 1 to 3. Report n°2's first run at `3a22daa` stopped on its ECE cross-check, so it ran at `31c8005`, which changes only that check's tolerance (`docs/PROTOCOL.md`, change log, 2026-10-29, during the official runs). Check that `git rev-parse HEAD` equals it and `git status --porcelain` is empty before each run. If either fails, stop.
 
 1. **Report n°1 after the vault move.**
    - Run `cd python && uv run --no-sync python -m olsprime.bench.report1 --check ../runs/2026-10-28-report1`.

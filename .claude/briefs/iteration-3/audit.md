@@ -90,6 +90,22 @@ Report phase 1 with every finding. The orchestrator fixes or logs each one, then
 - Each row added to `docs/RESULTS.md`: does the number match the run's files, and does the verdict follow the registered rule?
 - Each claim in `docs/ITERATIONS.md`'s outcome and in the reports: is it stated no stronger than the evidence?
 - The vault move: do the logs show that only renames happened, and that sealed reads were checked equal? Is the "stage" claimed the stage reached?
+- Added on 2026-10-29, after the runs:
+  - **The ECE tolerance.** Commit `31c8005` changed one evaluation check between the two official commits: Report n°2's ECE cross-check, from a fixed `rel_tol=1e-9` to 4·n·ε. Review it as a phase 1 change. Does the check still catch a lost row or a row in another bin at the panel's size? Does the PROTOCOL entry disclose the one number the stopped run showed?
+  - **The hand-offs of passes 1c to 1f**, checked on the real results:
+    - the previewed and unseen hours add up to the scored hours, over 18 previewed months of 72;
+    - every undefined cell of the previewed months is explained;
+    - every share of identical hours is read with its count of informative hours;
+    - the CUSUM's days left out add up;
+    - the panel H1's patterns are the predicted ones;
+    - every `--check` passed;
+    - the previewed part agrees with the 18-month smoke run as far as the two `report2.json` files allow.
+  - **The 42 adversary misses that are not constant**, which Abdou asked about. They are the leaks of `adversary.json` whose `h1_pattern` has no `X` and whose `constant_on_original_rows` is false.
+    - Classify them.
+    - Say for each whether H1 cannot see it by design, or whether it is a hole H1 should close.
+    - Propose a planted family for the next adversary run if a pattern emerges.
+  - **The data manifest digest**, from `7c5f2397…` after the move to `0ee7ac0f…` in the runs.
+  - **The 94 unscored hours around 2020-07-01**, and the Coverage paragraph of report-2.md.
 
 ## Constraints
 

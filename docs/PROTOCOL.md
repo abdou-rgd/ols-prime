@@ -295,3 +295,14 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
     - A probe on synthetic data reproduced the gap. A lost row, the defect the check is there for, moves the ECE about 300 times more than the new tolerance.
     - The tolerance is now 4·n·ε, about eight times the worst-case rounding of the two sums over n rows: 1.2 × 10⁻⁹ in absolute terms for 1.4 million rows.
     - The run wrote no file. Its traceback showed one number, `climatology-panel`'s ECE over the test period, 0.0029. No other number of Report n°2 was seen before the re-run, which scores the same arms with the same rules.
+- 2026-10-29, after audit phase 2, once Report n°2 had run. Wording only: no rule, statistic, threshold, grid, seed or period changes.
+  - **What the ECE cross-check guards.**
+    - It guards a row lost or counted twice between the hourly sums and `stats.ece`. Such a row moves the ECE by about |correct − confidence|/n. For a row of climatology, whose confidence is about 0.44, that is 220 to 285 times the tolerance on the panel.
+    - A row whose confidence nearly equals its correctness, a confident and right forecast, moves it by almost nothing.
+    - It cannot see a row put in another bin. Both paths bin the same way, and a row moved between two bins whose sums share a sign leaves the ECE unchanged.
+    - The docstring of `ece_tolerance` says otherwise. It is corrected with the next change to `bench/report2.py`.
+  - **The bound.** The two paths do not round alike.
+    - `stats.ece` counts each bin's correct rows exactly, and adds its confidences in one sequential sum. Divided by n, that sum's rounding moves the ECE by at most about u·n·mean(confidence), where u = ε/2 is the unit roundoff. That is below n·ε/2.
+    - The hourly path adds about 30 rows per cell, then the cells over about 50,000 hours. Its rounding is smaller still: at most about H·u, for H hours.
+    - So 4·n·ε is more than eight times the worst case, as long as the mean confidence stays below 0.96. Climatology's is about 0.44.
+    - For the run's 1,493,353 scored rows, the tolerance is 1.33 × 10⁻⁹. The entry above rounded the panel to 1.4 million rows and the tolerance to 1.2 × 10⁻⁹. The stopped run's gap was 3.7 × 10⁻¹² in absolute terms: 1.3 × 10⁻⁹ of an ECE of 0.0029.
