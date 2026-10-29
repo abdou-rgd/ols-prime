@@ -23,11 +23,15 @@ def sealed_vault(monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempP
 
     A test must never read or create ``runs/vault/`` in the repository, and a default
     ``load_klines(symbol, interval)`` must never find the repository's ``data/``: the data root is an
-    empty folder of its own (not inside ``tmp_path``, which tests fill).
+    empty folder of its own (not inside ``tmp_path``, which tests fill). The vault tree
+    (``olsprime.vault``) gets an empty folder of its own too, and no identity is named, so a default
+    test never finds the real ``ols-prime-vault`` beside the repository nor a private key.
     """
     monkeypatch.delenv("OLSPRIME_OPEN_VAULT", raising=False)
+    monkeypatch.delenv("OLSPRIME_VAULT_IDENTITY", raising=False)
     monkeypatch.setenv("OLSPRIME_RUNS_DIR", str(tmp_path_factory.mktemp("runs")))
     monkeypatch.setenv("OLSPRIME_DATA_DIR", str(tmp_path_factory.mktemp("datadir")))
+    monkeypatch.setenv("OLSPRIME_VAULT_DIR", str(tmp_path_factory.mktemp("vaultdir")))
 
 
 WIRE = Tripwire()

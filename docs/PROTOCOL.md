@@ -28,6 +28,11 @@ Fixed before any model is trained. Any change gets a dated entry in the change l
   - The vault opens only with two keys at once: the environment variable `OLSPRIME_OPEN_VAULT=1`, and a file `runs/vault/OPEN` written by hand at the final evaluation. Its first line is the date alone (ISO 8601) and the next lines are the ids of the final models. An empty file, or a first line that is not a date, keeps the vault shut with an error.
   - Each read with the vault open adds a line to `runs/vault/ACCESS.log`.
   - `OPEN` and `ACCESS.log` are the only files under `runs/` that git tracks, so the opening is recorded in the history.
+- **The physical seal (iteration 3).** `python -m olsprime.vault` moves the vault months out of `data/` into a vault tree outside the repository (stage 1), then encrypts that tree to an age key held off this machine (stage 2). `docs/DATA.md` gives the stages, the stage reached and their limits. The two keys now also decide whether the vault tree is read at all.
+  - **Sealed.** `load_klines` reads `data/` only, and never touches the vault tree.
+  - **Both keys, stage 1.** `load_klines` also reads the pair's plaintext file in the vault tree, joins the two on `open_time` (the file in `data/` wins) and sorts.
+  - **Both keys, stage 2.** The `.age` file is decrypted in memory with the identity file named by `OLSPRIME_VAULT_IDENTITY`. With no identity, or a wrong one, `VaultSealed` is raised and nothing opens, even with both keys forged.
+  - Each part read is logged in `ACCESS.log`, the tree's part tagged `[vault tree]`. `olsprime.vault` refuses to run while the vault is open.
 
 ## Leakage tests (mandatory for every model)
 
@@ -231,3 +236,4 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
   - Two clarifications of the panel, the same day and before any Matrix run. They come from building it, and change nothing in the design.
     - 233 of the 274 members have rows in the development period; the other 41 first join in 2025.
     - The validation year's bars are loaded through the seal, then cut before features and labels. The earlier wording said they were not read at all.
+  - The physical seal of the vault months, in "Splits": a vault tree outside `data/` (stage 1) and its age encryption (stage 2). The downloader and `build_parquet` now refuse vault months. No split or period changes.

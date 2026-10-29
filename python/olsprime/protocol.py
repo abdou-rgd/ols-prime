@@ -22,10 +22,22 @@ no other module opens a Parquet file.
 Each read with the vault open appends a line to ``<runs>/vault/ACCESS.log``.
 Downloading and the structural checks of ``build_parquet`` are not reads for
 modelling and stay outside this lock.
+
+The physical seal (iteration 3, ``python -m olsprime.vault``) moves the vault months out of ``data/``
+into a vault tree (:func:`olsprime.paths.vault_dir`). With both keys in place, :func:`load_klines` adds
+the rows of the vault tree to the pair's table:
+
+- stage 1: the plaintext Parquet file of the vault tree, read through :func:`load_klines_file`;
+- stage 2: the ``.age`` file of the vault tree, decrypted in memory with the identity named by
+  ``OLSPRIME_VAULT_IDENTITY``. Without that identity (or with another) nothing opens: :class:`VaultSealed`.
+
+Without both keys nothing reads the vault tree. It is the one thing the file system keeps from a
+process that has taken the guards down: at stage 2 the rows are ciphertext without the identity.
 """
 
 from __future__ import annotations
 
+import io
 import os
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timezone
@@ -41,6 +53,8 @@ from olsprime import paths
 from olsprime.paths import runs_dir
 
 OPEN_ENV = "OLSPRIME_OPEN_VAULT"
+IDENTITY_ENV = "OLSPRIME_VAULT_IDENTITY"
+ENCRYPTED_SUFFIX = ".age"
 
 
 def _is_utc(value: datetime) -> bool:
@@ -158,6 +172,23 @@ def known_at_expr(interval: str) -> pl.Expr:
     return pl.max_horizontal(pl.col("close_time"), nominal).alias("known_at")
 
 
+def _stored_columns(columns: list[str] | None) -> list[str] | None:
+    """The columns to read from the file for the requested ``columns``: ``known_at`` is computed, not stored."""
+    if columns is None:
+        return None
+    stored = [c for c in columns if c != "known_at"]
+    needed = [c for c in ("open_time", "close_time") if c not in stored]
+    return stored + needed
+
+
+def _sealed_frame(frame: pl.DataFrame, interval: str, columns: list[str] | None, caller: str) -> pl.DataFrame:
+    """Add ``known_at``, seal on it, and select ``columns`` (every stored column and ``known_at`` when ``None``)."""
+    out_columns = [*frame.columns, "known_at"] if columns is None else list(columns)
+    frame = frame.with_columns(known_at_expr(interval))
+    frame = seal(frame, time_col="known_at", caller=caller)
+    return frame.select(out_columns)
+
+
 def load_klines_file(
     path: Path,
     interval: str,
@@ -167,17 +198,9 @@ def load_klines_file(
 ) -> pl.DataFrame:
     """Read a klines Parquet file and seal it; see :func:`load_klines`."""
     interval_ms(interval)  # fail early on an unknown interval
-    if columns is None:
-        frame = pl.read_parquet(path)
-        out_columns = [*frame.columns, "known_at"]
-    else:
-        out_columns = list(columns)
-        stored = [c for c in out_columns if c != "known_at"]
-        needed = [c for c in ("open_time", "close_time") if c not in stored]
-        frame = pl.read_parquet(path, columns=stored + needed)
-    frame = frame.with_columns(known_at_expr(interval))
-    frame = seal(frame, time_col="known_at", caller=caller)
-    return frame.select(out_columns)
+    stored = _stored_columns(columns)
+    frame = pl.read_parquet(path) if stored is None else pl.read_parquet(path, columns=stored)
+    return _sealed_frame(frame, interval, columns, caller)
 
 
 def load_klines(
@@ -203,10 +226,78 @@ def load_klines(
     were final before ``VAULT.start``. A 1 w bar opened on 2025-12-29 is dropped.
     ``open_time`` and ``close_time`` are always read for it, and dropped afterwards
     when ``columns`` leaves them out.
+
+    With both keys in place the pair's file in the vault tree is read too (plain or decrypted in
+    memory, see the module docstring), the two parts are joined on ``open_time`` (the data file's
+    row wins) and sorted; each part is logged on its own. Sealed, the vault tree is not touched.
     """
     root = data_dir if data_dir is not None else paths.data_dir()
     path = parquet_path(root / "parquet", symbol, interval)
-    return load_klines_file(path, interval, columns=columns, caller=caller or f"load_klines({symbol},{interval})")
+    who = caller or f"load_klines({symbol},{interval})"
+    if not vault_open():
+        return load_klines_file(path, interval, columns=columns, caller=who)
+    wanted = None if columns is None else list(dict.fromkeys([*columns, "open_time"]))
+    frame = load_klines_file(path, interval, columns=wanted, caller=who)
+    part = _vault_tree_part(symbol, interval, wanted, who)
+    if part is not None:
+        frame = pl.concat([frame, part]).unique(subset="open_time", keep="first", maintain_order=True).sort("open_time")
+    return frame.select(frame.columns if columns is None else columns)
+
+
+# --- The vault tree (physical seal) ---------------------------------------------------
+
+
+def vault_tree_klines_path(symbol: str, interval: str, root: Path | None = None) -> Path:
+    """Where the vault tree keeps a pair's Parquet file (plain); the encrypted one adds ``.age``."""
+    return parquet_path((root if root is not None else paths.vault_dir()) / "parquet", symbol, interval)
+
+
+def read_identity(path: Path):
+    """The age X25519 identity in ``path`` (an age key file: ``#`` comment lines, then ``AGE-SECRET-KEY-1...``)."""
+    import pyrage
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except (OSError, UnicodeDecodeError) as error:
+        raise VaultSealed(f"cannot read the identity file {path}: {error}") from None
+    secret = next((line.strip() for line in lines if line.strip() and not line.lstrip().startswith("#")), "")
+    try:
+        return pyrage.x25519.Identity.from_str(secret)
+    except pyrage.IdentityError:
+        raise VaultSealed(f"{path} holds no age identity (an AGE-SECRET-KEY-1... line)") from None
+
+
+def decrypt_vault_bytes(ciphertext: bytes, *, what: str) -> bytes:
+    """Decrypt ``ciphertext`` with the identity named by ``OLSPRIME_VAULT_IDENTITY``; :class:`VaultSealed` if it cannot."""
+    import pyrage
+
+    named = os.environ.get(IDENTITY_ENV)
+    if not named:
+        raise VaultSealed(f"{what} is encrypted and {IDENTITY_ENV} is not set: stage 2 opens only with the identity")
+    identity = read_identity(Path(named))
+    try:
+        return pyrage.decrypt(ciphertext, [identity])
+    except pyrage.DecryptError as error:
+        raise VaultSealed(f"{what}: the identity in {named} does not open it ({error})") from None
+
+
+def _vault_tree_part(symbol: str, interval: str, columns: list[str] | None, caller: str) -> pl.DataFrame | None:
+    """The pair's rows in the vault tree, sealed like any read (so logged, with the vault open); ``None`` if it has none.
+
+    Only called with both keys in place. A plain file (stage 1) is read through :func:`load_klines_file`; an
+    encrypted one (stage 2) is decrypted in memory.
+    """
+    interval_ms(interval)
+    plain = vault_tree_klines_path(symbol, interval)
+    who = f"{caller} [vault tree]"
+    if plain.is_file():
+        return load_klines_file(plain, interval, columns=columns, caller=who)
+    cipher = plain.with_name(plain.name + ENCRYPTED_SUFFIX)
+    if cipher.is_file():
+        data = decrypt_vault_bytes(cipher.read_bytes(), what=cipher.name)
+        frame = pl.read_parquet(io.BytesIO(data), columns=_stored_columns(columns))
+        return _sealed_frame(frame, interval, columns, who)
+    return None
 
 
 # --- Universe and manifest helpers ---------------------------------------------------
@@ -236,6 +327,32 @@ def stored_row_count(path: Path) -> int:
     :func:`sealed_klines_span` or :func:`sealed_universe_span` for what a model may see.
     """
     return pq.read_metadata(path).num_rows
+
+
+def stored_open_time_bounds(path: Path) -> tuple[datetime, datetime] | None:
+    """``(first, last)`` ``open_time`` as the Parquet statistics state them, vault bars included; ``None`` without statistics.
+
+    No row is read: the statistics are the file's own footer. Like :func:`stored_row_count`, it tells
+    whether a file holds bars of the vault, not what they hold.
+    """
+    meta = pq.read_metadata(path)
+    if "open_time" not in meta.schema.names:
+        return None
+    index = meta.schema.names.index("open_time")
+    lows, highs = [], []
+    for group in range(meta.num_row_groups):
+        stats = meta.row_group(group).column(index).statistics
+        if stats is None or not stats.has_min_max:
+            return None
+        lows.append(stats.min)
+        highs.append(stats.max)
+    if not lows:
+        return None
+    return _as_utc(min(lows)), _as_utc(max(highs))
+
+
+def _as_utc(when: datetime) -> datetime:
+    return when.replace(tzinfo=UTC) if when.tzinfo is None else when.astimezone(UTC)
 
 
 def _span(times: pl.Series) -> tuple[int, datetime | None, datetime | None]:

@@ -159,7 +159,29 @@ Remaining limits, stated plainly:
 - **No test needs the real store, and CI is the evidence.** GitHub Actions runs the whole suite (`uv run --locked pytest`, `.github/workflows/ci.yml`) on runners that have no `data/` at all. No test skips or branches on whether real data exist: the only skips in `python/tests` are `test_decision.py` (a Rust source file), `test_stats.py` (the slow flag) and a symbolic-link check in `test_tripwire.py`, and none tests a `.exists()` on a data path.
 - A reader captured before `conftest.py` is loaded (by a plugin, say) is not wrapped.
 - `pandas`, `torch` and `duckdb` are not installed in this environment, so those wrappers are untested against the real libraries.
-- The vault rows still sit in the same files as the rest, and in the quality reports of the two pairs that have them (see above). Keeping them in a separate tree, unreachable without both keys, is the planned physical seal (iteration 3).
+- Until stage 1 of the physical seal runs (below), the vault rows sit in the same files as the rest, and in the quality reports of the two pairs that have them (see above).
+
+**The physical seal (iteration 3).** The vault months leave `data/` in two stages, with `uv run python -m olsprime.vault {plan,move,encrypt,keygen,status}` (`python/olsprime/vault.py`).
+- **Stage 1, out of `data/`.** `move` works in two phases.
+  - First it rebuilds, into a staging folder (`data/parquet.vault-stage/`), every Parquet file that holds vault rows, from that pair's non-vault archives. Each rebuild is checked before any table is touched. Its sealed read must equal the old file's, frame for frame, schema included. Its stored row count must equal the old file's sealed count, so no vault row is left.
+  - Then the old file and its quality report are hard-linked into the vault tree, and the new file is renamed over the old path. The path therefore always holds the old file or the new one.
+  - The vault archives and their `.CHECKSUM` files are renamed into the tree once `is_verified` passes on each.
+  - Nothing is deleted. A journal makes the move resumable, and `MANIFEST.json` lists every file with its size, SHA-256 and original path.
+  - The vault tree is `$OLSPRIME_VAULT_DIR`, else `<parent of the repository>/ols-prime-vault`: outside the repository and on the same volume, so that renames and links work. A root inside the repository, nested with the data root or on another volume is refused.
+- **Stage 2, encrypted.** `encrypt --recipient age1…` writes each file of the tree to `<name>.age`, and records each ciphertext's SHA-256. It uses age X25519 through `pyrage` 1.4.0, which binds Rust's `age` crate.
+  - Plaintext goes only with `--remove-plaintext`, which is Abdou's to pass.
+  - The identity (`keygen --out`, on a medium taken away) must never be stored on this machine.
+  - `encrypt` cannot check that the recipient matches an identity Abdou holds. So run it first without `--remove-plaintext`, decrypt one file with the real identity, and only then remove plaintext.
+- **Refusals.** `download_month`, the downloader's command and the archive downloads refuse a vault month (`VaultMonthRefused`) before any request. `build_parquet` leaves out every archive of a vault month, with a warning that names it. Fetching the vault months for the final evaluation will go through the vault module, a later step.
+- **Guards.**
+  - The runtime tripwire treats the vault root like the repository's `data/`. The static guard flags the names and strings that reach the vault tree (rule `vault-tree`) outside `vault.py`, `protocol.py`, `paths.py` and the test guards.
+  - Comparing the tripwire's targets with the static guard's lists found 11 polars readers the static guard did not flag, such as `read_parquet_metadata`, `scan_iceberg` and `read_lines`. They are flagged now.
+- **Limits, in plain words.**
+  - The vault months are public on data.binance.vision. The seal stops our own pipeline and our agents, not a person who downloads them.
+  - Until stage 2, the vault tree is plaintext, outside `data/`, and guarded only in-process.
+  - Until the identity leaves this machine, stage 2 is only as safe as that file.
+  - The tool reads no vault row, but the process that runs it sees file names, sizes and the Parquet footers' statistics. A table whose footer lacks statistics is not scanned for stray vault bars.
+- **Status, 2026-10-29: stage 0.** `plan` found 36 archives (788 kB), only BTCUSDT and ETHUSDT, 1 h and 1 d, 2026-01 → 2026-09, all verified. It found 4 tables holding 13,650 vault rows, and no other table with a bar at or after 2026-01-01. `plan --verify` rebuilt the four tables in a temporary folder and found every sealed read identical. The real move runs after the audit.
 
 **Quirks to handle downstream.** The quality report (`{SYMBOL}.quality.json` beside each Parquet file) counts them.
 - **Timestamps.** From 2025-01-01, spot files use microseconds. The parser reads the unit from each value's magnitude and stores milliseconds UTC.
