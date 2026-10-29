@@ -47,7 +47,8 @@ Each row gives:
 - the run folder and the commit;
 - the variants tried so far: 10 before this iteration, plus the 8 arms of Report n°2;
 - the numbers with their intervals;
-- the verdict by the registered rule, word for word as the rule decides it.
+- the verdict by the registered rule, word for word as the rule decides it;
+- for H2, H3, H10, H11 and H12, this clause: "18 of the 72 test months (2019-01 → 2020-06) were scored by smoke runs before this run, with the same arms and rules; no rule changed after them (PROTOCOL change log, 2026-10-29, after audit pass 1c)." Then, as a description, each part's numbers from the report's section "The previewed months, apart": the previewed months, then the others.
 
 A hypothesis that was not run gets no row, and you say so.
 

@@ -40,25 +40,36 @@ Ground every claim in the repository, and every number in the verified figures b
    - The σ schedule.
    - What each arm is: climatology, matrix-select, matrix-1y, softmax-1y, knn-1y, matrix-adaptive (H10), matrix-stack (H11), matrix-cusum (H12).
 7. **CUSUM (H12).**
-   - Page's two-sided test, k = 0.5, and the threshold set by simulation for an ARL₀ of 30 days.
-   - The standardized recursive residuals, and why an alarm acts only once its labels are known.
+   - Page's two-sided test, k = 0.5, and the threshold h = 4.761 set by simulation for an ARL₀ of 365 days: about 6 false alarms over the 2,191 test days.
+   - Audit pass 1a first found the registered ARL of 30 days: about 72 false alarms, a coin flip on "fewer than 72 refits". Tell that story: a threshold is a claim about false alarms.
+   - The input: each member's residual over its predictive standard deviation, σ̂·√(1 + 1/n_w + x̃ᵀ(M_xx + Λ)⁻¹x̃), averaged over the day's members and divided by s, fitted in the fold so the daily mean has unit variance.
+   - The timing: day d's value enters at 01:00 on d + 1, once its labels are known, and an alarm acts at the next 00:00 UTC with a refit purged at − 24 h. The day that straddles a refit is left out.
+   - H12's bar: no worse than monthly refits within 0.5 % of climatology's log-loss, with at most 36 fits where the monthly schedule makes 72.
    - Demo: a series with a break, the S⁺ and S⁻ paths and the threshold, with sliders on the break's size and on k.
 8. **Scoring.**
    - Why the hourly series is aggregated before any inference.
    - Diebold-Mariano with 23 lags and the HLN correction: overlapping one-day outcomes.
-   - The bootstrap of a BSS, which is a ratio.
-   - DSR and the variants counted.
+   - Why a comparison needs two tests to pass: DM's p < 0.05 and a stationary bootstrap interval on the same side of 0.
+   - The paired bootstrap of a BSS, which is a ratio: both arms resampled on the same hours.
+   - Effect sizes as a share of climatology's log-loss.
+   - DSR and the variants counted: 8 arms, 18 variants in all.
+   - The months already seen: smoke runs scored 18 of the 72 test months before the official run. Why the report shows them apart from the other 54, why the split is only a description fixed in advance, and why a part where two arms agree at every hour has no test.
 9. **H1 on the panel.** The planted online leaks and their predicted patterns of cuts, and what the restricted recomputation leaves out, and why.
 10. **The adversary.**
-    - The random leaks and their honest twins.
+    - The random leaks and their honest twins, and the twins that are constant on the data.
+    - The two headline rates: caught at any cut, and the mean per-cut rate.
+    - The attenuation curve over ε, from 1 down to 10⁻¹⁰: how small a leak H1 still sees.
+    - The families the generator never produces, listed in every report.
     - The Wilson interval. Demo: sliders on n and k, comparing Wilson with the Wald interval near 0 and 1.
     - What population the share describes, and what it does not.
     - The misses, and where they send the next designed run.
 11. **The physical seal.**
-    - Stage 1: renames only, a journal, sealed reads checked equal.
-    - Stage 2: age encryption (X25519) to a key that never touches the machine.
+    - Stage 1: renames only, a journal that pins each archive's and each CHECKSUM file's hash, sealed reads checked equal.
+    - Stage 2, in three steps: `encrypt` to an age recipient (X25519) whose key never touches the machine; `verify-decrypt`, which decrypts in memory with the key on its removable medium and stamps the manifest; then `encrypt --remove-plaintext`, which refuses without that stamp.
     - The limits, plainly. The vault months are public on data.binance.vision: the seal stops our own pipeline and agents, not a person. Until stage 2 the vault tree is plaintext, guarded only in-process.
-12. **Kani.** `max_qty_within_contract` proven on GitHub, and the local re-run.
+12. **Kani.**
+    - `max_qty_within_contract` proven on GitHub, and the local re-run of the five proven harnesses.
+    - Why a solver can lie: CBMC 6.11's `--bitwuzla` path writes an overflow flag in one order and reads it in the other, so it "proves" false overflow checks (cbmc#8723). A proof is only as sound as its toolchain.
 13. **LFM3, read at Abdou's request.** Liquid AI's model: gated short convolutions with a few attention layers, a sigmoid gate on each attention head, and a Pareto search over quality and latency.
     - What it is not: there is no test-time regression layer in it.
     - What we may take: candidate ablation arms for H4, a head gate on OLS heads and a conv-first hybrid. These are ideas, read through a summarizing tool, not verified at the source.

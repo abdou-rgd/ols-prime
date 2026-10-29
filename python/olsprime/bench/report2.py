@@ -13,7 +13,8 @@ One deterministic command, as pre-registered in ``docs/PROTOCOL.md``, "Matrix on
   months 2019-01 -> 2024-12.
 - **Scored rows.** The test rows with a label and complete features, the same for every arm.
   Each score is averaged over the scored rows of each decision hour; every statistic is computed
-  on these hourly series, and every reported mean is a mean over hours.
+  on these hourly series, and every reported mean is a mean over hours. The report states its
+  coverage: the scored hours out of the test months' hours.
 - **Statistics.** Log-loss, Brier, Brier skill score against ``climatology-panel`` and top-label
   ECE (10 equal-width bins, on the scored rows) per arm, each with a stationary-bootstrap 95 %
   interval (Politis-White block length, 2,000 resamples, percentile; the ECE resamples whole
@@ -21,7 +22,8 @@ One deterministic command, as pre-registered in ``docs/PROTOCOL.md``, "Matrix on
   (two-sided, rectangular kernel, 23 lags, Harvey-Leybourne-Newbold), and the stationary bootstrap
   of the mean hourly difference with the Politis-White length of that difference, 2,000
   resamples, 95 % percentile interval. Each difference is also given as a share of climatology's
-  log-loss.
+  log-loss, and each comparison gives the share of hours at which the two arms' losses are
+  identical (above one half: "few informative hours"; descriptive).
 - **Decision rules.** A comparison passes when DM gives p < 0.05 and the bootstrap interval lies
   on the same side of 0. H2: BSS of ``matrix-select`` above 0 with its interval above 0. H3:
   ``matrix-1y`` beats ``softmax-1y`` and ``knn-1y``, both passing. H10, H11: ``matrix-adaptive``,
@@ -29,6 +31,11 @@ One deterministic command, as pre-registered in ``docs/PROTOCOL.md``, "Matrix on
   difference ``matrix-cusum - matrix-select`` (mean + t_0.95(T - 1) x the HLN-corrected DM standard
   error) and the bootstrap's 95th percentile both below 0.005 x climatology's log-loss, and at most
   36 fits.
+- **The previewed months, apart.** Descriptive, not a verdict: H2's BSS and every comparison on
+  the test months that smoke runs scored before the registered run (through 2020-06), and on the
+  others, each part with its own climatology and bootstrap seeds (:func:`preview_split`). A
+  part's comparison says "rule met", never "passes". Under its verdicts, where they are read,
+  the report says which test months the smoke runs scored.
 
 Outputs: ``report-2.md``, ``report2.json``, ``config.json`` and ``run.json`` (the only file with
 wall-clock times) to ``runs/<UTC date>-report2/`` (suffixed if taken) or ``--out``. ``--check
@@ -63,13 +70,17 @@ from olsprime.features.panel import FIRST_MONTH, LAST_MONTH, fingerprint, hourly
 from olsprime.models.matrix import (
     ARMS,
     DAY_MS,
+    HOUR_MS,
     NOT_COMPUTED,
     STATUS_NAMES,
     ArmsResult,
     MatrixConfig,
     MatrixSystem,
     feature_ratios,
+    fold_months_ms,
     iso,
+    month_start_ms,
+    next_month_ms,
 )
 from olsprime.paths import runs_dir
 from olsprime.protocol import DEVELOPMENT
@@ -104,6 +115,7 @@ class Report2Config:
     readout_seed: int = 20261029
     variants_before: int = VARIANTS_BEFORE
     data_end: str = DEVELOPMENT.end.isoformat()
+    previewed_through: tuple[int, int] = (2020, 6)  # smoke runs scored the test months up to here first (PROTOCOL, after audit pass 1c)
 
     @property
     def registered(self) -> bool:
@@ -143,6 +155,12 @@ def scored_rows(res: ArmsResult, system: MatrixSystem) -> Scored:
 
 def hourly(values: np.ndarray, sc: Scored) -> np.ndarray:
     return np.bincount(sc.hour, weights=values, minlength=sc.hours.size) / sc.count
+
+
+def calendar_hours(mc: MatrixConfig) -> int:
+    """The hours of the test months, scored or not (audit pass 1c: the report states its coverage)."""
+    months = fold_months_ms(mc)
+    return int((next_month_ms(months[-1]) - months[0]) // HOUR_MS)
 
 
 def _chunks(t: int, block: float, n_boot: int, seed: int, size: int = 100):
@@ -229,10 +247,10 @@ def passes(dm_p: float, low: float, high: float, mean: float) -> bool:
     return bool(dm_p < 0.05 and mean < 0.0 and high < 0.0)
 
 
-def compare_arms(ll: dict[str, np.ndarray], a: str, b: str, ll_clim: float, cfg: Report2Config) -> dict[str, Any]:
+def compare_arms(ll: dict[str, np.ndarray], a: str, b: str, ll_clim: float, cfg: Report2Config, *tag: str) -> dict[str, Any]:
     d = ll[a] - ll[b]
     dm = stats.diebold_mariano(ll[a], ll[b], h=cfg.dm_h)
-    boot = mean_interval(d, cfg, "diff", a, b)
+    boot = mean_interval(d, cfg, "diff", a, b, *tag)
     se = dm_standard_error(dm, d, cfg.dm_h)
     t95 = float(st.t.ppf(0.95, df=d.size - 1))
     return {
@@ -243,12 +261,108 @@ def compare_arms(ll: dict[str, np.ndarray], a: str, b: str, ll_clim: float, cfg:
         "dm_statistic": dm.statistic,
         "dm_p": dm.p_value,
         "dm_kernel": dm.kernel_used,
+        "dm_lags": dm.h_used - 1,
         "dm_note": dm.note,
         "dm_se": se,
         "upper_95_one_sided": float(d.mean() + t95 * se),
         "bootstrap": boot,
         "passes": passes(dm.p_value, boot["low"], boot["high"], float(d.mean())),
         "hours": int(d.size),
+        **identical_hours(d),
+    }
+
+
+FEW_INFORMATIVE = 0.5  # above this share of identical hours, a comparison rests on few informative hours (audit pass 1e)
+
+
+def identical_hours(d: np.ndarray) -> dict[str, Any]:
+    """The hours at which two arms' hourly log-losses are identical: both arms read the same cells at every scored row.
+
+    Diebold-Mariano and the bootstrap then rest on the other hours alone, while their degrees of
+    freedom count every hour. Descriptive: the verdicts do not use it.
+    """
+    same = d == 0
+    return {"identical_hours": int(same.sum()), "share_of_hours_identical": float(same.mean())}
+
+
+def _informative(c: dict[str, Any]) -> str:
+    share = c["share_of_hours_identical"]
+    return f"{share:.1%} ({c['hours'] - c['identical_hours']} informative)" + (", few informative hours" if share > FEW_INFORMATIVE else "")
+
+
+MIN_SPLIT_HOURS = 100
+
+
+def _compare_part(part: dict[str, np.ndarray], a: str, b: str, clim: float, cfg: Report2Config, name: str) -> dict[str, Any]:
+    """compare_arms on one part, or a record of why it has no test: a part can hold two arms that agree at every hour.
+
+    A part describes, so its comparisons say ``rule_met``: "passes" is the registered rule's word,
+    and the verdicts are those of the whole period (audit pass 1e).
+    """
+    d = part[a] - part[b]
+    if np.all(d == d[0]):  # e.g. matrix-adaptive taking matrix-select's rho at every decision: Diebold-Mariano is undefined
+        return {"a": a, "b": b, "mean_diff": float(d.mean()), "hours": int(d.size), **identical_hours(d),
+                "undefined": "the difference is the same at every hour"}  # fmt: skip
+    c = compare_arms(part, a, b, clim, cfg, name)
+    c["rule_met"] = c.pop("passes")
+    return c
+
+
+def preview_split(ll: dict[str, np.ndarray], br: dict[str, np.ndarray], sc: Scored, cfg: Report2Config) -> dict[str, Any]:
+    """Descriptive, not a verdict: H2's BSS and every comparison on the previewed test months alone, and on the others alone.
+
+    Smoke runs scored the test months through ``cfg.previewed_through`` before the registered run,
+    with the same arms and rules (``docs/PROTOCOL.md``, change log, after audit pass 1c). The two
+    parts show whether a result rests on those months. Each part has its own climatology
+    log-loss for the shares, and its own bootstrap seeds.
+    """
+    end = next_month_ms(month_start_ms(*cfg.previewed_through))
+    months = fold_months_ms(cfg.matrix)
+    out: dict[str, Any] = {"previewed_through": "%d-%02d" % cfg.previewed_through, "previewed_months": sum(1 for m in months if m < end),
+                           "test_months": len(months)}  # fmt: skip
+    for name, keep in (("previewed", sc.hours < end), ("unseen", sc.hours >= end)):
+        if int(keep.sum()) < MIN_SPLIT_HOURS:
+            out[name] = None
+            continue
+        part = {a: v[keep] for a, v in ll.items()}
+        clim = float(part[CLIMATOLOGY].mean())
+        out[name] = {
+            "hours": int(keep.sum()),
+            "first_hour": iso(int(sc.hours[keep][0])),
+            "last_hour": iso(int(sc.hours[keep][-1])),
+            "climatology_log_loss": clim,
+            "h12_margin": cfg.h12_margin * clim,
+            "bss_matrix_select": bss_interval(br["matrix-select"][keep], br[CLIMATOLOGY][keep], cfg, "bss", "matrix-select", name),
+            "comparisons": [dict(_compare_part(part, a, b, clim, cfg, name), hypothesis=h) for h, a, b in COMPARISONS],
+        }
+    return out
+
+
+def cusum_summary(cusum: dict[str, Any], mc: MatrixConfig) -> dict[str, Any]:
+    """matrix-cusum's fits and counts, with the day each refit left out of the restarted CUSUM (audit pass 1c).
+
+    A refit at F leaves out the day decided at ``F - 1 day``, whose value would enter after F. That
+    day is in the CUSUM only if it has a complete row at 00:00 UTC; when it has none, there is
+    nothing to leave out, and the fit's ``day_left_out`` is None.
+    """
+    fits, path = cusum["fits"], cusum["path"]
+    skipped = sorted(int(x) for x in cusum["skipped_days"])
+    rows = []
+    for i, f in enumerate(fits):
+        before = int(f["fit_ms"]) - DAY_MS
+        rows.append({"fit": iso(f["fit_ms"]), "window": mc.windows_days[f["window"]], "rho": mc.rhos[f["rho"]],
+                     "s": f["s"], "s_days": f["s_days"], "s_default": f["s_default"], "default": f["default"],
+                     "n_selection": f["n_selection"], "day_left_out": iso(before)[:10] if i and before in skipped else None})  # fmt: skip
+    return {
+        "threshold": mc.cusum_threshold,
+        "k": mc.cusum_k,
+        "fits": rows,
+        "days": int(path["day_ms"].size),
+        "days_left_out_at_refits": len(skipped),
+        "days_left_out": [iso(x)[:10] for x in skipped],
+        "refits_without_a_day_left_out": sum(1 for r in rows[1:] if r["day_left_out"] is None),
+        "fits_with_s_set_to_1": sum(1 for f in fits if f["s_default"]),
+        "alarms": int(path["alarm"].sum()) if path["alarm"].size else 0,
     }
 
 
@@ -386,6 +500,7 @@ def compute(panel: pl.DataFrame, cfg: Report2Config) -> tuple[dict[str, Any], di
         }
     ll_clim = metrics[CLIMATOLOGY]["log_loss"]["estimate"]
     comparisons = [dict(compare_arms(ll, a, b, ll_clim, cfg), hypothesis=h) for h, a, b in COMPARISONS]
+    split = preview_split(ll, br, sc, cfg)
     cusum_fits = res.cusum["fits"]
     timings["statistics"] = time.perf_counter() - t
     t = time.perf_counter()
@@ -396,10 +511,12 @@ def compute(panel: pl.DataFrame, cfg: Report2Config) -> tuple[dict[str, Any], di
         "registered": cfg.registered,
         "panel": {"rows": int(d.n), "complete": int(d.complete.sum()), "members": len(d.symbols), "fingerprint_sha256": fingerprint(panel),
                   "entries": int(system.entry_rows.size), "symbols": list(d.symbols)},  # fmt: skip
-        "scored": {"rows": int(sc.rows.size), "hours": int(sc.hours.size), "first_hour": iso(int(sc.hours[0])), "last_hour": iso(int(sc.hours[-1]))},
+        "scored": {"rows": int(sc.rows.size), "hours": int(sc.hours.size), "first_hour": iso(int(sc.hours[0])), "last_hour": iso(int(sc.hours[-1])),
+                   "calendar_hours": calendar_hours(cfg.matrix), "share_of_calendar_hours": sc.hours.size / calendar_hours(cfg.matrix)},  # fmt: skip
         "arms": metrics,
         "comparisons": comparisons,
         "verdicts": verdicts(metrics, comparisons, len(cusum_fits), cfg),
+        "preview_split": split,
         "fallbacks": {arm: metrics[arm]["fallbacks"] for arm in ARMS},
         "fallbacks_by_status": {arm: metrics[arm]["fallbacks_by_status"] for arm in ARMS},
         "record_fallbacks": res.record_fallbacks,
@@ -407,17 +524,7 @@ def compute(panel: pl.DataFrame, cfg: Report2Config) -> tuple[dict[str, Any], di
         "record_status": res.record_status,
         "feature_ratio": feature_ratio_summary(system, res),
         "defaults": res.defaults,
-        "cusum": {
-            "threshold": cfg.matrix.cusum_threshold,
-            "k": cfg.matrix.cusum_k,
-            "fits": [{"fit": iso(f["fit_ms"]), "window": cfg.matrix.windows_days[f["window"]], "rho": cfg.matrix.rhos[f["rho"]],
-                      "s": f["s"], "s_days": f["s_days"], "s_default": f["s_default"], "default": f["default"],
-                      "n_selection": f["n_selection"]} for f in cusum_fits],  # fmt: skip
-            "days": int(res.cusum["path"]["day_ms"].size),
-            "days_left_out_at_refits": int(res.cusum["skipped_days"].size),
-            "fits_with_s_set_to_1": sum(1 for f in cusum_fits if f["s_default"]),
-            "alarms": int(res.cusum["path"]["alarm"].sum()) if res.cusum["path"]["alarm"].size else 0,
-        },
+        "cusum": cusum_summary(res.cusum, cfg.matrix),
         "fits": [
             {"month": iso(f["month_ms"])[:7], "n_selection": f["n_selection"], "default": f["default"],
              "select": {"window": cfg.matrix.windows_days[f["select"][0]], "rho": cfg.matrix.rhos[f["select"][1]]},
@@ -480,6 +587,45 @@ def _ci(ci: dict[str, Any] | None, digits: int = 4) -> str:
     return f"{ci['estimate']:.{digits}f} [{ci['low']:.{digits}f}, {ci['high']:.{digits}f}]"
 
 
+def _preview_lines(m: dict[str, Any]) -> list[str]:
+    """The previewed test months and the others, apart (descriptive)."""
+    ps = m["preview_split"]
+    parts = [(name, ps[name]) for name in ("previewed", "unseen")]
+    head = [f"{name}, {p['first_hour'][:7]} -> {p['last_hour'][:7]}, {p['hours']} hours" if p else f"{name}: too few hours" for name, p in parts]
+    lines = [
+        "## The previewed months, apart",
+        "",
+        f"Before this run, smoke runs on the real panel scored {ps['previewed_months']} of the {ps['test_months']} test months, through "
+        f"{ps['previewed_through']}, with the same arms and rules. No rule changed after them (`docs/PROTOCOL.md`, change log, "
+        "2026-10-29, after audit pass 1c). Each number below is computed on those months alone and on the others alone, with the "
+        "same statistics. It is descriptive: the verdicts are those of the whole period, above.",
+        "",
+        f"| quantity | {head[0]} | {head[1]} |",
+        "|---|---|---|",
+        "| BSS of matrix-select | " + " | ".join(_ci(p["bss_matrix_select"]) if p else "-" for _, p in parts) + " |",
+    ]
+    for i, (h, a, b) in enumerate(COMPARISONS):
+        cells = []
+        for _, p in parts:
+            if p is None:
+                cells.append("-")
+                continue
+            c = p["comparisons"][i]
+            if "undefined" in c:
+                cells.append(f"{c['mean_diff']:+.5f}; no test: {c['undefined']}")
+                continue
+            boot = c["bootstrap"]
+            if h == "H12":
+                cells.append(f"{c['mean_diff']:+.5f}; upper bound {c['upper_95_one_sided']:+.5f}, bootstrap q95 {boot['q95']:+.5f}, "
+                             f"margin {p['h12_margin']:.5f}")  # fmt: skip
+            else:
+                cells.append(f"{c['mean_diff']:+.5f} [{boot['low']:+.5f}, {boot['high']:+.5f}], DM p {c['dm_p']:.4f}, "
+                             f"{'rule met' if c['rule_met'] else 'rule not met'}")  # fmt: skip
+            cells[-1] += f"; identical hours {_informative(c)}"
+        lines.append(f"| {h}: {a} - {b} | " + " | ".join(cells) + " |")
+    return [*lines, ""]
+
+
 def render(m: dict[str, Any], config: dict[str, Any]) -> str:
     v = m["verdicts"]
     word = {True: "holds", False: "does not hold"}
@@ -497,10 +643,21 @@ def render(m: dict[str, Any], config: dict[str, Any]) -> str:
         "|---|---|---|",
         *(f"| {h} | {word[v[h]['holds']]} | {v[h]['rule']} |" for h in ("H2", "H3", "H10", "H11", "H12")),
         "",
+        f"Before this run, smoke runs on the real panel scored {m['preview_split']['previewed_months']} of the "
+        f"{m['preview_split']['test_months']} test months, through {m['preview_split']['previewed_through']}, with the same arms and "
+        "rules, and no rule changed after them (`docs/PROTOCOL.md`, change log, 2026-10-29, after audit pass 1c). Those months and "
+        "the others are shown apart below, as a description.",
+        "",
         f"Panel: {m['panel']['rows']} rows, {m['panel']['complete']} complete, {m['panel']['members']} members, "
         f"{m['panel']['entries']} entries; fingerprint `{m['panel']['fingerprint_sha256']}`. Scored: {m['scored']['rows']} rows over "
         f"{m['scored']['hours']} decision hours ({m['scored']['first_hour'][:13]} -> {m['scored']['last_hour'][:13]}). Every mean is "
         "a mean over hours of the hourly means; intervals are stationary-bootstrap 95 % percentile intervals.",
+        "",
+        f"Coverage: {m['scored']['hours']} of the test months' {m['scored']['calendar_hours']} hours are scored "
+        f"({m['scored']['share_of_calendar_hours']:.1%}). An hour is scored when a member has a scored row in it. A row is not scored "
+        "when a feature or its label is missing: for about 90 bars after a gap in a pair's bars, while the features' longest window "
+        "refills, and for the 25 bars before it, whose labels need a bar inside it. An exchange outage makes that gap for every "
+        "member at once, so every verdict below is conditional on the hours away from outages.",
         "",
         "## Arms",
         "",
@@ -517,15 +674,21 @@ def render(m: dict[str, Any], config: dict[str, Any]) -> str:
         "",
         "Difference = a - b in mean hourly log-loss (negative: a is better).",
         "",
-        "| hypothesis | a | b | difference | share of climatology | DM statistic | DM p | bootstrap 95 % | passes |",
-        "|---|---|---|---|---|---|---|---|---|",
+        "| hypothesis | a | b | difference | share of climatology | DM statistic | DM p | DM kernel | bootstrap 95 % | passes | identical hours |",
+        "|---|---|---|---|---|---|---|---|---|---|---|",
     ]
     for c in m["comparisons"]:
         b = c["bootstrap"]
         lines.append(
             f"| {c['hypothesis']} | {c['a']} | {c['b']} | {c['mean_diff']:+.5f} | {c['share_of_climatology']:+.4%} | "
-            f"{c['dm_statistic']:+.3f} | {c['dm_p']:.4f} | [{b['low']:+.5f}, {b['high']:+.5f}] | {'yes' if c['passes'] else 'no'} |"
+            f"{c['dm_statistic']:+.3f} | {c['dm_p']:.4f} | {c['dm_kernel']}, {c['dm_lags']} lags | [{b['low']:+.5f}, {b['high']:+.5f}] | "
+            f"{'yes' if c['passes'] else 'no'} | {_informative(c)} |"
         )
+    lines += ["", f"Identical hours: the share of hours at which both arms' hourly log-losses are equal, because they read the same "
+              f"cells at every scored row. Above {FEW_INFORMATIVE:.0%}, the tests rest on few informative hours; this is descriptive "
+              "and changes no verdict."]  # fmt: skip
+    notes = [f"{c['a']} - {c['b']}: {c['dm_note']}" for c in m["comparisons"] if c["dm_note"]]
+    lines += ["", "Diebold-Mariano fallbacks: " + ("; ".join(notes) if notes else "none") + "."]
     h12 = v["H12"]
     lines += [
         "",
@@ -537,16 +700,18 @@ def render(m: dict[str, Any], config: dict[str, Any]) -> str:
         "",
         f"CUSUM: two-sided Page, k = {m['cusum']['k']}, threshold {m['cusum']['threshold']:.3f} (ARL 365 days under iid N(0, 1)); "
         f"{m['cusum']['days']} daily values, {m['cusum']['alarms']} alarms; {m['cusum']['days_left_out_at_refits']} days decided "
-        "just before a refit left out of the restarted CUSUM; "
-        f"{m['cusum']['fits_with_s_set_to_1']} of {len(m['cusum']['fits'])} fits with s set to 1 (fewer than two daily values, or s = 0). "
-        "A day's value is made entirely by the fit in force at its decisions: readouts, residual mean square rss / (n_w - 16), "
-        "leverage and s.",
+        f"just before a refit left out of the restarted CUSUM ({', '.join(m['cusum']['days_left_out']) or 'none'}); "
+        f"{m['cusum']['refits_without_a_day_left_out']} refits had no such day to leave out, because it had no complete row at "
+        f"00:00 UTC; {m['cusum']['fits_with_s_set_to_1']} of {len(m['cusum']['fits'])} fits with s set to 1 (fewer than two daily "
+        "values, or s = 0). A day's value is made entirely by the fit in force at its decisions: readouts, residual mean square "
+        "rss / (n_w - 16), leverage and s, which is read the same way over the days of the fit's selection rows.",
         "",
-        "| fit | window (days) | rho | s | days behind s | s set to 1 | default |",
-        "|---|---|---|---|---|---|---|",
-        *(f"| {f['fit'][:10]} | {f['window'] or 'all'} | {f['rho']:g} | {f['s']:.4f} | {f['s_days']} | {f['s_default']} | {f['default']} |"
-          for f in m["cusum"]["fits"]),  # fmt: skip
+        "| fit | window (days) | rho | s | days behind s | s set to 1 | default | day left out |",
+        "|---|---|---|---|---|---|---|---|",
+        *(f"| {f['fit'][:10]} | {f['window'] or 'all'} | {f['rho']:g} | {f['s']:.4f} | {f['s_days']} | {f['s_default']} | {f['default']} | "
+          f"{f['day_left_out'] or ('-' if i == 0 else 'none')} |" for i, f in enumerate(m["cusum"]["fits"])),  # fmt: skip
         "",
+        *_preview_lines(m),
         "## Counts",
         "",
         "Fallbacks to climatology at the scored rows, by the status of the cell read:",

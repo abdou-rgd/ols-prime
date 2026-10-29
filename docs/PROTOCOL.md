@@ -124,7 +124,7 @@ Fixed on 2026-10-29, before any Matrix run. It defines H2, H3 and H10–H12 for 
 The CUSUM of `matrix-cusum`:
 - **Input.** One value per day d, from the decisions of the bars that open at 00:00 UTC on d (decision time 00:59:59.999), so the daily labels do not overlap.
   - Each decision's recursive residual of the `fwd_return` readout, its realized `fwd_return` minus the forecast made at the decision time, is divided by its predictive standard deviation, σ̂·√(1 + 1/n_w + x̃ᵀ(M_xx + Λ)⁻¹x̃). Here x̃ is the query's features minus the window's means, M_xx the window's centred cross-products, and σ̂² the window's residual mean square at the decision time.
-  - The day's raw value is the mean of these over members. It is divided by s, the standard deviation of the raw daily values over the days of the last fit's selection rows, recomputed with that fit's window and ρ. The members' residuals move together, so the raw mean does not have unit variance: s gives back the unit variance that the threshold assumes.
+  - The day's raw value is the mean of these over members. It is divided by s, the standard deviation of the raw daily values over the days of the last fit's selection rows, recomputed with that fit's window, ρ and σ, as the fit reads its live days. The members' residuals move together, so the raw mean does not have unit variance: s gives back the unit variance that the threshold assumes.
 - **Timing.** Day d's value is known with its labels, at the exit open, 01:00 UTC on d + 1, and it enters the CUSUM then. An alarm acts at the first 00:00 UTC after that instant. The arm refits there, on rows whose labels are known by the fit time minus 24 h, and the CUSUM restarts at 0.
   - A day's value is computed entirely with the fit in force at its decision time: its readouts, σ̂, leverage and s. The restarted CUSUM takes only the days decided after the refit, so the day decided just before it is left out.
 - **Threshold.** A two-sided Page CUSUM with k = 0.5. Its threshold is set by simulation, before any result, to give an average run length of 365 days under independent N(0, 1) values. That is about 6 false alarms over the 2,191 test days, against 72 monthly fits.
@@ -132,7 +132,7 @@ The CUSUM of `matrix-cusum`:
 If the exact kernel readouts cannot run over the 365-day window within the iteration, H3 runs at the 30-day window for all three of its arms. This fallback is fixed here, before any result.
 
 **Scoring.**
-- Scored rows are the test rows with a label and complete features. They are the same for every arm.
+- Scored rows are the test rows with a label and complete features. They are the same for every arm. The report gives the share of the test months' hours that are scored, and why the others are not.
 - Each score is averaged over the scored rows of each decision hour. Every statistic is computed on these hourly series, so the dependence across pairs stays inside the hour. A reported mean is a mean over hours.
 - Metrics: log-loss, Brier, Brier skill score against `climatology-panel`, expected calibration error.
 - Diebold-Mariano runs on the hourly loss differences, two-sided, with the rectangular kernel, h − 1 = 23 lags and the Harvey-Leybourne-Newbold correction.
@@ -140,6 +140,8 @@ If the exact kernel readouts cannot run over the 365-day window within the itera
   - For the Brier skill score, the arm's and climatology's hourly Brier series are resampled with the same blocks. Each resample gives 1 − mean(b_arm*)/mean(b_clim*), and the Politis-White length is computed on the hourly difference b_arm − b_clim.
 - A comparison of two arms has a second test: the same bootstrap of the mean hourly log-loss difference, with the Politis-White length of that difference. Diebold-Mariano with 23 lags covers the overlap of the labels exactly, but not a dependence that lasts longer, such as a skill that changes with the regime.
 - Each difference is also reported as a share of climatology's log-loss, beside its p-value.
+- Each comparison also gives the share of hours at which the two arms' hourly log-losses are identical, because both read the same cells at every scored row, and the count of the other hours, the informative ones. Above one half, the report says that the tests rest on few informative hours. This is a description and changes no verdict.
+- The test months that smoke runs scored before the official run, 2019-01 → 2020-06, are also reported apart from the other 54. The Brier skill score of `matrix-select` and every comparison are computed on each part alone, with the same statistics and each part's own climatology. It is a description: the verdicts rest on the whole period, and a part's comparison says whether the rule is met, never that it passes. A part in which two arms agree at every hour has no test, and the report says so.
 
 **Decision rules.** A comparison passes when the Diebold-Mariano test gives p < 0.05 and the bootstrap's 95 % interval of the difference lies on the same side of 0.
 - **H2** holds if the Brier skill score of `matrix-select` is above 0 and its 95 % interval lies above 0.
@@ -153,7 +155,8 @@ If the exact kernel readouts cannot run over the 365-day window within the itera
 **Future invariance on the panel.** Before any result, every arm passes H1 on a sub-panel.
 - The sub-panel: the 10 members with the most member months in the development period.
 - The cuts: 8 cut hours, drawn with a fixed seed in the test months, one of them at a month's first hour and one at its last.
-- Every bar of every member after the cut is perturbed in both directions, as in H1. Every output at or before the cut is compared bit for bit. A member with no bar after a cut is left out of that cut, and the count is reported.
+- Every bar of every member after the cut is perturbed in both directions, as in H1. Every output at or before the cut is compared bit for bit, with every fit-time choice behind it. The fit of the cut's month is compared when a row of that month is decided by the cut; without one, nothing of that month is compared.
+- A member with no bar after a cut, or none at or before it (not yet listed), is left out of that cut, and the count is reported.
 - Planted online leaks must each be caught where predicted:
   - entries stamped with their decision time instead of `label_known_at`;
   - a window that ends one hour after the decision;
@@ -161,6 +164,7 @@ If the exact kernel readouts cannot run over the 365-day window within the itera
   - a fit-time selection on rows whose labels are not yet known (no purge);
   - a kernel readout whose candidates reach one label horizon past the decision.
 - A limit: only the sub-panel's bars are perturbed. An input built from other members' bars would not move. No arm has such an input.
+- A second limit: a member not yet listed at a cut stays unperturbed, since all its bars lie after the cut. An arm that read such a member's future bars would not be caught at the cuts before its listing.
 
 **The readout, described.** For a seeded sample of 1,000 test decisions of `matrix-1y`, the report gives the share of negative weights. It also gives the signed contribution of the last 30 days, and that of the older entries.
 
@@ -258,3 +262,29 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
   - Stated as limits: the upper wick at odd cuts in H1, and the panel H1's inputs from other members.
   - The adversary's report gains an attenuation curve, the families it never produces, the share of constant twins and the mean per-cut rate.
 - 2026-10-29, after audit pass 1b and before any Matrix run: the CUSUM's day that straddles a refit is defined. Its value uses the fit in force at its decision time, and the restarted CUSUM leaves it out.
+- 2026-10-29, after audit pass 1c and before any official Matrix run. The audit found no Blocker and no Major point, and six Minor points, all fixed before the runs. No rule, threshold, grid, seed or period changes.
+  - **The CUSUM's s** is now read with the fit's own σ, as its live days are. It was read with the σ of each selection row's month: a choice the text left open, and not the faithful one. On two synthetic panels the two differ by 2.4 × 10⁻⁵ and 1.7 × 10⁻⁴ of s.
+  - **The panel H1** compares the fit of a cut's month only when a row of that month is decided by the cut. Without one, the run scoped to the cut makes no fit for that month, and the honest system was flagged. The predictions that rest on that fit follow the same rule.
+  - **A member not yet listed at a cut** is left out of it too, and the limit this opens is stated.
+  - **The reports say more.**
+    - The panel H1 marks a run that is not the registered one, as Report n°2 does.
+    - Report n°2 lists the days each refit left out of the CUSUM.
+    - It gives the Diebold-Mariano kernel and lags behind each comparison.
+    - It gives its coverage in hours.
+  - **Smoke runs on the real panel came before this entry.** They measured run times and checked the reports' shape:
+    - the panel H1 on its sub-panel, with test months 2019-01 → 2019-06;
+    - Report n°2 on 5 members, with test months 2019-01 → 2019-03;
+    - Report n°2 on every member, with test months 2019-01 → 2020-06, 18 of the 72.
+
+    The full development panel, every member from 2017-10 to 2024-12, was also built with no arm run on it:
+    - once for `docs/DATA.md`: its rows, its members and the shares of the three label classes;
+    - once to size and time the runs, using no label value. That pass measured each feature's |mean| / std, over the panel and over each month's σ set, from feature moments only. It also counted the rows and kernel pairs each run reads, at the eight H1 cuts too. The official H1 sub-panel was rebuilt to time it.
+
+    Their numbers are not results, and none of the changes above was chosen from them. The official runs score those months again, with the rest.
+- 2026-10-29, after audit pass 1d and before any official Matrix run. No rule, threshold, grid, seed or period changes.
+  - **The previewed months, apart.** Report n°2 also gives the Brier skill score of `matrix-select` and every comparison on the 18 test months the smoke runs scored, and on the other 54 alone (Scoring). This is fixed before the run, and it describes: the verdicts rest on the whole period.
+  - **Where the results are read.** Under its verdicts, the report states that those months were scored before the run, with the same arms and rules. The RESULTS rows of H2, H3 and H10–H12 say it too.
+  - The entry above now lists the passes over the full development panel among the contacts with the real data.
+- 2026-10-29, after audit pass 1e and before any official Matrix run. No rule, threshold, grid, seed or period changes.
+  - **Identical hours.** Each comparison gives the share of hours at which both arms' hourly log-losses are identical and the count of informative hours, with the words "few informative hours" above one half (Scoring; the count after audit pass 1f). Two arms that read the same cells give exactly equal losses. A part where they differ at only a handful of hours would otherwise show an ordinary p-value, with degrees of freedom counting every hour.
+  - **A part's words.** A comparison on the previewed months or on the others says whether the rule is met. "Passes" stays the word of the whole period's verdicts.

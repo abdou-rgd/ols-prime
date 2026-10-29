@@ -58,7 +58,8 @@ piece:
   is known later are left out of that day, so the value is known then). An alarm acts at the first
   00:00 UTC after that instant, ``D + 2 days``, with a refit on rows known by the fit time minus
   24 h: every input of a refit is known before it acts. Between refits the arm keeps its sigma (of
-  ``F - 24 h``), window and rho, so its readouts are its own (``ridge_batch`` with that scale).
+  ``F - 24 h``), window and rho, so its readouts are its own (``ridge_batch`` with that scale). Its
+  s is read the same way, with that sigma, window and rho, over the days of its selection rows.
 
 Determinism
 -----------
@@ -462,10 +463,6 @@ class Record:
     loss: np.ndarray  # (N, C)
     kernel: np.ndarray  # (N,) the kernel candidates were computed at this row
     mid: np.ndarray  # positions (into rows) of the rows whose bar opens at 00:00 UTC
-    mid_fwd: np.ndarray  # (Nm, W, R) the fwd_return forecast
-    mid_lev: np.ndarray  # (Nm, W, R)
-    mid_rss: np.ndarray  # (Nm, W, R) rss of fwd_return
-    mid_n: np.ndarray  # (Nm, W) window counts
 
 
 @dataclass(eq=False)
@@ -624,11 +621,6 @@ class MatrixSystem:
         status = np.full((n, C), NOT_COMPUTED, dtype=np.uint8)
         kern = np.zeros(n, dtype=bool)
         mid = np.flatnonzero(d.open_ms[rows] % DAY_MS == 0)
-        nm = mid.size
-        mid_fwd, mid_lev, mid_rss = np.full((nm, W, R), np.nan), np.full((nm, W, R), np.nan), np.full((nm, W, R), np.nan)
-        mid_n = np.zeros((nm, W), dtype=np.int64)
-        pos_of_mid = np.full(n, -1, dtype=np.int64)
-        pos_of_mid[mid] = np.arange(nm)
         month_of = d.month_ms[rows]
         for m in months:
             st = self.month_stats(m)
@@ -643,12 +635,6 @@ class MatrixSystem:
             p = prob_map(fc[..., :N_CLASSES], cfg.prob_floor)
             p[~good] = st.clim
             probs[at, : W * R], ok[at, : W * R], status[at, : W * R] = p, good, code
-            m_at = at[pos_of_mid[at] >= 0]
-            if m_at.size:
-                ex = self._ridge(rows[m_at], self.ridge_as_of(rows[m_at]), st.var, self.windows, self.rhos, extras=True)
-                j = pos_of_mid[m_at]
-                mid_fwd[j], mid_lev[j], mid_rss[j] = ex["forecast"][..., 3], ex["leverage"], ex["rss"][..., 3]
-                mid_n[j] = ex["count"]
             if not kernels:
                 continue
             k_at = at if scope.kernel_from_ms is None else at[d.decision_ms[r] > scope.kernel_from_ms]
@@ -667,7 +653,7 @@ class MatrixSystem:
         lab = d.label[rows]
         computed = np.isfinite(probs[:, :, 0])
         loss[computed] = label_loss(probs, lab)[computed]
-        return Record(self.candidates, rows, month_of, probs, ok, status, loss, kern, mid, mid_fwd, mid_lev, mid_rss, mid_n)
+        return Record(self.candidates, rows, month_of, probs, ok, status, loss, kern, mid)
 
     # --- fits ---
 
@@ -764,21 +750,24 @@ class MatrixSystem:
             choice[i] = argmin_first(scores[i])
         return {"decision_ms": decisions, "count": count, "scores": scores, "default": default, "choice": choice}
 
-    def _cusum_scale(self, rec: Record, sel: np.ndarray, w: int, r: int) -> tuple[float, int, bool]:
-        """s: the standard deviation (ddof 1) of the raw daily values over the days of the selection rows, at (w, rho)."""
+    def _cusum_scale(self, rec: Record, sel: np.ndarray, fit: dict[str, Any]) -> tuple[float, int, bool]:
+        """s: the standard deviation (ddof 1) of the raw daily values over the days of the selection rows.
+
+        Each day's raw value is read as :meth:`run_cusum` reads a live day: with the fit's window,
+        rho and sigma^2, at each row's decision time (audit pass 1c).
+        """
         d = self.data
-        mid_sel = sel[rec.mid]
-        j = np.flatnonzero(mid_sel)
-        rows = rec.rows[rec.mid[j]]
-        known = d.lka_ms[rows] <= d.open_ms[rows] + DAY_MS + HOUR_MS
-        j, rows = j[known], rows[known]
-        z = standardized_residuals(d.fwd[rows], rec.mid_fwd[j, w, r], rec.mid_lev[j, w, r], rec.mid_rss[j, w, r], rec.mid_n[j, w])
-        days = d.open_ms[rows]
+        rows = rec.rows[rec.mid[sel[rec.mid]]]
+        rows = rows[d.lka_ms[rows] <= d.open_ms[rows] + DAY_MS + HOUR_MS]
         raw = []
-        for day in np.unique(days):
-            v = z[(days == day) & np.isfinite(z)]
-            if v.size:
-                raw.append(seqsum(v) / float(v.size))
+        if rows.size:
+            ro = self._cusum_readout(fit, rows, extras=True)
+            z = standardized_residuals(d.fwd[rows], ro["forecast"][:, 3], ro["leverage"], ro["rss"], ro["count"])
+            days = d.open_ms[rows]
+            for day in np.unique(days):
+                v = z[(days == day) & np.isfinite(z)]
+                if v.size:
+                    raw.append(seqsum(v) / float(v.size))
         if len(raw) < 2:
             return 1.0, len(raw), True
         a = np.array(raw)
@@ -792,6 +781,8 @@ class MatrixSystem:
         cfg = self.cfg
         R = len(self.rhos)
         st = self.fit_stats(fit_ms)
+        if st.var is None:
+            raise ValueError(f"no sigma at the CUSUM fit {iso(fit_ms)}")
         sel = self.selection_mask(fit_ms, rec)
         n_sel = int(sel.sum())
         scores = self._scores(rec, sel)[: self.n_ridge]
@@ -800,11 +791,10 @@ class MatrixSystem:
             w, r = cfg.default_window, cfg.rhos.index(cfg.default_rho)
         else:
             w, r = divmod(argmin_first(scores), R)
-        s, s_days, s_default = self._cusum_scale(rec, sel, w, r)
-        if st.var is None:
-            raise ValueError(f"no sigma at the CUSUM fit {iso(fit_ms)}")
-        return {"fit_ms": int(fit_ms), "window": int(w), "rho": int(r), "n_selection": n_sel, "default": bool(default),
-                "scores": scores, "var": st.var, "clim": st.clim, "s": s, "s_days": s_days, "s_default": s_default}  # fmt: skip
+        fit = {"fit_ms": int(fit_ms), "window": int(w), "rho": int(r), "n_selection": n_sel, "default": bool(default),
+               "scores": scores, "var": st.var, "clim": st.clim}  # fmt: skip
+        fit["s"], fit["s_days"], fit["s_default"] = self._cusum_scale(rec, sel, fit)
+        return fit
 
     def _cusum_readout(self, fit: dict[str, Any], rows: np.ndarray, *, extras: bool) -> dict[str, np.ndarray]:
         out = self._ridge(rows, self.ridge_as_of(rows), fit["var"], [self.windows[fit["window"]]], self.rhos[[fit["rho"]]], extras=extras)

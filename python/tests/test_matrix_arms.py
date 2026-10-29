@@ -159,14 +159,14 @@ def test_a_refused_cell_falls_back_to_the_arm_climatology_and_is_counted(system:
     assert res.record_fallbacks[s2.candidates[0]] == rec.rows.size
 
 
-def test_mid_rows_carry_the_leverage_and_rss(system: MatrixSystem, record: mx.Record) -> None:
+def test_the_cusum_readout_carries_the_leverage_and_rss(system: MatrixSystem, record: mx.Record) -> None:
     d = system.data
     t, xs, ys = entries(system)
-    k = len(record.mid) // 2
-    j = record.mid[k]
+    j = record.mid[len(record.mid) // 2]
     row = record.rows[j]
     assert system.data.open_ms[row] % DAY_MS == 0
     var = system.month_stats(int(record.month[j])).var
+    ro = system._cusum_readout({"var": var, "window": 1, "rho": 2}, np.array([row]), extras=True)
     inside = (t <= d.decision_ms[row]) & (t > d.decision_ms[row] - 365 * DAY_MS)
     x, y = xs[inside], ys[inside, 3]
     n = len(x)
@@ -174,11 +174,30 @@ def test_mid_rows_carry_the_leverage_and_rss(system: MatrixSystem, record: mx.Re
     a = xc.T @ xc + 1e-2 * n * np.diag(var)
     beta = np.linalg.solve(a, xc.T @ yc)
     xt = d.x[row] - x.mean(axis=0)
-    assert record.mid_lev[k, 1, 2] == pytest.approx(xt @ np.linalg.solve(a, xt), rel=1e-9)
-    assert record.mid_fwd[k, 1, 2] == pytest.approx(y.mean() + beta @ xt, rel=1e-9, abs=1e-14)
+    assert ro["leverage"][0] == pytest.approx(xt @ np.linalg.solve(a, xt), rel=1e-9)
+    assert ro["forecast"][0, 3] == pytest.approx(y.mean() + beta @ xt, rel=1e-9, abs=1e-14)
     rss = ((yc - xc @ beta) ** 2).sum()
-    assert record.mid_rss[k, 1, 2] == pytest.approx(rss, rel=1e-8)
-    assert record.mid_n[k, 1] == n
+    assert ro["rss"][0] == pytest.approx(rss, rel=1e-8)
+    assert ro["count"][0] == n
+
+
+def test_the_cusum_scale_reads_the_selection_days_with_the_fits_own_sigma(system: MatrixSystem, record: mx.Record) -> None:
+    """s is the ddof-1 spread of the selection days' raw values, read as the live days are (audit pass 1c)."""
+    d = system.data
+    fit_ms = int(MONTHS[4].timestamp() * 1000)
+    fit = system.cusum_fit(record, fit_ms)
+    assert not fit["default"] and not fit["s_default"]
+    sel = system.selection_mask(fit_ms, record)
+    rows = record.rows[sel & (d.open_ms[record.rows] % DAY_MS == 0)]
+    rows = rows[d.lka_ms[rows] <= d.open_ms[rows] + DAY_MS + HOUR_MS]
+    ro = system._cusum_readout(fit, rows, extras=True)
+    z = mx.standardized_residuals(d.fwd[rows], ro["forecast"][:, 3], ro["leverage"], ro["rss"], ro["count"])
+    days = d.open_ms[rows]
+    raw = [z[(days == day) & np.isfinite(z)].mean() for day in np.unique(days) if np.isfinite(z[days == day]).any()]
+    assert fit["s_days"] == len(raw) > 1
+    assert fit["s"] == pytest.approx(np.std(raw, ddof=1), rel=1e-12)
+    # the record's rows were read with the sigma of their own months, which is not the fit's
+    assert any(not np.array_equal(system.month_stats(int(m)).var, fit["var"]) for m in np.unique(d.month_ms[rows]))
 
 
 def test_the_status_of_every_output_is_counted(result: mx.ArmsResult, record: mx.Record) -> None:

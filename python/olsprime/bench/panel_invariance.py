@@ -33,6 +33,10 @@ the perturbed bars:
   selected window, rho, tau, k and alpha, and alpha's scores; per decision of
   ``matrix-adaptive``, its row count, scores and rho; every ``matrix-cusum`` fit (time, sigma^2,
   window, rho, scores, s) and every day of its CUSUM that entered at or before ``until``.
+- The fit of month M itself only when a test row of M is decided at or before ``until``
+  (:func:`fit_compared`). Without one, the run on the perturbed bars makes no fit for M, and no
+  output of M is compared (audit pass 1c). The predictions that rest on that fit follow the same
+  rule.
 
 An honest arm must not differ by a single bit. A planted leak is caught at a cut only where a
 compared value moves by more than :data:`olsprime.bench.invariance.CAUGHT_ABOVE`, turns missing or
@@ -127,6 +131,10 @@ class PanelH1Config:
     def h1(self) -> H1Config:
         return H1Config(perturbation_seed=self.perturbation_seed, perturbation=self.perturbation, level_shifts=self.level_shifts)
 
+    @property
+    def registered(self) -> bool:
+        return self == PanelH1Config()
+
 
 @dataclass(frozen=True)
 class PanelCut:
@@ -217,6 +225,11 @@ def _test_rows_until(data: PanelArrays, cfg: MatrixConfig, cut: PanelCut, *, mon
     return np.flatnonzero(m)
 
 
+def fit_compared(data: PanelArrays, cut: PanelCut, month_ms: int) -> bool:
+    """A monthly fit is compared at a cut when a test row of its month is decided by the cut: else the scoped run makes no such fit."""
+    return bool(np.any(data.complete & (data.month_ms == month_ms) & (data.decision_ms <= cut.until_ms)))
+
+
 def predict_stamped(data: PanelArrays, cfg: MatrixConfig, cut: PanelCut) -> bool:
     """An entry decided by the cut whose label is known after it (read at once when stamped at its decision)."""
     c = data.complete
@@ -238,16 +251,19 @@ def predict_window(data: PanelArrays, cfg: MatrixConfig, cut: PanelCut) -> bool:
 
 
 def predict_sigma(data: PanelArrays, cfg: MatrixConfig, cut: PanelCut) -> bool:
-    """A row of the cut's month that opens after the cut: its features move sigma^2 of the month."""
-    return bool(np.any((data.month_ms == cut.month_ms) & data.features_ok & (data.open_ms > cut.hour_ms)))
+    """A row of the cut's month that opens after the cut, the month's fit being compared: its features move sigma^2 of the month."""
+    later = np.any((data.month_ms == cut.month_ms) & data.features_ok & (data.open_ms > cut.hour_ms))
+    return bool(later and fit_compared(data, cut, cut.month_ms))
 
 
 def predict_unpurged(data: PanelArrays, cfg: MatrixConfig, cut: PanelCut) -> bool:
-    """A fit at or before the cut whose unpurged selection rows include a label known after the cut."""
+    """A compared fit at or before the cut whose unpurged selection rows include a label known after the cut."""
     span = cfg.selection_days * DAY_MS
     for f in fold_months_ms(cfg):
         if f > cut.until_ms:
             break
+        if not fit_compared(data, cut, f):
+            continue
         rows = data.complete & (data.decision_ms > f - span) & (data.decision_ms < f)
         if np.any(rows & (data.lka_ms > cut.until_ms)):
             return True
@@ -345,8 +361,9 @@ def compared_items(res: ArmsResult, data: PanelArrays, cut: PanelCut, n_ridge: i
         items[f"fallback:{arm}"] = res.fallback[arm][m].astype(np.float64)
         items[f"status:{arm}"] = res.status[arm][m].astype(np.float64)
     kernel = bool(KERNEL_ARMS & set(res.probs))
+    in_month = bool(np.any(mask & (mon == month)))  # the scoped run fits month M only then (fit_compared)
     for fit in res.fits:
-        if fit["month_ms"] > until:
+        if fit["month_ms"] > until or (fit["month_ms"] == month and not in_month):
             continue
         pre = f"fit:{iso(fit['month_ms'])[:7]}:"
         items[pre + "n_selection"] = np.array([fit["n_selection"], fit["default"]], dtype=np.float64)
@@ -483,6 +500,7 @@ def run_panel_h1(
     leaks = [s for s in systems if not s["honest"]]
     left = systems[0]["records"] if systems else []
     return {
+        "registered": cfg.registered,
         "config": _config_json(cfg),
         "members": sorted(bars),
         "cuts": [{"cut": k + 1, "hour": iso(c.hour_ms), "until": iso(c.until_ms), "kind": c.kind, "month": iso(c.month_ms)[:7]} for k, c in enumerate(cuts)],
@@ -519,9 +537,11 @@ def _clean(value: Any) -> Any:
 
 def render_md(result: dict[str, Any]) -> str:
     h1 = result["h1"]
-    lines = [
-        "# The panel H1: future invariance of the Matrix arms",
-        "",
+    lines = ["# The panel H1: future invariance of the Matrix arms", ""]
+    if not result.get("registered", False):
+        lines += ["**NOT THE REGISTERED RUN.** This run's configuration differs from the pre-registered one "
+                  "(a smoke run or a test): its verdict is not a result.", ""]  # fmt: skip
+    lines += [
         f"**Verdict: the panel H1 {'holds' if h1['holds'] else 'FAILS'}.** Honest violations: {h1['honest_violations']}. "
         f"Planted leaks off their predicted pattern: {', '.join(h1['leaks_off_pattern']) or 'none'}.",
         "",

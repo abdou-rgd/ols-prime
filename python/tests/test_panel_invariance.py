@@ -4,7 +4,9 @@
   bit for bit, for every arm, at every cut and in both directions;
 - each planted online leak is caught at its predicted cuts and nowhere else;
 - the cuts are seeded, with one at a month's first hour and one at its last;
-- a member with no bar after a cut is left out of that cut and counted.
+- a member with no bar after a cut is left out of that cut and counted;
+- a cut in a month with no row decided by it flags nothing, and a report that is not the
+  registered run says so (audit pass 1c).
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 import numpy as np
+import polars as pl
 import pytest
 
 from olsprime.bench import panel_invariance as pi
@@ -89,6 +92,29 @@ def test_a_member_without_a_later_bar_is_left_out_and_counted(h1: dict) -> None:
         hour = datetime.fromisoformat(c["hour"]).timestamp() * 1000
         left = h1["left_out"][str(c["cut"])]
         assert left == ({"CCCUSDT": "no bar after the cut"} if hour >= last_bar else {})
+
+
+def test_a_cut_in_a_month_with_no_row_decided_by_it_flags_nothing() -> None:
+    """Probe D of audit pass 1c: every member's bar at a month's first hour dropped, a first-hour cut there."""
+    bars, months = subpanel()
+    hole = datetime(2019, 2, 1, tzinfo=UTC)
+    bars = {s: b.filter(pl.col("open_time") != hole) for s, b in bars.items()}
+    cut = pi.PanelCut(int(hole.timestamp() * 1000), pi.FIRST_HOUR)
+    data = MatrixSystem(pi.build_panel(bars, months), CFG.matrix).data
+    assert np.any(data.complete & (data.month_ms == cut.month_ms))  # the original run fits February
+    assert not pi.fit_compared(data, cut, cut.month_ms)  # the run scoped to the cut does not
+    for spec in (pi.HONEST, *(s for s in pi.LEAKS if s.cls in (pi.MonthSigma, pi.Unpurged))):
+        out = pi.run_system(spec, bars, months, [cut], CFG)
+        assert out["verdict"]["ok"], (spec.name, out["verdict"])
+        assert out["verdict"]["pattern"] == out["verdict"]["predicted_pattern"] == "."
+
+
+def test_a_report_that_is_not_the_registered_run_says_so(h1: dict) -> None:
+    assert pi.PanelH1Config().registered and not CFG.registered
+    assert h1["registered"] is False
+    clean = pi._clean(h1)
+    assert "NOT THE REGISTERED RUN" in pi.render_md(clean)
+    assert "NOT THE REGISTERED RUN" not in pi.render_md({**clean, "registered": True})
 
 
 def test_perturbed_bars_keep_the_past_and_move_the_future() -> None:
