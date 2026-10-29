@@ -158,7 +158,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         f"{totals['sealed_rows']:,} sealed rows; vault {'OPEN' if manifest['vault_open'] else 'sealed'}"
     )
     tree = manifest["vault_tree"]
-    print(f"vault tree: stage {tree['stage']}, {tree['files']} files, {tree['bytes']:,} bytes, manifest {tree['manifest_digest']}")
+    print(
+        f"vault tree: stage {tree['stage']}, {tree['files']} files, {tree['bytes']:,} bytes, manifest {tree['manifest_digest']}; "
+        f"still under data/: {tree['archives_still_in_data']} archives, {tree['tables_still_in_data']} tables"
+    )
     print(f"digest {manifest['digest']}")
     print(f"written to {out}")
     return 0

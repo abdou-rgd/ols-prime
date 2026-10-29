@@ -167,11 +167,17 @@ Remaining limits, stated plainly:
   - Then the old file and its quality report are hard-linked into the vault tree, and the new file is renamed over the old path. The path therefore always holds the old file or the new one.
   - The vault archives and their `.CHECKSUM` files are renamed into the tree once `is_verified` passes on each.
   - Nothing is deleted. A journal makes the move resumable, and `MANIFEST.json` lists every file with its size, SHA-256 and original path.
+  - The journal pins the SHA-256 of every archive and of its `.CHECKSUM` file when the plan is made. `move` checks them all before it touches a table.
+  - A file held open by another process stops `move` with one refusal line. Nothing is lost, and running `move` again resumes.
   - The vault tree is `$OLSPRIME_VAULT_DIR`, else `<parent of the repository>/ols-prime-vault`: outside the repository and on the same volume, so that renames and links work. A root inside the repository, nested with the data root or on another volume is refused.
 - **Stage 2, encrypted.** `encrypt --recipient age1…` writes each file of the tree to `<name>.age`, and records each ciphertext's SHA-256. It uses age X25519 through `pyrage` 1.4.0, which binds Rust's `age` crate.
   - Plaintext goes only with `--remove-plaintext`, which is Abdou's to pass.
   - The identity (`keygen --out`, on a medium taken away) must never be stored on this machine.
-  - `encrypt` cannot check that the recipient matches an identity Abdou holds. So run it first without `--remove-plaintext`, decrypt one file with the real identity, and only then remove plaintext. Audit pass 1b asks for more before stage 2: a `verify-decrypt` command that decrypts every file in memory and compares its SHA-256 with the manifest, and a `--remove-plaintext` that refuses until it has run.
+  - `encrypt` cannot check that the recipient matches an identity Abdou holds. So stage 2 runs in three steps, after audit pass 1b:
+    1. `encrypt --recipient age1…` writes the `.age` files and keeps the plaintext.
+    2. `verify-decrypt`, with `OLSPRIME_VAULT_IDENTITY` naming the identity on its removable medium, decrypts every `.age` file in memory and compares each SHA-256 with the manifest. If all match, it writes a stamp into `MANIFEST.json`: the time, the count, the SHA-256 of the public recipient, and the ciphertext hash of each file it opened. The identity is never written or printed.
+    3. `encrypt --recipient age1… --remove-plaintext` removes plaintext only if the stamp exists, was made for that recipient, and covers the ciphertext of every file. A new `encrypt` voids the stamp, so `verify-decrypt` must run again after it.
+  - The stamp is part of the manifest's digest, so the manifest must never be edited by hand.
 - **Refusals.** `download_month`, the downloader's command and the archive downloads refuse a vault month (`VaultMonthRefused`) before any request. `build_parquet` leaves out every archive of a vault month, with a warning that names it. Fetching the vault months for the final evaluation will go through the vault module, a later step.
 - **Guards.**
   - The runtime tripwire treats the vault root like the repository's `data/`. The static guard flags the names and strings that reach the vault tree (rule `vault-tree`) outside `vault.py`, `protocol.py`, `paths.py` and the test guards.

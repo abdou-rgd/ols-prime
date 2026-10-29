@@ -4,7 +4,7 @@ The guards of ``olsprime.protocol`` and of the tests live inside the process, an
 showed that such guards can be taken down from inside it. This module makes the vault unreadable
 instead of watched, in two stages::
 
-    uv run python -m olsprime.vault {plan,move,encrypt,keygen,status}
+    uv run python -m olsprime.vault {plan,move,encrypt,keygen,verify-decrypt,status}
 
 **Stage 0, in ``data/``.** The monthly archives of the vault months (read from the file names: month at or
 after ``VAULT.start``) sit in ``data/raw/``, and the Parquet files of their pairs hold the vault rows.
@@ -26,7 +26,9 @@ nothing. ``MANIFEST.json`` lists every file of the tree with its size, SHA-256 a
 **Stage 2, encrypted (``encrypt``).** Each file of the tree is encrypted to ``<name>.age`` for an age X25519
 recipient whose private key never touches this machine (``keygen`` makes one, for Abdou to run with the output on
 a medium taken away). The ciphertext SHA-256 goes into the manifest. A plaintext file is removed **only** with
-``--remove-plaintext``, after its ciphertext is written, flushed and re-hashed from disk.
+``--remove-plaintext``, after its ciphertext is written, flushed and re-hashed from disk, and only once
+``verify-decrypt`` has stamped the manifest: it decrypts every ``.age`` file in memory with the identity named by
+``OLSPRIME_VAULT_IDENTITY`` and compares the plaintext's SHA-256 with the manifest's.
 
 The open path (final evaluation only) is in :mod:`olsprime.protocol`: with both keys in place ``load_klines``
 adds the vault tree's rows, decrypting in memory at stage 2 with the identity named by
@@ -49,7 +51,8 @@ import json
 import logging
 import os
 import tempfile
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -75,6 +78,7 @@ STAGING_DIR = "parquet.vault-stage"  # beside data/parquet, same volume; emptied
 SCHEMA_VERSION = 1
 BOOKKEEPING = frozenset({MANIFEST_NAME, JOURNAL_NAME})
 CHECKSUM_SUFFIX = ".CHECKSUM"
+STAMP_KEY = "decrypt_check"  # in the manifest: written by verify-decrypt, required by encrypt --remove-plaintext
 
 Checkpoint = Callable[[str], None]
 
@@ -146,6 +150,7 @@ class VaultArchive:
     checksum_bytes: int | None
     verified: bool
     sha256: str  # of the archive, hashed the way is_verified does
+    checksum_sha256: str | None = None  # of the CHECKSUM file; the journal pins it, as it pins the archive's
 
     @property
     def checksum_rel(self) -> str:
@@ -208,6 +213,7 @@ def scan_vault_archives(raw_dir: Path) -> tuple[list[VaultArchive], list[str]]:
                         checksum_path.stat().st_size if has_checksum else None,
                         verified,
                         file_sha256(zip_path),
+                        _sha_or_none(checksum_path),
                     )
                 )
             for orphan in sorted(checksums - set(zips)):
@@ -459,6 +465,7 @@ def _load_manifest(vault_root: Path) -> dict[str, Any]:
 
 def _store_manifest(vault_root: Path, manifest: dict[str, Any]) -> dict[str, Any]:
     files = sorted(manifest["files"], key=lambda e: e["path"])
+    stamp = manifest.get(STAMP_KEY)
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "vault_start": protocol.VAULT.start.isoformat(),
@@ -469,6 +476,8 @@ def _store_manifest(vault_root: Path, manifest: dict[str, Any]) -> dict[str, Any
             "encrypted": sum("ciphertext" in e for e in files),
         },
     }
+    if stamp is not None:  # kept across rewrites; a manifest without one has the body it always had
+        manifest[STAMP_KEY] = stamp
     manifest["generated_at"] = _iso()
     manifest["digest"] = manifest_digest(manifest)
     _write_json(vault_root / MANIFEST_NAME, manifest)
@@ -550,7 +559,7 @@ def _new_journal(plan: Plan) -> dict[str, Any]:
             }
             for item in plan.parquet
         ],
-        "archives": [{"rel": a.zip_rel, "sha256": a.sha256, "checksum_sha256": None} for a in plan.archives],
+        "archives": [{"rel": a.zip_rel, "sha256": a.sha256, "checksum_sha256": a.checksum_sha256} for a in plan.archives],
     }
 
 
@@ -646,17 +655,35 @@ def _rename_once(source: Path, dest: Path, expected: str) -> bool:
     return True
 
 
+def _archive_paths(job: dict[str, Any], data_dir: Path, vault_root: Path) -> tuple[Path, Path, Path, Path]:
+    zip_src, zip_dest = data_dir / "raw" / job["rel"], vault_root / "raw" / job["rel"]
+    return zip_src, zip_dest, zip_src.with_name(zip_src.name + CHECKSUM_SUFFIX), zip_dest.with_name(zip_dest.name + CHECKSUM_SUFFIX)
+
+
+def _check_archive_pins(job: dict[str, Any], data_dir: Path, vault_root: Path) -> None:
+    """Refuse an archive or CHECKSUM file that is not the one the journal pinned at plan time.
+
+    A journal written before the CHECKSUM file was pinned has ``None`` there: that pin is taken later, in the job.
+    """
+    zip_src, _, checksum_src, checksum_dest = _archive_paths(job, data_dir, vault_root)
+    if zip_src.exists() and file_sha256(zip_src) != job["sha256"]:
+        raise VaultError(f"{zip_src} changed since the plan was made: it is not moved")
+    checksum_here = checksum_src if checksum_src.exists() else checksum_dest
+    if job["checksum_sha256"] is not None and checksum_here.is_file() and file_sha256(checksum_here) != job["checksum_sha256"]:
+        raise VaultError(f"{checksum_here} changed since the plan was made: its archive is not moved")
+
+
 def _run_archive_job(job: dict[str, Any], data_dir: Path, vault_root: Path, save: Callable[[], None], checkpoint: Checkpoint) -> int:
     rel = job["rel"]
-    zip_src, zip_dest = data_dir / "raw" / rel, vault_root / "raw" / rel
-    checksum_src, checksum_dest = zip_src.with_name(zip_src.name + CHECKSUM_SUFFIX), zip_dest.with_name(zip_dest.name + CHECKSUM_SUFFIX)
+    zip_src, zip_dest, checksum_src, checksum_dest = _archive_paths(job, data_dir, vault_root)
     moved = 0
     if zip_src.exists() and not is_verified(zip_src):
         raise VaultError(f"{zip_src} does not pass is_verified: it is not moved")
+    _check_archive_pins(job, data_dir, vault_root)
+    checksum_here = checksum_src if checksum_src.exists() else checksum_dest
+    if not checksum_here.is_file():
+        raise VaultError(f"{checksum_src} is missing")
     if job["checksum_sha256"] is None:
-        checksum_here = checksum_src if checksum_src.exists() else checksum_dest
-        if not checksum_here.is_file():
-            raise VaultError(f"{checksum_src} is missing")
         job["checksum_sha256"] = file_sha256(checksum_here)
         save()
     moved += _rename_once(zip_src, zip_dest, job["sha256"])
@@ -664,6 +691,23 @@ def _run_archive_job(job: dict[str, Any], data_dir: Path, vault_root: Path, save
     moved += _rename_once(checksum_src, checksum_dest, job["checksum_sha256"])
     checkpoint(f"archive:{Path(rel).name}:checksum-moved")
     return moved
+
+
+@contextmanager
+def _os_refusal(step: str) -> Iterator[None]:
+    """Turn an ``OSError`` of a move step (a file held open by another process, a full disk) into one refusal.
+
+    Every step of the move is journaled and re-entrant, so nothing is lost: ``move`` run again resumes.
+    """
+    try:
+        yield
+    except OSError as error:
+        culprit = error.filename2 or error.filename or "a file"
+        reason = error.strerror or type(error).__name__
+        raise VaultError(
+            f"while {step}, {culprit} could not be changed ({type(error).__name__}: {reason}); another process may hold it open. "
+            "Nothing was lost; run move again to resume"
+        ) from None
 
 
 def _remove_empty_dirs(folder: Path) -> None:
@@ -703,24 +747,33 @@ def move(data_dir: Path, vault_root: Path, *, checkpoint: Checkpoint = _no_check
     def save() -> None:
         _write_json(_journal_path(vault_root), journal)
 
+    for archive_job in journal["archives"]:  # a changed archive or CHECKSUM file refuses before any table is touched
+        with _os_refusal(f"checking {archive_job['rel']}"):
+            _check_archive_pins(archive_job, data_dir, vault_root)
     swapped = 0
     for job in journal["parquet"]:  # every rebuild is verified before the first table is touched
-        _stage_parquet_job(job, data_dir, save, checkpoint)
+        with _os_refusal(f"rebuilding {job['id']}"):
+            _stage_parquet_job(job, data_dir, save, checkpoint)
     for job in journal["parquet"]:
         before = job["stage"]
-        _swap_parquet_job(job, data_dir, vault_root, save, checkpoint)
+        with _os_refusal(f"swapping {job['id']}"):
+            _swap_parquet_job(job, data_dir, vault_root, save, checkpoint)
         swapped += before != "swapped"
-    moved = sum(_run_archive_job(job, data_dir, vault_root, save, checkpoint) for job in journal["archives"])
-    moved_files = [
-        *(_entry(vault_root, job["old"], "parquet") for job in journal["parquet"]),
-        *(_entry(vault_root, job["old_quality"], "quality") for job in journal["parquet"] if job["old_quality"]),
-        *(_entry(vault_root, "raw/" + job["rel"], "archive") for job in journal["archives"]),
-        *(_entry(vault_root, "raw/" + job["rel"] + CHECKSUM_SUFFIX, "checksum") for job in journal["archives"]),
-    ]
-    manifest = _set_entries(vault_root, moved_files)
-    checkpoint("manifest-written")
-    journal["finished"] = _iso()
-    save()
+    moved = 0
+    for archive_job in journal["archives"]:
+        with _os_refusal(f"moving {archive_job['rel']}"):
+            moved += _run_archive_job(archive_job, data_dir, vault_root, save, checkpoint)
+    with _os_refusal("writing the manifest"):
+        moved_files = [
+            *(_entry(vault_root, job["old"], "parquet") for job in journal["parquet"]),
+            *(_entry(vault_root, job["old_quality"], "quality") for job in journal["parquet"] if job["old_quality"]),
+            *(_entry(vault_root, "raw/" + job["rel"], "archive") for job in journal["archives"]),
+            *(_entry(vault_root, "raw/" + job["rel"] + CHECKSUM_SUFFIX, "checksum") for job in journal["archives"]),
+        ]
+        manifest = _set_entries(vault_root, moved_files)
+        checkpoint("manifest-written")
+        journal["finished"] = _iso()
+        save()
     _remove_empty_dirs(data_dir / STAGING_DIR)
     return MoveResult(resumed, moved, swapped, manifest["digest"])
 
@@ -767,7 +820,8 @@ def encrypt(vault_root: Path, recipient_text: str, *, remove_plaintext: bool = F
     if not (vault_root / MANIFEST_NAME).is_file():
         raise VaultError(f"{vault_root} has no {MANIFEST_NAME}: nothing was moved there, or it is not a vault tree")
     recipient = parse_recipient(recipient_text)
-    by_path = {e["path"]: e for e in _load_manifest(vault_root)["files"]}
+    current = _load_manifest(vault_root)
+    by_path = {e["path"]: e for e in current["files"]}
     plain = [p for p in tree_files(vault_root) if not p.endswith(".age")]
     unknown = [p for p in plain if p not in by_path]
     if unknown:
@@ -775,6 +829,13 @@ def encrypt(vault_root: Path, recipient_text: str, *, remove_plaintext: bool = F
     changed = [rel for rel in plain if file_sha256(vault_root / rel) != by_path[rel]["sha256"]]
     if changed:
         raise VaultError("files that do not match the SHA-256 in the manifest, nothing encrypted: " + ", ".join(changed))
+    if remove_plaintext:
+        _require_decrypt_stamp(vault_root, current, by_path, plain, recipient_text.strip())
+
+    def store() -> dict[str, Any]:
+        current["files"] = list(by_path.values())
+        return _store_manifest(vault_root, current)
+
     encrypted = reused = removed = 0
     for rel in plain:
         entry, source = by_path[rel], vault_root / rel
@@ -793,15 +854,123 @@ def encrypt(vault_root: Path, recipient_text: str, *, remove_plaintext: bool = F
                 "sha256": file_sha256(cipher),
                 "recipient": recipient_text.strip(),
             }
-            _store_manifest(vault_root, {"files": list(by_path.values())})
+            store()
             encrypted += 1
         if remove_plaintext:
             if file_sha256(cipher) != entry["ciphertext"]["sha256"]:
                 raise VaultError(f"{cipher.name} no longer matches its recorded SHA-256: the plaintext stays")
             source.unlink()
             removed += 1
-    manifest = _store_manifest(vault_root, {"files": list(by_path.values())})
+    manifest = store()
     return EncryptResult(encrypted, reused, removed, manifest["digest"])
+
+
+def _recipient_digest(recipient_text: str) -> str:
+    return hashlib.sha256(recipient_text.strip().encode("ascii", errors="replace")).hexdigest()
+
+
+def _require_decrypt_stamp(
+    vault_root: Path, manifest: dict[str, Any], by_path: dict[str, dict[str, Any]], plain: Sequence[str], recipient_text: str
+) -> None:
+    """Refuse ``--remove-plaintext`` unless ``verify-decrypt`` has shown, for this recipient, that every ciphertext opens.
+
+    The stamp names, for each file, the ciphertext SHA-256 it checked; a file encrypted again since, or for another
+    recipient, is not covered. Checked before anything is encrypted or removed.
+    """
+    stamp = manifest.get(STAMP_KEY)
+    if not stamp:
+        raise VaultError(
+            "no decrypt check in the manifest: run verify-decrypt first, with the identity mounted "
+            "(OLSPRIME_VAULT_IDENTITY), so that no plaintext is removed on an unproven ciphertext"
+        )
+    if stamp.get("recipient_sha256") != _recipient_digest(recipient_text):
+        raise VaultError("the decrypt check was made for another recipient than --recipient: run verify-decrypt again")
+    covered = stamp.get("covered", {})
+    for rel in plain:
+        entry = by_path[rel]
+        known = entry.get("ciphertext")
+        cipher = vault_root / (rel + ".age")
+        if not known or known["recipient"] != recipient_text or _sha_or_none(cipher) != known["sha256"] or covered.get(rel) != known["sha256"]:
+            raise VaultError(
+                f"the decrypt check does not cover {rel}.age (not encrypted yet, encrypted again since, or for another recipient): "
+                "run encrypt without --remove-plaintext, then verify-decrypt, then this"
+            )
+
+
+@dataclass
+class DecryptCheckResult:
+    files: int
+    recipient_sha256: str
+    manifest_digest: str
+
+
+def verify_decrypt(vault_root: Path) -> DecryptCheckResult:
+    """Decrypt every ``.age`` file in memory with the identity of ``OLSPRIME_VAULT_IDENTITY`` and compare SHA-256s.
+
+    Each plaintext must hash to ``files[].sha256`` in the manifest. On success a stamp (time, count, SHA-256 of the
+    identity's public recipient, the ciphertext hash checked per file) goes into the manifest; the identity never
+    does, and no decrypted byte is written or printed. Run once by Abdou, with the identity on a mounted medium.
+    """
+    import pyrage
+
+    _refuse_if_open()
+    journal = _load_journal(vault_root)
+    if journal is not None and journal["finished"] is None:
+        raise VaultError("an unfinished move is in the vault tree: run move again first")
+    if not (vault_root / MANIFEST_NAME).is_file():
+        raise VaultError(f"{vault_root} has no {MANIFEST_NAME}: nothing was moved there, or it is not a vault tree")
+    named = os.environ.get(protocol.IDENTITY_ENV)
+    if not named:
+        raise VaultError(f"{protocol.IDENTITY_ENV} is not set: mount the medium that holds the identity and name its file")
+    try:
+        identity = protocol.read_identity(Path(named))
+    except protocol.VaultSealed as error:
+        raise VaultError(str(error)) from None
+    recipient = str(identity.to_public())
+    current = _load_manifest(vault_root)
+    entries = current["files"]
+    if not entries:
+        raise VaultError("the manifest lists no file: nothing to check")
+    missing = [e["path"] for e in entries if "ciphertext" not in e]
+    if missing:
+        raise VaultError("files that are not encrypted yet (run encrypt first): " + ", ".join(missing))
+    listed = {e["ciphertext"]["path"] for e in entries}
+    stray = [p for p in tree_files(vault_root) if p.endswith(".age") and p not in listed]
+    if stray:
+        raise VaultError("ciphertext files that the manifest does not list: " + ", ".join(stray))
+    problems: list[str] = []
+    covered: dict[str, str] = {}
+    for entry in entries:
+        known, cipher = entry["ciphertext"], vault_root / entry["ciphertext"]["path"]
+        if not cipher.is_file():
+            problems.append(f"{known['path']}: missing")
+            continue
+        blob = cipher.read_bytes()
+        if hashlib.sha256(blob).hexdigest() != known["sha256"]:
+            problems.append(f"{known['path']}: does not match the ciphertext SHA-256 in the manifest")
+            continue
+        if known["recipient"] != recipient:
+            problems.append(f"{known['path']}: encrypted for {known['recipient']}, not for the recipient of this identity")
+            continue
+        try:
+            plain = pyrage.decrypt(blob, [identity])
+        except pyrage.DecryptError as error:
+            problems.append(f"{known['path']}: does not decrypt with this identity ({error})")
+            continue
+        if hashlib.sha256(plain).hexdigest() != entry["sha256"]:
+            problems.append(f"{known['path']}: decrypts to bytes other than the recorded SHA-256")
+            continue
+        covered[entry["path"]] = known["sha256"]
+    if problems:
+        raise VaultError(f"{len(problems)} of {len(entries)} files fail the decrypt check, no stamp written:\n  " + "\n  ".join(problems))
+    current[STAMP_KEY] = {
+        "at": _iso(),
+        "files": len(covered),
+        "recipient_sha256": _recipient_digest(recipient),
+        "covered": covered,
+    }
+    manifest = _store_manifest(vault_root, current)
+    return DecryptCheckResult(len(covered), current[STAMP_KEY]["recipient_sha256"], manifest["digest"])
 
 
 def keygen(out: Path, data_dir: Path, vault_root: Path) -> str:
@@ -855,13 +1024,18 @@ def status(data_dir: Path, vault_root: Path) -> dict[str, Any]:
     manifest_path = vault_root / MANIFEST_NAME
     digest = None
     manifest_ok = None
+    stamp = None
     if manifest_path.is_file():
         stored = json.loads(manifest_path.read_text(encoding="utf-8"))
         digest = stored.get("digest")
         manifest_ok = digest == manifest_digest(stored)
+        stamp = stored.get(STAMP_KEY)
     return {
         "stage": stage,
         "vault_months_in_data": in_data,
+        "archives_still_in_data": len(archives),
+        "tables_still_in_data": len(holding),
+        "decrypt_check": {k: stamp[k] for k in ("at", "files", "recipient_sha256")} if stamp else None,
         "anomalies": anomalies,
         "tree_files": len(files),
         "tree_bytes": size,
@@ -880,7 +1054,8 @@ def tree_summary(data_dir: Path | None = None, vault_root: Path | None = None) -
         "stage": state["stage"],
         "files": state["tree_files"],
         "bytes": state["tree_bytes"],
-        "months_still_in_data": len(state["vault_months_in_data"]),
+        "archives_still_in_data": state["archives_still_in_data"],
+        "tables_still_in_data": state["tables_still_in_data"],
         "manifest_digest": state["manifest_digest"],
         "manifest_ok": state["manifest_ok"],
     }
@@ -896,8 +1071,13 @@ def format_status(state: dict[str, Any]) -> str:
     ]
     if state["unfinished_move"]:
         lines.append("an unfinished move is journaled: run move again")
+    check = state["decrypt_check"]
+    if check:
+        lines.append(f"decrypt check: {check['files']} files at {check['at']}, recipient digest {check['recipient_sha256'][:16]}...")
+    lines.append(
+        f"still under data/: {state['archives_still_in_data']} vault archives and {state['tables_still_in_data']} tables holding vault bars"
+    )
     if state["vault_months_in_data"]:
-        lines.append(f"vault months still under data/: {len(state['vault_months_in_data'])}")
         lines.extend(f"  {text}" for text in state["vault_months_in_data"])
     if state["anomalies"]:
         lines.append(f"anomalies: {len(state['anomalies'])}")
@@ -928,6 +1108,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     )
     keygen_cmd = commands.add_parser("keygen", help="write a new age identity to --out and print its public recipient (Abdou only)")
     keygen_cmd.add_argument("--out", type=Path, required=True, help="a path on a medium you take away")
+    commands.add_parser(
+        "verify-decrypt",
+        help="decrypt every .age file in memory with $OLSPRIME_VAULT_IDENTITY, compare SHA-256s, stamp the manifest (Abdou only)",
+    )
     commands.add_parser("status", help="stage, file counts and bytes, vault months still under data/")
     args = parser.parse_args(argv)
     logging.basicConfig(level=logging.WARNING, format="%(levelname)s %(message)s")
@@ -958,6 +1142,13 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "keygen":
             print(keygen(args.out, data_dir, vault_root))
+            return 0
+        if args.command == "verify-decrypt":
+            checked = verify_decrypt(vault_root)
+            print(
+                f"{checked.files} files decrypt to their recorded SHA-256; stamp written (recipient digest {checked.recipient_sha256}); "
+                f"manifest digest {checked.manifest_digest}"
+            )
             return 0
         print(format_status(status(data_dir, vault_root)))
         return 0

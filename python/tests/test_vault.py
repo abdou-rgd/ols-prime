@@ -11,6 +11,7 @@ from __future__ import annotations
 import functools
 import hashlib
 import json
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -363,6 +364,99 @@ def test_a_move_for_another_data_root_does_not_finish_a_stranger_journal(tmp_pat
         vault.move(other.data, world.vault)
 
 
+def test_a_locked_file_is_one_refusal_line_and_move_resumes_to_the_same_end_state(tmp_path, monkeypatch, capsys):
+    reference = make_world(tmp_path / "reference")
+    vault.move(reference.data, reference.vault)
+    final = hashes(reference.data), hashes(reference.vault, skip=BOOKKEEPING)
+
+    world = make_world(tmp_path / "locked")
+    original = hashes(world.data)
+    real_replace, raised = os.replace, []
+
+    def locked_once(source, dest, *args, **kwargs):
+        # Another process holds the table: the rename over it fails once, as it does on Windows.
+        if Path(dest).suffix == ".parquet" and vault.STAGING_DIR in Path(source).parts and not raised:
+            raised.append(str(dest))
+            raise PermissionError(13, "The process cannot access the file because it is being used by another process", str(source), None, str(dest))
+        return real_replace(source, dest, *args, **kwargs)
+
+    monkeypatch.setattr(vault.os, "replace", locked_once)
+    base = ["--data-dir", str(world.data), "--vault-dir", str(world.vault)]
+    assert vault.main([*base, "move"]) == 2  # a refusal, not a traceback
+    lines = capsys.readouterr().out.strip().splitlines()
+    assert raised and len(lines) == 1 and lines[0].startswith("refused:")
+    assert Path(raised[0]).name in lines[0] and "Nothing was lost" in lines[0] and "run move again" in lines[0]
+    now_data, now_vault = hashes(world.data), hashes(world.vault)
+    for rel, sha in original.items():  # every original is where it was or in the vault tree, and no table path is empty
+        assert now_data.get(rel) == sha or now_vault.get(rel) == sha, rel
+        if rel.startswith("parquet/"):
+            assert rel in now_data, rel
+
+    assert vault.main([*base, "move"]) == 0 and "resumed" in capsys.readouterr().out  # the lock is gone
+    assert (hashes(world.data), hashes(world.vault, skip=BOOKKEEPING)) == final
+    assert vault.move(world.data, world.vault).nothing_to_do
+
+
+def test_the_journal_pins_the_checksum_files_and_move_refuses_an_edited_one_before_touching_a_table(tmp_path):
+    world = make_world(tmp_path)
+
+    class Crash(Exception):
+        pass
+
+    def boom(label: str) -> None:
+        raise Crash(label)
+
+    with pytest.raises(Crash):
+        vault.move(world.data, world.vault, checkpoint=boom)  # stops right after the journal is written
+    journal = json.loads((world.vault / vault.JOURNAL_NAME).read_text())
+    assert len(journal["archives"]) == 6
+    for job in journal["archives"]:
+        checksum = world.data / "raw" / (job["rel"] + ".CHECKSUM")
+        assert job["checksum_sha256"] == hashlib.sha256(checksum.read_bytes()).hexdigest()
+    # The CHECKSUM file is edited so that it still verifies its archive (a comment after the digest).
+    victim = world.data / "raw" / (journal["archives"][2]["rel"] + ".CHECKSUM")
+    victim.write_text(victim.read_text().rstrip("\n") + "  # edited after the plan\n")
+    assert vault.scan_vault_archives(world.data / "raw")[1] == []  # the archive still passes is_verified
+    before = hashes(world.data)
+    with pytest.raises(vault.VaultError, match="changed since the plan"):
+        vault.move(world.data, world.vault)
+    assert hashes(world.data) == before  # refused before the first table was touched
+    assert not any(rel.startswith(("raw/", "parquet/")) for rel in hashes(world.vault))
+
+
+def test_a_journal_written_before_the_checksum_pin_still_resumes_and_a_finished_one_does_nothing(tmp_path):
+    reference = make_world(tmp_path / "reference")
+    vault.move(reference.data, reference.vault)
+    final = hashes(reference.data), hashes(reference.vault, skip=BOOKKEEPING)
+
+    class Crash(Exception):
+        pass
+
+    def boom(label: str) -> None:
+        raise Crash(label)
+
+    world = make_world(tmp_path / "old")
+    with pytest.raises(Crash):
+        vault.move(world.data, world.vault, checkpoint=boom)
+    path = world.vault / vault.JOURNAL_NAME
+    journal = json.loads(path.read_text())
+    for job in journal["archives"]:
+        job["checksum_sha256"] = None  # what the code before the pin wrote
+    path.write_text(json.dumps(journal))
+    assert vault.move(world.data, world.vault).resumed
+    assert (hashes(world.data), hashes(world.vault, skip=BOOKKEEPING)) == final
+    # The journal of a finished move, with the old None: status reads it, a new move has nothing to do and changes nothing.
+    journal = json.loads(path.read_text())
+    assert journal["finished"] is not None and all(job["checksum_sha256"] for job in journal["archives"])  # pinned on resume
+    for job in journal["archives"]:
+        job["checksum_sha256"] = None
+    path.write_text(json.dumps(journal))
+    settled = hashes(world.data), hashes(world.vault)
+    assert vault.status(world.data, world.vault)["stage"] == 1 and not vault.status(world.data, world.vault)["unfinished_move"]
+    assert vault.move(world.data, world.vault).nothing_to_do
+    assert (hashes(world.data), hashes(world.vault)) == settled
+
+
 # --- encrypt -----------------------------------------------------------------------------------------------
 
 
@@ -374,11 +468,11 @@ def throwaway_identity(tmp_path: Path, name: str = "id.txt") -> tuple[pyrage.x25
     return identity, str(identity.to_public()), path
 
 
-def test_encrypt_round_trips_byte_for_byte_and_removes_plaintext_only_with_the_flag(tmp_path):
+def test_encrypt_round_trips_byte_for_byte_and_removes_plaintext_only_with_the_flag(tmp_path, monkeypatch):
     world = make_world(tmp_path)
     vault.move(world.data, world.vault)
     plain = hashes(world.vault, skip=BOOKKEEPING)
-    identity, recipient, _ = throwaway_identity(tmp_path)
+    identity, recipient, identity_file = throwaway_identity(tmp_path)
 
     first = vault.encrypt(world.vault, recipient)
     assert (first.encrypted, first.reused, first.plaintext_removed) == (len(plain), 0, 0)
@@ -392,6 +486,8 @@ def test_encrypt_round_trips_byte_for_byte_and_removes_plaintext_only_with_the_f
         assert hashlib.sha256(pyrage.decrypt(blob, [identity])).hexdigest() == sha  # byte for byte
         assert blob[:21] == b"age-encryption.org/v1"
 
+    monkeypatch.setenv("OLSPRIME_VAULT_IDENTITY", str(identity_file))
+    assert vault.verify_decrypt(world.vault).files == len(plain)
     second = vault.encrypt(world.vault, recipient, remove_plaintext=True)
     assert (second.encrypted, second.reused, second.plaintext_removed) == (0, len(plain), len(plain))
     assert not any((world.vault / rel).exists() for rel in plain)
@@ -453,6 +549,133 @@ def test_encrypt_waits_for_an_unfinished_move(tmp_path):
         vault.move(world.data, world.vault, checkpoint=boom)
     with pytest.raises(vault.VaultError, match="unfinished"):
         vault.encrypt(world.vault, recipient)
+
+
+def encrypted_world(tmp_path: Path, recipient: str) -> World:
+    world = make_world(tmp_path)
+    vault.move(world.data, world.vault)
+    vault.encrypt(world.vault, recipient)
+    return world
+
+
+def test_verify_decrypt_with_the_right_identity_stamps_the_manifest_and_leaves_everything_else(tmp_path, monkeypatch):
+    _, recipient, identity_file = throwaway_identity(tmp_path)
+    world = encrypted_world(tmp_path, recipient)
+    before = hashes(world.vault, skip=frozenset({vault.MANIFEST_NAME}))
+    listed = json.loads((world.vault / vault.MANIFEST_NAME).read_text())
+    monkeypatch.setenv("OLSPRIME_VAULT_IDENTITY", str(identity_file))
+    result = vault.verify_decrypt(world.vault)
+    stored = json.loads((world.vault / vault.MANIFEST_NAME).read_text())
+    stamp = stored["decrypt_check"]
+    assert result.files == stamp["files"] == len(listed["files"]) and result.manifest_digest == stored["digest"]
+    assert stamp["recipient_sha256"] == hashlib.sha256(recipient.encode()).hexdigest() and stamp["at"].endswith("+00:00")
+    assert stored["digest"] == vault.manifest_digest(stored) and stored["digest"] != listed["digest"]  # the stamp is in the body
+    assert {e["path"]: e for e in stored["files"]} == {e["path"]: e for e in listed["files"]}  # no file entry changed
+    assert hashes(world.vault, skip=frozenset({vault.MANIFEST_NAME})) == before  # nothing written but the manifest
+    secret = identity_file.read_text().splitlines()[-1]
+    assert secret not in (world.vault / vault.MANIFEST_NAME).read_text() and recipient not in json.dumps(stamp)
+    assert vault.status(world.data, world.vault)["decrypt_check"]["files"] == result.files
+    # The stamp survives a later encrypt, which rewrites the manifest.
+    vault.encrypt(world.vault, recipient)
+    assert json.loads((world.vault / vault.MANIFEST_NAME).read_text())["decrypt_check"] == stamp
+
+
+def test_verify_decrypt_refuses_a_wrong_identity_a_wrong_recipient_and_a_damaged_ciphertext_and_writes_no_stamp(tmp_path, monkeypatch):
+    _, recipient, identity_file = throwaway_identity(tmp_path)
+    _, _, stranger_file = throwaway_identity(tmp_path, "stranger.txt")
+    world = encrypted_world(tmp_path, recipient)
+    with pytest.raises(vault.VaultError, match="OLSPRIME_VAULT_IDENTITY"):
+        vault.verify_decrypt(world.vault)
+    monkeypatch.setenv("OLSPRIME_VAULT_IDENTITY", str(stranger_file))
+    with pytest.raises(vault.VaultError, match="not for the recipient"):
+        vault.verify_decrypt(world.vault)
+    monkeypatch.setenv("OLSPRIME_VAULT_IDENTITY", str(tmp_path / "usb" / "absent.txt"))
+    with pytest.raises(vault.VaultError, match="cannot read"):
+        vault.verify_decrypt(world.vault)
+    # The manifest says the right recipient, but the ciphertext was made for a stranger (a stale key): it does not decrypt.
+    monkeypatch.setenv("OLSPRIME_VAULT_IDENTITY", str(identity_file))
+    cipher = next(p for p in sorted(world.vault.rglob("*.age")))
+    rel = cipher.relative_to(world.vault).as_posix()
+    entry_path = rel.removesuffix(".age")
+    wrong = pyrage.encrypt((world.vault / entry_path).read_bytes(), [pyrage.x25519.Recipient.from_str(throwaway_identity(tmp_path, "s2.txt")[1])])
+    cipher.write_bytes(wrong)
+    stored = json.loads((world.vault / vault.MANIFEST_NAME).read_text())
+    entry = next(e for e in stored["files"] if e["path"] == entry_path)
+    entry["ciphertext"]["sha256"] = hashlib.sha256(wrong).hexdigest()
+    (world.vault / vault.MANIFEST_NAME).write_text(json.dumps(stored))
+    with pytest.raises(vault.VaultError, match=r"(?s)1 of \d+ files fail.*does not decrypt"):
+        vault.verify_decrypt(world.vault)
+    assert "decrypt_check" not in json.loads((world.vault / vault.MANIFEST_NAME).read_text())
+    # A ciphertext that no longer matches its recorded hash.
+    cipher.write_bytes(wrong + b"x")
+    with pytest.raises(vault.VaultError, match="ciphertext SHA-256"):
+        vault.verify_decrypt(world.vault)
+    assert "decrypt_check" not in json.loads((world.vault / vault.MANIFEST_NAME).read_text())
+
+
+def test_verify_decrypt_refuses_plaintext_that_decrypts_to_other_bytes_and_files_not_encrypted_yet(tmp_path, monkeypatch):
+    identity, recipient, identity_file = throwaway_identity(tmp_path)
+    world = make_world(tmp_path)
+    vault.move(world.data, world.vault)
+    monkeypatch.setenv("OLSPRIME_VAULT_IDENTITY", str(identity_file))
+    with pytest.raises(vault.VaultError, match="not encrypted yet"):
+        vault.verify_decrypt(world.vault)
+    vault.encrypt(world.vault, recipient)
+    # The manifest's plaintext hash is made to differ from what the ciphertext holds.
+    stored = json.loads((world.vault / vault.MANIFEST_NAME).read_text())
+    stored["files"][0]["sha256"] = "0" * 64
+    (world.vault / vault.MANIFEST_NAME).write_text(json.dumps(stored))
+    with pytest.raises(vault.VaultError, match="other than the recorded SHA-256"):
+        vault.verify_decrypt(world.vault)
+    assert pyrage.decrypt((world.vault / (stored["files"][0]["path"] + ".age")).read_bytes(), [identity])  # the file itself is fine
+
+
+def test_remove_plaintext_is_refused_without_a_covering_stamp_and_nothing_is_deleted(tmp_path, monkeypatch):
+    _, recipient, identity_file = throwaway_identity(tmp_path)
+    _, other_recipient, _ = throwaway_identity(tmp_path, "other.txt")
+    world = encrypted_world(tmp_path, recipient)
+    plain = hashes(world.vault, skip=BOOKKEEPING | {rel for rel in hashes(world.vault) if rel.endswith(".age")})
+    cipher_before = {rel: sha for rel, sha in hashes(world.vault).items() if rel.endswith(".age")}
+
+    def untouched() -> None:
+        assert hashes(world.vault, skip=BOOKKEEPING) == {**plain, **cipher_before}
+
+    with pytest.raises(vault.VaultError, match="verify-decrypt"):
+        vault.encrypt(world.vault, recipient, remove_plaintext=True)
+    untouched()
+    monkeypatch.setenv("OLSPRIME_VAULT_IDENTITY", str(identity_file))
+    vault.verify_decrypt(world.vault)
+    with pytest.raises(vault.VaultError, match="another recipient"):  # a different (valid) recipient than the one checked
+        vault.encrypt(world.vault, other_recipient, remove_plaintext=True)
+    untouched()
+    # A file encrypted again since the check is not covered: the stamp names the ciphertext it opened.
+    stored = json.loads((world.vault / vault.MANIFEST_NAME).read_text())
+    rel = stored["files"][0]["path"]
+    stored["decrypt_check"]["covered"][rel] = "0" * 64
+    stored["digest"] = vault.manifest_digest(stored)
+    (world.vault / vault.MANIFEST_NAME).write_text(json.dumps(stored))
+    with pytest.raises(vault.VaultError, match="does not cover"):
+        vault.encrypt(world.vault, recipient, remove_plaintext=True)
+    untouched()
+    # Back to a good stamp: now the removal goes through, and only then.
+    vault.verify_decrypt(world.vault)
+    outcome = vault.encrypt(world.vault, recipient, remove_plaintext=True)
+    assert outcome.plaintext_removed == len(plain) and not any((world.vault / rel).exists() for rel in plain)
+    assert {rel: sha for rel, sha in hashes(world.vault).items() if rel.endswith(".age")} == cipher_before
+
+
+def test_encrypting_again_for_another_recipient_voids_the_stamp(tmp_path, monkeypatch):
+    _, recipient, identity_file = throwaway_identity(tmp_path)
+    _, other_recipient, other_file = throwaway_identity(tmp_path, "other.txt")
+    world = encrypted_world(tmp_path, recipient)
+    monkeypatch.setenv("OLSPRIME_VAULT_IDENTITY", str(identity_file))
+    vault.verify_decrypt(world.vault)
+    vault.encrypt(world.vault, other_recipient)  # every ciphertext is made again, for the new recipient
+    with pytest.raises(vault.VaultError, match="another recipient"):
+        vault.encrypt(world.vault, other_recipient, remove_plaintext=True)
+    monkeypatch.setenv("OLSPRIME_VAULT_IDENTITY", str(other_file))
+    vault.verify_decrypt(world.vault)
+    assert vault.encrypt(world.vault, other_recipient, remove_plaintext=True).plaintext_removed > 0
 
 
 # --- keygen ------------------------------------------------------------------------------------------------
@@ -552,7 +775,11 @@ def test_at_stage_2_the_open_path_needs_the_identity_and_forged_keys_alone_read_
     before = open_reads(world, monkeypatch)
     vault.move(world.data, world.vault)
     _, recipient, identity_file = throwaway_identity(tmp_path)
+    vault.encrypt(world.vault, recipient)
+    monkeypatch.setenv("OLSPRIME_VAULT_IDENTITY", str(identity_file))
+    vault.verify_decrypt(world.vault)
     vault.encrypt(world.vault, recipient, remove_plaintext=True)
+    monkeypatch.delenv("OLSPRIME_VAULT_IDENTITY")
     assert vault.status(world.data, world.vault)["stage"] == 2
     logged = len(access_lines())
 
@@ -667,7 +894,8 @@ def test_the_manifest_reports_the_vault_tree_at_each_stage_and_reads_no_vault_ro
         "stage": 0,
         "files": 0,
         "bytes": 0,
-        "months_still_in_data": 6 + len(VAULT_PAIRS),
+        "archives_still_in_data": 6,
+        "tables_still_in_data": len(VAULT_PAIRS),
         "manifest_digest": None,
         "manifest_ok": None,
     }
@@ -675,10 +903,14 @@ def test_the_manifest_reports_the_vault_tree_at_each_stage_and_reads_no_vault_ro
     stage1 = manifest.build_manifest(world.data)
     tree = stage1["vault_tree"]
     listed = json.loads((world.vault / vault.MANIFEST_NAME).read_text())
-    assert (tree["stage"], tree["files"], tree["months_still_in_data"]) == (1, len(listed["files"]), 0)
+    assert (tree["stage"], tree["files"], tree["archives_still_in_data"], tree["tables_still_in_data"]) == (1, len(listed["files"]), 0, 0)
+    assert "months_still_in_data" not in tree
     assert tree["manifest_digest"] == listed["digest"] and tree["manifest_ok"] is True
     assert tree["bytes"] == sum(e["bytes"] for e in listed["files"])
-    _, recipient, _ = throwaway_identity(tmp_path)
+    _, recipient, identity_file = throwaway_identity(tmp_path)
+    vault.encrypt(world.vault, recipient)
+    monkeypatch.setenv("OLSPRIME_VAULT_IDENTITY", str(identity_file))
+    vault.verify_decrypt(world.vault)
     vault.encrypt(world.vault, recipient, remove_plaintext=True)
     stage2 = manifest.build_manifest(world.data)
     assert stage2["vault_tree"]["stage"] == 2 and stage2["vault_tree"]["files"] == len(listed["files"])
@@ -694,9 +926,16 @@ def test_status_names_what_is_still_under_data(tmp_path):
     named = "\n".join(state["vault_months_in_data"])
     assert "raw/spot/monthly/klines/AAAUSDT/1d/AAAUSDT-1d-2026-01.zip" in named and "CCCUSDT 1d (Parquet footer)" in named
     assert "stage 0" in vault.format_status(state)
+    assert (state["archives_still_in_data"], state["tables_still_in_data"]) == (6, len(VAULT_PAIRS))
+    assert len(state["vault_months_in_data"]) == 6 + len(VAULT_PAIRS)  # the list names items; the two counts do not mix them
+    assert "6 vault archives and 3 tables" in vault.format_status(state)
+    vault.move(world.data, world.vault)
+    after = vault.status(world.data, world.vault)
+    assert (after["archives_still_in_data"], after["tables_still_in_data"], after["stage"]) == (0, 0, 1)
+    assert "0 vault archives and 0 tables" in vault.format_status(after)
 
 
-def test_the_command_line_runs_each_stage(tmp_path, capsys):
+def test_the_command_line_runs_each_stage(tmp_path, capsys, monkeypatch):
     world = make_world(tmp_path)
     base = ["--data-dir", str(world.data), "--vault-dir", str(world.vault)]
     assert vault.main([*base, "plan"]) == 0
@@ -704,9 +943,18 @@ def test_the_command_line_runs_each_stage(tmp_path, capsys):
     assert vault.main([*base, "move"]) == 0 and "finished" in capsys.readouterr().out
     assert vault.main([*base, "move"]) == 0 and "nothing to do" in capsys.readouterr().out
     assert vault.main([*base, "status"]) == 0 and "stage 1" in capsys.readouterr().out
-    _, recipient, _ = throwaway_identity(tmp_path)
+    _, recipient, identity_file = throwaway_identity(tmp_path)
     assert vault.main([*base, "encrypt", "--recipient", recipient]) == 0 and "encrypted" in capsys.readouterr().out
     assert vault.main([*base, "status"]) == 0 and "stage 1" in capsys.readouterr().out
+    assert vault.main([*base, "encrypt", "--recipient", recipient, "--remove-plaintext"]) == 2  # no decrypt check yet
+    assert "verify-decrypt" in capsys.readouterr().out
+    assert vault.main([*base, "verify-decrypt"]) == 2  # and no identity named
+    assert "OLSPRIME_VAULT_IDENTITY" in capsys.readouterr().out
+    monkeypatch.setenv("OLSPRIME_VAULT_IDENTITY", str(identity_file))
+    assert vault.main([*base, "verify-decrypt"]) == 0
+    printed = capsys.readouterr().out
+    assert "decrypt to their recorded SHA-256" in printed and "AGE-SECRET-KEY" not in printed and recipient not in printed
+    assert vault.main([*base, "status"]) == 0 and "decrypt check: " in capsys.readouterr().out
     assert vault.main([*base, "encrypt", "--recipient", recipient, "--remove-plaintext"]) == 0
     capsys.readouterr()
     assert vault.main([*base, "status"]) == 0 and "stage 2" in capsys.readouterr().out
