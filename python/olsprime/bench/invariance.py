@@ -356,8 +356,7 @@ def run_model(spec: ModelSpec, bars: pl.DataFrame, cuts: Sequence[Cut], cfg: H1C
         by_cell = spec.probe.predicted_flag(bars, cut.index, mirror) if spec.probe is not None else None
         results = {}
         for j, shift in enumerate(cfg.level_shifts):
-            config = replace(cfg.perturbation, level_shift=shift, mirror=mirror)
-            seed = cfg.perturbation_seed + 1000 * j + k
+            seed, config = perturbation_at(cfg, k, j)
             perturbed = outputs(spec, perturb_after(bars, cut.index, seed=seed, config=config), cfg, before=cut.known_at)
             results[_direction(shift)] = compare(original, perturbed, cut.known_at)
         union = np.logical_or.reduce([r["mask"] for r in results.values()])
@@ -394,6 +393,16 @@ def is_mirrored(k: int) -> bool:
     return k % 2 == 1
 
 
+def perturbation_at(cfg: H1Config, k: int, j: int) -> tuple[int, Perturbation]:
+    """The seed and configuration of direction ``cfg.level_shifts[j]`` at the k-th cut (0-based) of a cut list.
+
+    H1's schedule in one place: :func:`run_model`, :func:`realised_cells` and the adversary
+    (:mod:`olsprime.bench.adversary`) all perturb with it.
+    """
+    config = replace(cfg.perturbation, level_shift=cfg.level_shifts[j], mirror=is_mirrored(k))
+    return cfg.perturbation_seed + 1000 * j + k, config
+
+
 def _cell(b: pl.DataFrame, row: int) -> list[str]:
     o, c = float(b["open"][row]), float(b["close"][row])
     colour = "green" if c > o else "red" if c < o else "doji"
@@ -406,8 +415,7 @@ def realised_cells(bars: pl.DataFrame, cuts: Sequence[Cut], cfg: H1Config) -> li
     for k, cut in enumerate(cuts):
         row = {"cut": cut.index, "mirror": is_mirrored(k), "original": _cell(bars, cut.index + 1)}
         for j, shift in enumerate(cfg.level_shifts):
-            config = replace(cfg.perturbation, level_shift=shift, mirror=is_mirrored(k))
-            seed = cfg.perturbation_seed + 1000 * j + k
+            seed, config = perturbation_at(cfg, k, j)
             row[_direction(shift)] = _cell(perturb_after(bars, cut.index, seed=seed, config=config), cut.index + 1)
         out.append(row)
     return out

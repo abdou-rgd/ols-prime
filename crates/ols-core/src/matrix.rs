@@ -3,6 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use nalgebra::DVector;
 
 use crate::OlsError;
+use crate::centred::{CentredFit, CentredRidge, CentredStats};
 use crate::ridge::{RidgeConfig, RidgeModel, finite, residual_sum_squares, ridge_fit, solve_query};
 use crate::stats::{SuffStats, check_finite, check_len};
 
@@ -63,6 +64,14 @@ fn fresh_id() -> u64 {
 /// from an independent memory with the same `p`, or from a clone that has since received other
 /// entries, is rejected with [`OlsError::ForeignReadout`] instead of being read against foreign
 /// entries. The id is the whole check, so a faithful clone refuses it too: query the clone.
+///
+/// **Two trees.** Every node exists twice over the same blocks: as raw sums ([`SuffStats`],
+/// read by [`Matrix::range_stats`] and the raw ridge) and in centred form ([`CentredStats`],
+/// read by [`Matrix::centred_range_stats`], the centred ridge and the batch readouts). The raw
+/// tree is kept exactly as it was, so every raw read keeps its bits; the centred tree costs as
+/// much again, `p + p² + q + qp + q²` floats per node. Pick `block_log2` for the memory: at 2·10⁶
+/// entries with p = 15 and q = 4, blocks of 2⁶ make about 6.2·10⁴ nodes per tree, 160 MB each,
+/// and blocks of 2⁸ a quarter of that, for at most 2·2⁸ scanned entries per read.
 #[derive(Debug)]
 pub struct Matrix {
     id: u64,
@@ -74,6 +83,93 @@ pub struct Matrix {
     times: Vec<i64>,
     /// `levels[k][j]` holds the statistics of blocks `[j·2^k, (j+1)·2^k)`.
     levels: Vec<Vec<SuffStats>>,
+    /// The same nodes in centred form.
+    centred: Vec<Vec<CentredStats>>,
+}
+
+/// A lookback window, in milliseconds: at decision time `d`, the entries with
+/// `d − span < time ≤ d`, or every entry with `time ≤ d` for [`Window::ALL`].
+///
+/// The left bound is open, so a 30-day window at `d` holds exactly the entries that became
+/// known during the 30 days that end at `d`, and windows of the same span at `d` and `d + span`
+/// never share an entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct Window {
+    span_ms: Option<i64>,
+}
+
+impl Window {
+    /// Every entry known at the decision time.
+    pub const ALL: Self = Self { span_ms: None };
+
+    /// The last `span_ms > 0` milliseconds.
+    pub fn last(span_ms: i64) -> Result<Self, OlsError> {
+        if span_ms > 0 {
+            Ok(Self {
+                span_ms: Some(span_ms),
+            })
+        } else {
+            Err(OlsError::InvalidWindow(span_ms))
+        }
+    }
+
+    /// The span in milliseconds, or `None` for all history.
+    pub fn span_ms(&self) -> Option<i64> {
+        self.span_ms
+    }
+}
+
+/// A centred read of Matrix for one query over a range of entries ([`Matrix::centred_query`]).
+///
+/// Like [`Readout`], only the memory that made it accepts it back.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CentredReadout {
+    owner: u64,
+    start: usize,
+    end: usize,
+    mean_x: Vec<f64>,
+    a: DVector<f64>,
+    forecast: DVector<f64>,
+    leverage: f64,
+    rss: DVector<f64>,
+}
+
+impl CentredReadout {
+    /// First entry of the range.
+    pub fn start(&self) -> usize {
+        self.start
+    }
+
+    /// One past the last entry of the range.
+    pub fn end(&self) -> usize {
+        self.end
+    }
+
+    /// The window's mean state `x̄`.
+    pub fn mean_x(&self) -> &[f64] {
+        &self.mean_x
+    }
+
+    /// The dual direction `a = (M_xx + Λ)⁻¹ (x_q − x̄)`.
+    pub fn a(&self) -> &DVector<f64> {
+        &self.a
+    }
+
+    /// The forecast `ŷ = ȳ + β (x_q − x̄)`: the same bits as [`Matrix::ridge_batch`] gives.
+    pub fn forecast(&self) -> &DVector<f64> {
+        &self.forecast
+    }
+
+    /// The leverage `x̃ᵀ (M_xx + Λ)⁻¹ x̃`.
+    pub fn leverage(&self) -> f64 {
+        self.leverage
+    }
+
+    /// The window's residual sum of squares at this penalty, per outcome
+    /// ([`CentredFit::rss`]).
+    pub fn rss(&self) -> &DVector<f64> {
+        &self.rss
+    }
 }
 
 impl Clone for Matrix {
@@ -89,6 +185,7 @@ impl Clone for Matrix {
             ys: self.ys.clone(),
             times: self.times.clone(),
             levels: self.levels.clone(),
+            centred: self.centred.clone(),
         }
     }
 }
@@ -173,6 +270,7 @@ impl Matrix {
             ys: Vec::new(),
             times: Vec::new(),
             levels: Vec::new(),
+            centred: Vec::new(),
         })
     }
 
@@ -410,12 +508,216 @@ impl Matrix {
         })
     }
 
+    /// Index range `[start, end)` of the entries a reader deciding at `as_of` sees through
+    /// `window`: `as_of − span < time ≤ as_of`, or `time ≤ as_of` for [`Window::ALL`].
+    ///
+    /// The bound is computed in i128, so no span overflows: a span reaching before `i64::MIN`
+    /// is all history.
+    pub fn window_range(&self, as_of: i64, window: Window) -> (usize, usize) {
+        let end = self.times.partition_point(|&t| t <= as_of);
+        let start = match window.span_ms {
+            None => 0,
+            Some(span) => {
+                let open = i128::from(as_of) - i128::from(span);
+                self.times[..end].partition_point(|&t| i128::from(t) <= open)
+            }
+        };
+        (start, end)
+    }
+
+    /// The centred statistics of entries `[start, end)`.
+    ///
+    /// The decomposition is the one of [`Matrix::range_stats`]: the partial blocks at the ends
+    /// are scanned (corrected two-pass), the blocks inside come from the centred tree, and the
+    /// pieces merge from left to right. It depends on `(start, end)` alone, so the result is a
+    /// pure function of the range: later pushes never change it, not even in the last bit.
+    pub fn centred_range_stats(&self, start: usize, end: usize) -> Result<CentredStats, OlsError> {
+        self.check_range(start, end)?;
+        let b = self.block_size();
+        let (first_block, last_block) = (start.div_ceil(b), end / b);
+        if first_block >= last_block {
+            return Ok(self.centred_scan(start, end));
+        }
+        let mut acc = self.centred_scan(start, first_block * b);
+        let (mut lo, mut hi) = (first_block, last_block);
+        let mut level = 0;
+        let mut right: Vec<&CentredStats> = Vec::new();
+        while lo < hi {
+            if lo % 2 == 1 {
+                acc.merge_unchecked(&self.centred[level][lo]);
+                lo += 1;
+            }
+            if hi % 2 == 1 {
+                hi -= 1;
+                right.push(&self.centred[level][hi]);
+            }
+            lo /= 2;
+            hi /= 2;
+            level += 1;
+        }
+        // The right-hand nodes were found from the right end inwards: merge them in order.
+        for node in right.into_iter().rev() {
+            acc.merge_unchecked(node);
+        }
+        acc.merge_unchecked(&self.centred_scan(last_block * b, end));
+        Ok(acc)
+    }
+
+    /// The centred ridge read of entries `[start, end)` for the query state `x_q`, with a free
+    /// intercept and the penalty `Λ = ρ·n·diag(s)` of `cfg` ([`CentredFit`]).
+    ///
+    /// The forecast, leverage and residual sums are the bits [`Matrix::ridge_batch`] returns
+    /// for the same range and penalty.
+    pub fn centred_query(
+        &self,
+        x_q: &[f64],
+        start: usize,
+        end: usize,
+        cfg: &CentredRidge,
+    ) -> Result<CentredReadout, OlsError> {
+        check_len(self.p, x_q.len())?;
+        check_finite(x_q)?;
+        let stats = self.centred_range_stats(start, end)?;
+        let fit = CentredFit::new(&stats, cfg)?;
+        let forecast = fit.forecast(x_q)?;
+        let leverage = fit.leverage(x_q)?;
+        let a = fit.direction(x_q)?;
+        Ok(CentredReadout {
+            owner: self.id,
+            start,
+            end,
+            mean_x: fit.mean_x().to_vec(),
+            a,
+            forecast,
+            leverage,
+            rss: DVector::from_column_slice(fit.rss()),
+        })
+    }
+
+    /// The signed weight `wᵢ = 1/n + (xᵢ − x̄)ᵀ a` of every entry in a centred readout's range,
+    /// in order. They sum to one (the free intercept), and `Σᵢ wᵢ yᵢ` is the forecast.
+    ///
+    /// # Errors
+    ///
+    /// [`OlsError::ForeignReadout`] if another instance produced the readout, and
+    /// [`OlsError::NonFinite`] if a weight overflows.
+    pub fn centred_weights(&self, readout: &CentredReadout) -> Result<Vec<f64>, OlsError> {
+        self.check_centred_readout(readout)?;
+        let n = (readout.end - readout.start) as f64;
+        let a = readout.a.as_slice();
+        let weights: Vec<f64> = (readout.start..readout.end)
+            .map(|i| {
+                let dot: f64 = self
+                    .x(i)
+                    .iter()
+                    .zip(&readout.mean_x)
+                    .zip(a)
+                    .map(|((x, m), a)| (x - m) * a)
+                    .sum();
+                1.0 / n + dot
+            })
+            .collect();
+        check_finite(&weights)?;
+        Ok(weights)
+    }
+
+    /// The exact signed contribution `Σ_{i∈S} wᵢ yᵢ` of the entries `S = [start, end)` to a
+    /// centred readout's forecast, from the statistics of S alone:
+    ///
+    /// ```text
+    /// Σ_{i∈S} wᵢ yᵢ = (n_S/n)·ȳ_S + (M_yx,S + n_S ȳ_S (x̄_S − x̄)ᵀ) a.
+    /// ```
+    ///
+    /// The contributions of a partition of the readout's range add up to its forecast.
+    ///
+    /// # Errors
+    ///
+    /// [`OlsError::ForeignReadout`] if another instance produced the readout,
+    /// [`OlsError::OutOfRange`] if `S` is not inside the readout's range, and
+    /// [`OlsError::NonFinite`] if the contribution overflows.
+    pub fn centred_contribution(
+        &self,
+        readout: &CentredReadout,
+        start: usize,
+        end: usize,
+    ) -> Result<DVector<f64>, OlsError> {
+        self.check_centred_readout(readout)?;
+        if !(readout.start <= start && start <= end && end <= readout.end) {
+            return Err(OlsError::OutOfRange {
+                start,
+                end,
+                bound_start: readout.start,
+                bound_end: readout.end,
+            });
+        }
+        let (p, q) = (self.p, self.q);
+        let s = self.centred_range_stats(start, end)?;
+        let (n, ns) = ((readout.end - readout.start) as f64, s.n());
+        let (myx, mean_x, mean_y) = (s.myx(), s.mean_x(), s.mean_y());
+        let a = readout.a.as_slice();
+        let out = DVector::from_fn(q, |c, _| {
+            if s.count() == 0 {
+                return 0.0;
+            }
+            let dot: f64 = (0..p)
+                .map(|j| {
+                    let shift = ns * mean_y[c] * (mean_x[j] - readout.mean_x[j]);
+                    (myx[c * p + j] + shift) * a[j]
+                })
+                .sum();
+            ns / n * mean_y[c] + dot
+        });
+        finite(out)
+    }
+
+    /// The rows `[start, end)` of states, row-major.
+    pub(crate) fn xs_rows(&self, start: usize, end: usize) -> &[f64] {
+        &self.xs[start * self.p..end * self.p]
+    }
+
+    /// The rows `[start, end)` of outcomes, row-major.
+    pub(crate) fn ys_rows(&self, start: usize, end: usize) -> &[f64] {
+        &self.ys[start * self.q..end * self.q]
+    }
+
+    fn centred_scan(&self, start: usize, end: usize) -> CentredStats {
+        CentredStats::scan(
+            self.p,
+            self.q,
+            self.xs_rows(start, end),
+            self.ys_rows(start, end),
+        )
+    }
+
+    fn check_centred_readout(&self, readout: &CentredReadout) -> Result<(), OlsError> {
+        if readout.owner != self.id {
+            return Err(OlsError::ForeignReadout);
+        }
+        check_len(self.p, readout.a.len())?;
+        self.check_range(readout.start, readout.end)
+    }
+
     /// Turns the block that just filled up into a leaf, then carries like a binary counter:
-    /// whenever a level holds an even number of nodes, its last two merge into a parent.
+    /// whenever a level holds an even number of nodes, its last two merge into a parent. The
+    /// centred tree carries in step with the raw one.
     fn close_block(&mut self) {
         let end = self.len();
+        let begin = end - self.block_size();
+        let mut cnode = self.centred_scan(begin, end);
+        for level in 0.. {
+            if level == self.centred.len() {
+                self.centred.push(Vec::new());
+            }
+            let nodes = &mut self.centred[level];
+            nodes.push(cnode);
+            if nodes.len() % 2 == 1 {
+                break;
+            }
+            cnode = nodes[nodes.len() - 2].clone();
+            cnode.merge_unchecked(&nodes[nodes.len() - 1]);
+        }
         let mut node = SuffStats::zeros(self.p, self.q);
-        self.scan_into(&mut node, end - self.block_size(), end);
+        self.scan_into(&mut node, begin, end);
         for level in 0.. {
             if level == self.levels.len() {
                 self.levels.push(Vec::new());

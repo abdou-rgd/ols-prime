@@ -4,7 +4,7 @@
 
 OLS Prime is a local-AI lab. Crypto trading is the playground, not the goal. Every component is a hypothesis: it is registered before it is tested, then measured by ablation against simple baselines on a leak-free backtest bench. A clean negative result counts as a result.
 
-> Status: iteration 2, the honest bench. Nothing here trades yet, and nothing here is investment advice.
+> Status: iteration 3, Matrix at scale. The vault months are out of `data/`, stage 1 of a physical seal whose encryption waits for an offline key. On the hourly bars of 233 pairs, Matrix forecasts slightly better than climatology, and better than softmax attention, but not measurably better than kNN ([Report n°2](docs/reports/report-2.md)). These are forecasts, before costs. Nothing here trades yet, and nothing here is investment advice.
 
 ## The idea
 
@@ -23,15 +23,15 @@ A pretrained LLM has already read the news of the years we would backtest on, so
 
 | Path | What |
 |---|---|
-| `crates/ols-core` | closed-form ridge, dual (attention) weights, recursive least squares with forgetting, Matrix |
+| `crates/ols-core` | closed-form ridge, dual (attention) weights, recursive least squares with forgetting; Matrix, with centred nodes, batch ridge readouts and exact softmax and kNN readouts |
 | `crates/backtest` | bar simulator (decide at the close, execute at the next open), venue fee schedules, metrics |
 | `crates/risk` | fixed-point risk kernel, with Kani proof harnesses and function contracts |
 | `crates/olsprime-py` | Python bindings of the Rust core (PyO3), built by `uv sync` |
-| `python/olsprime/data`, `universe.py` | data pipeline (data.binance.vision), point-in-time universe, the vault seal and the data manifest |
-| `python/olsprime/features`, `labels` | point-in-time features; three-class forward labels |
+| `python/olsprime/data`, `universe.py`, `vault.py` | data pipeline (data.binance.vision), point-in-time universe, the data manifest, and the physical seal that keeps the vault months outside `data/` |
+| `python/olsprime/features`, `labels` | point-in-time features and the hourly panel of the universe members; three-class forward labels |
 | `python/olsprime/eval` | walk-forward splits with purge and embargo; statistics (Sharpe intervals, PSR, DSR, stationary bootstrap, Diebold-Mariano, calibration) |
-| `python/olsprime/models` | baselines and the long/flat decision rule; the encoder and Matrix later |
-| `python/olsprime/bench` | the future-invariance test (H1) and the reports, one command each |
+| `python/olsprime/models` | baselines and the long/flat decision rule; the eight Matrix arms of Report n°2; the encoder later |
+| `python/olsprime/bench` | the future-invariance test (H1) on daily bars and on the panel, its adversary, and the reports, one command each |
 | `docs/` | [design](docs/DESIGN.md), [evaluation protocol](docs/PROTOCOL.md), [pre-registered hypotheses](docs/HYPOTHESES.md), [results](docs/RESULTS.md), [reports](docs/reports/) |
 
 ## Getting started
@@ -53,18 +53,31 @@ uv run python -m olsprime.bench.report1
 
 The first command downloads and checks the archives. On the development machine, the second runs H1, the future-invariance test, in seven to eight minutes with its default four processes. The third writes [Report n°1](docs/reports/report-1.md) in about 75 seconds. `report1 --check <run folder>` re-runs a report and compares it byte for byte.
 
-The Kani proofs need Linux (WSL2 works). Four of the twenty-one harnesses finish. On the development machine they take 14 to 16 minutes run four at a time (`-j 4 --output-format=terse`), or 18 minutes one after another:
-- the two of iteration 1: every buy gate blocks every buy, and sells are never gated;
-- the function contract of `product`;
-- a lemma that the specifications' 128-bit products never wrap.
+Report n°2 reads the hourly bars of every universe member: [`docs/DATA.md`](docs/DATA.md) gives the commands that rank the universe and download them, and the vault move that takes the sealed months out of `data/`. Then:
 
 ```bash
-cargo kani -p risk --exact -Z function-contracts -Z stubbing --no-assert-contracts --harness proofs::buy_gates_block_every_buy --harness proofs::sells_are_never_gated --harness proofs::product_contract --harness proofs::exact_never_wraps
+uv run python -m olsprime.bench.panel_invariance
+uv run python -m olsprime.bench.adversary
+uv run python -m olsprime.bench.report2
+```
+
+The first runs H1 on a 10-member sub-panel, with five planted leaks, in about 35 minutes. The second sends 10,000 random leaks through H1's perturbation in 3 to 5 minutes. The third writes [Report n°2](docs/reports/report-2.md) in about 20 minutes; `report2 --check <run folder>` takes as long again.
+
+The Kani proofs need Linux (WSL2 works). Five of the twenty-one harnesses finish:
+- the two of iteration 1: every buy gate blocks every buy, and sells are never gated;
+- the function contracts of `product` and of `max_qty_within`;
+- a lemma that the specifications' 128-bit products never wrap.
+
+On the development machine, run four at a time (`-j 4 --output-format=terse`), the five take about two hours. The contract of `max_qty_within` takes most of that: 122 minutes on 2026-10-29, under load from other jobs, and 72.5 minutes alone on a GitHub runner. The other four take 14 to 18 minutes together. On GitHub, the `proven` job runs the five in 74 to 91 minutes.
+
+```bash
+cargo kani -p risk --exact -Z function-contracts -Z stubbing --no-assert-contracts --harness proofs::buy_gates_block_every_buy --harness proofs::sells_are_never_gated --harness proofs::product_contract --harness proofs::exact_never_wraps --harness proofs::max_qty_within_contract
 ```
 
 `cargo kani -p risk`, with the same flags, runs all of them.
-- The contracts of the four helpers that divide (`notional_floor`, `notional_ceil`, `max_qty_within`, `round_down_to_lot`) are written in `crates/risk/src/spec.rs`. They are not proven yet: each ran out of time at 40 minutes. Property tests are the evidence for them for now.
+- The contracts of the three other helpers that divide (`notional_floor`, `notional_ceil`, `round_down_to_lot`) are written in `crates/risk/src/spec.rs`. They are not proven yet. Each gave no verdict in 340 minutes on a GitHub runner, and Z3 and Bitwuzla gave none in 45 minutes either. Property tests are the evidence for them for now.
 - So did the `check_order` harnesses that use those contracts as stubs.
+- Never pass `--cbmc-args --bitwuzla` as is: CBMC 6.11's Bitwuzla back end gives false proofs on Rust's overflow checks ([diffblue/cbmc#9144](https://github.com/diffblue/cbmc/issues/9144), fixed on CBMC's `develop` but not yet released; [model-checking/kani#5096](https://github.com/model-checking/kani/issues/5096)).
 
 [`kani.yml`](.github/workflows/kani.yml) keeps both lists.
 
@@ -77,7 +90,11 @@ cargo kani -p risk --exact -Z function-contracts -Z stubbing --no-assert-contrac
    - walk-forward protocol and baselines.
 
    Report: what fees do to simple strategies.
-2. **Matrix on hand-made features:** the paper's OLS attention, extended to time series.
+2. **Matrix on hand-made features**, the paper's OLS attention extended to time series, done in iteration 3:
+   - Matrix on the hourly bars of 233 pairs, 2019 to 2024, with the vault months moved out of `data/`;
+   - an adversary that measures how many random leaks H1 catches: 98 % of the 10,000 it planted.
+
+   [Report n°2](docs/reports/report-2.md): a Brier skill score of 0.013 over climatology, so H2 holds. Matrix beats softmax attention on the same memory, but not measurably kNN, so H3 does not hold. Refitted on a CUSUM's alarms, Matrix needs 13 fits instead of 72, and is no worse within the registered margin, so H12 holds. H10 and H11 do not hold. These are forecasts, before costs.
 3. **OLS Prime encoder, from scratch:** ablations against softmax and linear attention.
 4. **Rust inference engine and decision journal:** a prefill-only engine and an OptMem-style decision journal.
 5. **News:** through a small point-in-time text encoder, trained from scratch.

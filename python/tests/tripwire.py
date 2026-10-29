@@ -34,6 +34,13 @@ Round 2 of the guard fixes added:
   ``__init__``; cython types become subclasses (their original stays at ``__bases__[0]``, a stated
   limit). No wrapper has ``__wrapped__``. The gates bind their helpers as defaults when they are built.
 
+The vault tree of the physical seal (``python -m olsprime.vault``, outside ``data/``) is covered like ``data/``:
+any wrapped reader handed a path under the configured vault root (``$OLSPRIME_VAULT_DIR``, an empty folder
+of its own under pytest) needs the ordinary allowance, and one handed a path under the default vault root
+(``<parent of the repository>/ols-prime-vault``, the real one) trips for every file but ``olsprime/protocol.py``,
+like the repository's ``data/``. Those guards are the second line: the first is that the vault tree is
+encrypted (stage 2) or, at stage 1, outside the repository.
+
 The seal is watched too (the ``seal`` and ``vault-open`` rules of ``tests/allowlist.py``):
 
 - ``olsprime.protocol`` gets a module class that refuses to rebind ``seal``, ``vault_open``,
@@ -60,7 +67,8 @@ What it does not see (limits, to keep in mind):
 - Every in-process guard can be disarmed from inside the process: the ``__closure__`` of a wrapper
   holds the original, ``gc`` and ``ctypes`` reach the rest, and a disarm undone before the test ends
   leaves no trace for the teardown check. The static guard flags those names. Stops accidents and
-  careless code, not sabotage; the structural fix is the physical seal of iteration 3.
+  careless code, not sabotage; the structural fix is the physical seal of iteration 3: the vault rows
+  outside ``data/`` and, at stage 2, encrypted with a key that is not on this machine.
 - It sees Python-level entry points. A read through ``pyarrow._parquet``, ``pyarrow.lib`` or
   ``polars._plr`` directly, through ``ctypes``, through a subprocess, or by the ``open``
   built-in followed by a parser written by hand, passes. So does the original behind a wrapped
@@ -102,7 +110,7 @@ import pyarrow.parquet
 import pluggy
 import _pytest
 
-from olsprime.paths import REPO_ROOT, data_dir
+from olsprime.paths import REPO_ROOT, data_dir, default_vault_dir, vault_dir
 from tests import allowlist as allowlist_module
 from tests.allowlist import ALLOWED
 
@@ -257,8 +265,20 @@ def is_allowed(filename: str, rule: str, _allowed: Any = ALLOWED) -> bool:
 
 
 def data_roots() -> tuple[str, ...]:
-    """The folders that hold stored data: the repository's ``data/`` and the configured data root, normalised."""
-    return tuple({_norm(REPO_ROOT / "data") + os.sep, _norm(data_dir()) + os.sep})
+    """The folders that hold stored data, normalised.
+
+    The repository's ``data/``, the configured data root, and the vault tree (the configured root and the
+    default one beside the repository, ``physical seal`` of iteration 3): a path under the vault tree is a path
+    under ``data/`` for every wrapped reader, and ``<vault>/raw`` counts as a ``raw/`` folder.
+    """
+    return tuple(
+        {
+            _norm(REPO_ROOT / "data") + os.sep,
+            _norm(data_dir()) + os.sep,
+            _norm(default_vault_dir()) + os.sep,
+            _norm(vault_dir()) + os.sep,
+        }
+    )
 
 
 PATH_KEYWORDS = frozenset(
@@ -310,8 +330,12 @@ def _base_paths(args: tuple[Any, ...], kwargs: dict[str, Any]) -> list[str]:
 
 
 def repo_data_roots() -> tuple[str, ...]:
-    """The repository's own ``data/``, where the real vault lives (not the configured data root)."""
-    return (_norm(REPO_ROOT / "data") + os.sep,)
+    """The real store: the repository's own ``data/`` and the default vault tree beside the repository.
+
+    Not the configured data root or vault root: under pytest those are empty folders of the test's own (a fake
+    vault tree), and a path under them is judged by the ordinary rules of :func:`data_roots`.
+    """
+    return (_norm(REPO_ROOT / "data") + os.sep, _norm(default_vault_dir()) + os.sep)
 
 
 def raw_roots() -> tuple[str, ...]:

@@ -74,10 +74,13 @@ cargo clippy -p olsprime-py --all-targets --features python -- -D warnings
 cargo test --workspace
 cargo kani -p risk --exact -Z function-contracts -Z stubbing --no-assert-contracts \
   --harness proofs::buy_gates_block_every_buy --harness proofs::sells_are_never_gated \
-  --harness proofs::product_contract --harness proofs::exact_never_wraps   # WSL2 only
+  --harness proofs::product_contract --harness proofs::exact_never_wraps \
+  --harness proofs::max_qty_within_contract   # WSL2 only, about 2 hours with -j 4
 cd python && uv run pytest
 ```
 
 Kani runs only the proven harnesses, with the flags of `KANI_FLAGS` in `.github/workflows/kani.yml`. The `proven` job of that file keeps the list. `cargo kani -p risk` with the same flags runs all twenty-one harnesses.
 - In iteration 1, twelve of them ran out of time at one hour each, on a shared machine.
 - In iteration 2, so did the contracts of the four dividing helpers, at 40 minutes each, and every harness that stubs them. No verdict rests on an unproven contract.
+- On 2026-10-28, GitHub's `open` run (run 40636068905, 340 minutes per harness) proved `max_qty_within_contract` in 72.5 minutes. The other 16 gave no verdict.
+- On 2026-10-29, the five proven harnesses passed again locally with `-j 4`, in 122 minutes of wall time, under load from other jobs. `max_qty_within_contract` took 7,318 s; the other four took 27 to 1,057 s.

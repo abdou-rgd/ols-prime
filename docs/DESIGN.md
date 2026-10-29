@@ -79,17 +79,103 @@ This is OptMem's idea — an append-only log with a binary tree of summaries bui
 
 **Causality.** A decision taken at t over horizon h has an outcome known only at t + h. The entry joins Matrix then, never before.
 
-**Numerics.** The nodes hold raw sums, which has two consequences.
+**Numerics.** The nodes of the raw tree hold raw sums, which has two consequences. The centred tree of §3.1 removes the second. It only reduces the first: its residual sum of squares subtracts from the centred `M_yy`, not from `Σy²`, so it still cancels when the fit is close.
 - **Cancellation.** The residual sum of squares, `Σy² − 2βᵀΣyz + βᵀGβ`, cancels catastrophically when the fit is close (RSS ≪ Σy²). `residual_sum_squares` clamps a negative result to 0, which hides the error instead of flagging it. With daily returns, R² is near 0 and the cancellation is mild; in general it is not.
 - **Conditioning.** An uncentred Gram matrix beside an intercept is ill-conditioned when a feature's mean is large against its spread (§1).
-
-Planned for iteration 3: nodes in centred form, `(n, z̄, M_zz, ȳ, M_yz, M_yy)`.
-- Two nodes merge with the pairwise update of Chan, Golub and LeVeque (1979): `M(A ∪ B) = M(A) + M(B) + (n_A·n_B / n)·δ δᵀ`, where δ is the difference of the two means.
-- It stays exact and composable, at O(p²) per merge, and the intercept is then solved in centred form.
 
 **Overlapping outcomes.** With a horizon h > 1, consecutive entries share h − 1 periods of their outcome, so a range of N entries carries only about N/h independent outcomes.
 - Standard errors and tests must account for it: HAC with h − 1 lags, or the block bootstrap.
 - A readout's ridge penalty should scale with h, which is the same as weighting each entry by 1/h.
+
+### 3.1 Centred nodes (iteration 3)
+
+A second tree holds every node in centred form, `(n, z̄, M_zz, ȳ, M_yz, M_yy)`, where `M_zz = Σ(z − z̄)(z − z̄)ᵀ`.
+- **Merge.** Two nodes merge with the pairwise update of Chan, Golub and LeVeque (1979): `M(A ∪ B) = M(A) + M(B) + (n_A·n_B / n)·δ δᵀ`, where δ is the difference of the two means. The cost is O(p²) per merge.
+- **Leaves and partial blocks.** They are computed by the corrected two-pass scan: first the mean, then the centred sums minus `(Σd)(Σd)ᵀ/n`. That correction removes the first-order error of the rounded mean. A diagonal that rounds below zero, as a constant column can, is set to zero.
+- **Symmetry.** Only one triangle of `M_zz` and `M_yy` is computed. It is then mirrored, so both blocks are exactly symmetric.
+
+**Beside the raw tree, not in place of it.** The raw sums cannot be recovered exactly from centred nodes. Replacing the raw tree would change the bits of every raw read, and of every test and golden file built on them. So the centred tree sits beside it. Every raw read keeps its bits.
+- **Memory.** Each tree costs about 160 MB at 2 million entries with p = 15, q = 4 and blocks of 2⁶ entries. Blocks of 2⁸ cost a quarter of that.
+
+**Purity.** A centred read of `[l, r)` depends on `(l, r)` alone. It always takes the same path: the left partial block, the left nodes in order, the right nodes in reverse, then the right partial block. An entry pushed later never changes it, not even in the last bit. Property tests check this.
+
+### 3.2 Centred ridge with a free intercept
+
+For a window of `n_w` entries, a penalty `ρ ≥ 0` and a per-coordinate scale `s` (the fold's feature variances):
+
+```
+A = M_zz + Λ,   Λ = ρ·n_w·diag(s),   β = M_yz A⁻¹,   ŷ = ȳ + β (z_q − z̄).
+```
+
+- This is ridge on features standardized inside the fold, with an unpenalized intercept `b = ȳ − β z̄`.
+- On request, the read also gives the leverage `z̃ᵀ A⁻¹ z̃`, with `z̃ = z_q − z̄`, and the window's residual sum of squares per outcome: `M_yy − β M_yzᵀ − β Λ βᵀ`, clamped at 0.
+
+**Refusal.** The solve refuses a window whose `A` lies within rounding of a singular matrix. Let `D = diag(A)` and `S = D^(−1/2) A D^(−1/2)`. The solve accepts only if
+
+```
+λ_min(S) > τ,   τ = 4p(h + p + 2)ε · (1 + 2(L + 1)·r),
+```
+
+where:
+- `ε = 2⁻⁵²`;
+- `L` is the depth of the merge tree behind the statistics;
+- `h = longest scan + 3 + 3L`;
+- `r = maxⱼ √((M_jj + n z̄ⱼ²) / D_jj)` compares each coordinate's raw size with its scaled diagonal.
+
+The derivation is first order in ε:
+- **Scans.** A scan of b entries errs by at most about `(b + 3)ε √(M_jj M_kk)`.
+- **Merges.** Each merge adds two roundings. The nodes at one depth are disjoint, so their errors add up to at most `3ε √(M_jj M_kk)` per depth, by Cauchy–Schwarz.
+- **Rounded means.** The means of the merged nodes err relative to their values, not their spread. Through `δ δᵀ` this costs `2Lhε(rⱼ + rₖ)` after scaling. This is the only term where a large mean enters, and it enters linearly in r. The raw Gram matrix pays r².
+- **Spectrum.** The error of `S` is bounded in the Frobenius norm. A factor of 4 and one extra depth cover the scaling and the eigenvalue solver. By Weyl's inequality, a design that is exactly singular then has a computed `λ_min(S) ≤ τ`, and it is refused.
+
+This is a bound with conservative constants, not a proof. Property tests check it against an independent singular value decomposition, on designs that are exactly singular (duplicated rows, affine and constant columns, n ≤ p), including designs shifted by 10⁶.
+
+### 3.3 Batch readouts
+
+Two methods of `olsprime_rs.Matrix` serve the readouts of iteration 3. Each takes M queries `z_q` with their decision times `as_of` in milliseconds.
+- **`ridge_batch`** reads every query under W windows and R penalties. A window holds the entries with `as_of − w < time ≤ as_of`; "all history" holds every entry with `time ≤ as_of`. It returns the forecasts (M × W × R × q), the window counts (M × W), a status per cell (M × W × R), and on request the leverage and the residual sums of squares.
+- **`kernel_batch`** gives the exact kernel readouts of H3 over one window, with distances on `u = z / σ`:
+  - softmax (Nadaraya-Watson): `Σ wᵢ yᵢ / Σ wᵢ`, `wᵢ = exp(−(dᵢ − d_min) / (2τ²))`, one per width τ;
+  - k nearest neighbours: the mean y of the k nearest entries, ties going to the lowest entry index, one per k.
+
+  Every entry of the window gets its exact distance. Nothing is sampled or approximated.
+
+**Statuses.** A cell that is not ok holds NaN in every output. Bad inputs raise an error instead.
+
+| Code | Name | Meaning |
+|---|---|---|
+| 0 | `STATUS_OK` | a number |
+| 1 | `STATUS_EMPTY` | the window holds no entry |
+| 2 | `STATUS_SINGULAR` | the solve refused the window (§3.2) |
+| 3 | `STATUS_NON_FINITE` | an intermediate or the result overflowed |
+| 4 | `STATUS_TOO_FEW` | k is larger than the window |
+
+**Bit identity.** Each cell is computed by one thread, with fixed sequential code. Threads only decide which cells they take, and nothing is summed across threads. Tested guarantees:
+- every `ridge_batch` cell has the bits of the one-by-one read `centred_query`;
+- both batches give the same bits whatever the thread count, the order of the queries, and the entries pushed later;
+- the kernel sums run in an order fixed by the entry indices, and the exponential is computed in the crate rather than by the platform's math library. So the portable build and an AVX2 build give the same bits. A hash of the outputs matched at 10⁴ queries.
+
+The bindings follow the crate's rules:
+- dtypes are checked before any value is read;
+- every output and every internal buffer is sized against `MAX_ALLOC_BYTES` before anything is allocated;
+- an `as_of` in microseconds is refused;
+- Python's global interpreter lock is released during the computation.
+
+**Speed.** The benchmark is `cargo run --release -p ols-core --example matrix_bench`. It ran on a Ryzen 5 3600 (6 cores, 12 threads), with 12 worker threads, 2 million entries, p = 15 and q = 4, in the portable build, which is the build we keep.
+
+| Step | Time |
+|---|---|
+| push 2 million entries | 0.64 s |
+| `ridge_batch`, per 10⁵ queries × 3 windows × 6 penalties, leverage and residuals included | 0.19 s |
+| `kernel_batch`, per 10⁴ queries at 262,800 candidates, 3 widths and 3 values of k | 7.55 s |
+| all readouts for 2 million queries, extrapolated | about 25 minutes |
+
+Two stray processes kept two of the 12 hardware threads busy during these runs. The times are therefore pessimistic, and they vary from run to run.
+
+**Not verified.**
+- **Shift tolerance.** The shift-invariance tests use a loose tolerance: 10⁴·10⁶·ε in Rust, 10⁻⁷ in Python. The actual worst case was not measured.
+- **The lock test.** The test that the global interpreter lock is released was not checked against a build that holds the lock.
+- **Footprints.** The memory bounds that the bindings check are derived from the code. Nothing measures the actual allocations.
 
 ## 4. Encoder (phase 3)
 
@@ -182,3 +268,7 @@ Two timescales follow: Matrix and the readout weights at every bar, gradient-fre
   - §3 says that the raw entries stay in the log. Unlike OptMem's, Matrix's tree compacts nothing away.
   - §4 states the row sum under `λI` exactly: `1 − λ·e₀ᵀ(KᵀK + λI)⁻¹q`.
   - §7 limits the closed form for GCV to `Λ = λI`, or to centred statistics.
+- 2026-10-29: iteration 3 builds the centred core.
+  - §3.1: centred nodes now exist. They sit beside the raw tree, which keeps every raw read's bits.
+  - §3.2: the centred ridge with a free intercept and its refusal bound.
+  - §3.3: the batch readouts, their statuses and their measured speed.

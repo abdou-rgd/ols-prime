@@ -16,10 +16,15 @@ each value's order of magnitude, never from the date, and ``open_time`` and
 ``close_time`` are stored as milliseconds since the epoch, UTC.
 
 The Parquet file of a (symbol, interval) pair is rebuilt from every verified archive
-in the cache, so a narrower run never truncates it. Usage::
+of a month before the vault in the cache, so a narrower run never truncates it.
+
+Months at or after ``VAULT.start`` (``docs/PROTOCOL.md``, "Splits") are not downloaded
+here and never enter a Parquet file built here: they live in the vault tree outside
+``data/`` (``python -m olsprime.vault``). The final evaluation will fetch them through the
+vault module, a later step. Usage::
 
     uv run python -m olsprime.data.binance_vision --symbols BTCUSDT ETHUSDT \\
-        --intervals 1h 1d --start 2017-08 --end 2026-09
+        --intervals 1h 1d --start 2017-08 --end 2025-12
 """
 
 from __future__ import annotations
@@ -109,6 +114,34 @@ class Month:
         return f"{self.year:04d}-{self.month:02d}"
 
 
+class VaultMonthRefused(ValueError):
+    """A download or a rebuild was asked for a month at or after ``VAULT.start``."""
+
+
+def vault_first_month() -> Month:
+    """The first vault month (2026-01), read from ``olsprime.protocol.VAULT``.
+
+    Imported at the call: ``olsprime.protocol`` imports this module.
+    """
+    from olsprime.protocol import VAULT
+
+    return Month.of(VAULT.start)
+
+
+def is_vault_month(month: Month) -> bool:
+    return month >= vault_first_month()
+
+
+def vault_refusal(what: str, months: Iterable[Month]) -> str:
+    """The message of a refusal: which months, and where they are fetched instead."""
+    first = vault_first_month()
+    named = month_spans([m for m in months if m >= first])
+    return (
+        f"{what}: {named} belong to the vault (months from {first}, docs/PROTOCOL.md). They are not downloaded here; "
+        "the final evaluation will fetch them through olsprime.vault, a later step that is not built yet."
+    )
+
+
 def month_range(start: Month, end: Month) -> list[Month]:
     """Months from ``start`` to ``end``, both included."""
     months = []
@@ -142,6 +175,20 @@ def archive_relpath(symbol: str, interval: str, month: Month) -> str:
 def cached_archives(raw_dir: Path, symbol: str, interval: str) -> list[Path]:
     """Archives of a pair present in the cache, oldest first, verified or not."""
     return sorted((raw_dir / KLINES_PREFIX / symbol / interval).glob(f"{symbol}-{interval}-*.zip"))
+
+
+_ARCHIVE_NAME = re.compile(r"^(?P<symbol>[A-Z0-9]+)-(?P<interval>[0-9]+[smhdwM])-(?P<month>\d{4}-\d{2})\.zip$")
+
+
+def archive_name_parts(name: str) -> tuple[str, str, Month] | None:
+    """``(symbol, interval, month)`` read from an archive's file name, or ``None`` if it is not one."""
+    match = _ARCHIVE_NAME.match(name)
+    if match is None:
+        return None
+    try:
+        return match["symbol"], match["interval"], Month.parse(match["month"])
+    except ValueError:  # a month like 2026-13
+        return None
 
 
 def parquet_path(parquet_dir: Path, symbol: str, interval: str) -> Path:
@@ -287,7 +334,12 @@ def download_month(
     raw_dir: Path,
     force: bool = False,
 ) -> MonthResult:
-    """Fetch one monthly archive into the cache, unless a verified copy is already there."""
+    """Fetch one monthly archive into the cache, unless a verified copy is already there.
+
+    A month at or after ``VAULT.start`` raises :class:`VaultMonthRefused`, before any request.
+    """
+    if is_vault_month(month):
+        raise VaultMonthRefused(vault_refusal(f"{symbol} {interval}", [month]))
     relpath = archive_relpath(symbol, interval, month)
     zip_path = raw_dir / relpath
     if not force and is_verified(zip_path):
@@ -313,8 +365,14 @@ def download_archives(
     workers: int = 8,
     force: bool = False,
 ) -> list[MonthResult]:
-    """Fetch (symbol, interval, month) archives concurrently; results keep the task order."""
+    """Fetch (symbol, interval, month) archives concurrently; results keep the task order.
+
+    Raises :class:`VaultMonthRefused` before any request if one task names a vault month.
+    """
     tasks = list(tasks)
+    vault_months = [month for _, _, month in tasks if is_vault_month(month)]
+    if vault_months:
+        raise VaultMonthRefused(vault_refusal("download", vault_months))
     owned = client is None
     client = client or make_client(workers)
     try:
@@ -418,9 +476,10 @@ def read_klines_zip(path: Path, symbol: str) -> pl.DataFrame:
 
 
 def build_parquet(symbol: str, interval: str, *, raw_dir: Path, parquet_dir: Path) -> QualityReport | None:
-    """Rebuild a pair's Parquet file from every verified archive in the cache.
+    """Rebuild a pair's Parquet file from every verified archive of a month before the vault in the cache.
 
-    The quality report is computed on the raw concatenation (archive order, then file
+    An archive of a vault month (read from its file name) is left out, with a warning that names it,
+    whether it is verified or not: the vault rows do not enter a table built here. The quality report is computed on the raw concatenation (archive order, then file
     order), so duplicates and ordering problems stay visible; the stored series is
     then sorted by ``open_time``, keeping the first row of each open time. The report
     is saved beside the Parquet file as ``{SYMBOL}.quality.json``. Returns ``None``
@@ -428,7 +487,14 @@ def build_parquet(symbol: str, interval: str, *, raw_dir: Path, parquet_dir: Pat
     """
     archives = []
     for path in cached_archives(raw_dir, symbol, interval):
-        if is_verified(path):
+        parts = archive_name_parts(path.name)
+        if parts is None or is_vault_month(parts[2]):
+            log.warning(
+                "%s: %s, left out of the Parquet file",
+                path.name,
+                "not an archive name" if parts is None else f"vault month {parts[2]}",
+            )
+        elif is_verified(path):
             archives.append(path)
         else:
             log.warning("%s: not verified, left out of the Parquet file", path.name)
@@ -462,7 +528,12 @@ def run(
     workers: int = 8,
     force: bool = False,
 ) -> tuple[list[MonthResult], dict[tuple[str, str], QualityReport | None]]:
-    """Download the archives of ``start..end``, then rebuild each pair's Parquet file."""
+    """Download the archives of ``start..end``, then rebuild each pair's Parquet file.
+
+    Raises :class:`VaultMonthRefused` before any request if ``end`` is in the vault.
+    """
+    if is_vault_month(end):
+        raise VaultMonthRefused(vault_refusal("download", month_range(max(start, vault_first_month()), end)))
     raw_dir, parquet_dir = data_dir / "raw", data_dir / "parquet"
     results = download_klines(
         symbols,
@@ -516,14 +587,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--end",
         type=month_arg,
-        default=last_complete_month(),
-        help="last month, YYYY-MM (default: the last complete month)",
+        default=min(last_complete_month(), vault_first_month().shift(-1)),
+        help="last month, YYYY-MM (default: the last complete month, at most the month before the vault)",
     )
     parser.add_argument("--data-dir", type=Path, default=data_dir(), help="data root (default: %(default)s)")
     parser.add_argument("--workers", type=int, default=8, help="concurrent downloads (default: 8)")
     parser.add_argument("--force", action="store_true", help="download again even when the cache is verified")
     args = parser.parse_args(argv)
     configure_logging()
+    if is_vault_month(args.end):
+        parser.error(vault_refusal("--end", month_range(max(args.start, vault_first_month()), args.end)))
 
     results, reports = run(
         args.symbols,

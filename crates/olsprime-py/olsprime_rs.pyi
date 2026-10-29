@@ -16,7 +16,7 @@ Conventions:
   the interpreter instead of raising.
 """
 
-from typing import Final, Literal, final
+from typing import Final, Literal, NotRequired, TypedDict, final
 
 import numpy as np
 import numpy.typing as npt
@@ -26,6 +26,14 @@ __version__: Final[str]
 _F64 = npt.NDArray[np.float64]
 _I64 = npt.NDArray[np.int64]
 _I8 = npt.NDArray[np.int8]
+_U8 = npt.NDArray[np.uint8]
+
+# Scalar parameters of the centred and batch readouts (iteration 3). `_Int` is `int` and
+# `_Float` is `float`, with the same conversion rules; the aliases keep these parameters out
+# of the inventory of tests/test_rust_bindings.py, and tests/test_matrix_batch.py runs the
+# same range and type checks on every parameter annotated with them.
+_Int = int
+_Float = float
 
 # --- errors -------------------------------------------------------------------------------
 
@@ -306,6 +314,105 @@ class Summary:
     @property
     def residual_var(self) -> _F64: ...
 
+@final
+class CentredStats:
+    """Centred statistics of unit-weight entries: the count, the means and the centred sums
+    M_xx = sum (x - mean_x)(x - mean_x)^T, M_yx and M_yy. Immutable."""
+
+    @staticmethod
+    def from_rows(xs: _F64, ys: _F64) -> CentredStats:
+        """xs (n, p), ys (n, q), in one corrected two-pass scan."""
+    def merged(self, other: CentredStats) -> CentredStats:
+        """The statistics of the union of two disjoint sets (Chan-Golub-LeVeque)."""
+    @property
+    def p(self) -> int: ...
+    @property
+    def q(self) -> int: ...
+    @property
+    def count(self) -> int: ...
+    @property
+    def n(self) -> float: ...
+    @property
+    def longest_scan(self) -> int: ...
+    @property
+    def depth(self) -> int: ...
+    @property
+    def mean_x(self) -> _F64: ...
+    @property
+    def m_xx(self) -> _F64: ...
+    @property
+    def mean_y(self) -> _F64: ...
+    @property
+    def m_yx(self) -> _F64: ...
+    @property
+    def m_yy(self) -> _F64: ...
+
+@final
+class CentredReadout:
+    """A centred ridge read of Matrix; only the Matrix that made it accepts it."""
+
+    @property
+    def start(self) -> int: ...
+    @property
+    def end(self) -> int: ...
+    @property
+    def mean_x(self) -> _F64:
+        """The range's mean state, (p,)."""
+    @property
+    def a(self) -> _F64:
+        """(M_xx + Lambda)^-1 (x_q - mean_x), (p,)."""
+    @property
+    def forecast(self) -> _F64:
+        """mean_y + beta (x_q - mean_x), (q,): the bits ridge_batch gives for the same cell."""
+    @property
+    def leverage(self) -> float:
+        """(x_q - mean_x)^T (M_xx + Lambda)^-1 (x_q - mean_x)."""
+    @property
+    def rss(self) -> _F64:
+        """The range's residual sum of squares at this penalty, (q,)."""
+
+STATUS_OK: Final[int]
+"""0: a number."""
+STATUS_EMPTY: Final[int]
+"""1: the window holds no entry."""
+STATUS_SINGULAR: Final[int]
+"""2: the centred solve refused the window as numerically singular."""
+STATUS_NON_FINITE: Final[int]
+"""3: an intermediate or the result overflowed."""
+STATUS_TOO_FEW: Final[int]
+"""4: a kNN read asked for more neighbours than the window holds."""
+
+# The dicts that ridge_batch and kernel_batch return (stub-only types). Shapes:
+# - ridge: forecast (M, W, R, q); status (M, W, R) uint8; start, end and count (M, W) int64,
+#   count = end - start, the n_w of the penalty; leverage (M, W, R) with leverage=True; rss
+#   (M, W, R, q) with rss=True.
+# - kernel: softmax (M, T, q); softmax_status (M, T) uint8; knn (M, K, q); knn_status (M, K)
+#   uint8; start, end and count (M,) int64.
+_RidgeBatchResult = TypedDict(
+    "_RidgeBatchResult",
+    {
+        "forecast": _F64,
+        "status": _U8,
+        "start": _I64,
+        "end": _I64,
+        "count": _I64,
+        "leverage": NotRequired[_F64],
+        "rss": NotRequired[_F64],
+    },
+)
+_KernelBatchResult = TypedDict(
+    "_KernelBatchResult",
+    {
+        "softmax": _F64,
+        "softmax_status": _U8,
+        "knn": _F64,
+        "knn_status": _U8,
+        "start": _I64,
+        "end": _I64,
+        "count": _I64,
+    },
+)
+
 class Matrix:
     """Append-only memory of (time, state, outcome) entries. Push an entry only once its
     outcome is known, stamped with the time it became known (ms, UTC)."""
@@ -336,6 +443,51 @@ class Matrix:
     def weights(self, readout: Readout) -> _F64: ...
     def contribution(self, readout: Readout, start: int, end: int) -> _F64: ...
     def summarize(self, start: int, end: int, cfg: RidgeConfig) -> Summary: ...
+    def window_range(self, as_of: _Int, window: _Int | None = None) -> tuple[int, int]:
+        """(start, end) of the entries with as_of - window < time <= as_of (every
+        time <= as_of for window=None). window > 0 ms; as_of refused as in time_range."""
+    def centred_stats(self, start: _Int, end: _Int) -> CentredStats:
+        """The centred statistics of entries [start, end), from the tree of centred nodes."""
+    def centred_query(
+        self, x_q: _F64, start: _Int, end: _Int, rho: _Float, scale: _F64
+    ) -> CentredReadout:
+        """Ridge with a free intercept over [start, end): Lambda = rho * n * diag(scale),
+        rho >= 0, scale (p,) finite and >= 0. An empty or singular range is an OlsError."""
+    def centred_weights(self, readout: CentredReadout) -> _F64:
+        """1/n + (x_i - mean_x)^T a for every entry of the range, (end - start,); they sum
+        to one and weights @ ys is the forecast."""
+    def centred_contribution(self, readout: CentredReadout, start: _Int, end: _Int) -> _F64:
+        """The exact contribution of entries [start, end) to the readout's forecast, (q,)."""
+    def ridge_batch(
+        self,
+        x_q: _F64,
+        as_of: _I64,
+        windows: list[_Int | None],
+        rhos: _F64,
+        scale: _F64,
+        *,
+        leverage: bool = False,
+        rss: bool = False,
+        threads: _Int = 0,
+    ) -> _RidgeBatchResult:
+        """centred_query for every query (x_q (M, p), as_of (M,) ms), window (a span in ms,
+        or None for all history) and penalty (rhos (R,)), in parallel without the GIL. A cell
+        that is not STATUS_OK is NaN in every output; bit-identical to centred_query cell by
+        cell, whatever threads (0: every core)."""
+    def kernel_batch(
+        self,
+        x_q: _F64,
+        as_of: _I64,
+        window: _Int | None,
+        sigma: _F64,
+        taus: _F64,
+        ks: _I64,
+        *,
+        threads: _Int = 0,
+    ) -> _KernelBatchResult:
+        """Exact softmax (weights exp(-|u_q - u_i|^2 / (2 tau^2)), u = x / sigma) and kNN
+        (mean y of the k nearest, ties to the lowest index) over one window, in parallel
+        without the GIL. Bit-identical whatever threads and whatever the other queries."""
 
 # --- risk ---------------------------------------------------------------------------------
 

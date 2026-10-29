@@ -11,7 +11,11 @@ Keys are paths relative to ``python/``, exact and never patterns. A rule is a na
 - ``reader``: Parquet, IPC, Feather and Delta entry points of polars, pyarrow, pandas;
 - ``raw-reader``: CSV, JSON and zip readers (the downloaded archives);
 - ``binary-load``: ``numpy.load(allow_pickle=True)``;
-- ``import:pickle``: ``pickle.load``, ``pickle.loads`` and ``torch.load`` (which unpickles).
+- ``import:pickle``: ``pickle.load``, ``pickle.loads`` and ``torch.load`` (which unpickles);
+- ``vault-tree``: the names and strings that find the vault tree of the physical seal (the function that
+  returns its root, the two variables that name its folder and its identity, the default folder, the
+  identity reader; the list is ``VAULT_TREE_NAMES`` and ``VAULT_TREE_STRINGS`` in ``test_protocol.py``).
+  Static only: the tripwire judges the paths instead (``tests/tripwire.py``).
 """
 
 from collections.abc import Mapping
@@ -22,6 +26,13 @@ _RULES: dict[str, dict[str, str]] = {
         "reader": "the one reader of stored klines and universe tables, always followed by seal",
         "seal": "defines and calls the seal",
         "import:pyarrow": "stored_row_count reads the row count from the Parquet metadata, no row",
+        "vault-tree": "with both keys, finds the vault tree and decrypts its files in memory with the named identity",
+    },
+    "olsprime/vault.py": {
+        "vault-tree": "the vault tool: plans, moves, encrypts and reports the vault tree; it reads no row",
+    },
+    "olsprime/paths.py": {
+        "vault-tree": "defines the vault root and the variable that overrides it",
     },
     "olsprime/data/binance_vision.py": {
         "raw-reader": "parses the downloaded archives into the stored schema",
@@ -34,13 +45,19 @@ _RULES: dict[str, dict[str, str]] = {
     "tests/conftest.py": {
         "seal-patch": "seals the vault for every test: it unsets the key variable and moves the key folder and the data root",
         "disarm": "installs the tripwire, checks it at each teardown and takes it down at the end of the session",
+        "vault-tree": "gives every test an empty vault root of its own and no identity",
     },
     "tests/test_manifest.py": {"seal-patch": "opens the vault in a fake tree to show that the manifest counts and logs it"},
+    "tests/test_vault.py": {
+        "seal-patch": "forges both keys in a fake tree to show that the open path needs both keys and, at stage 2, the identity",
+        "vault-tree": "builds fake vault trees and points the vault root and the identity at them",
+    },
     "tests/test_binance_vision.py": {"reader": "reads back the Parquet file the build just wrote"},
     "tests/test_universe.py": {"reader": "reads back the universe file the run just wrote"},
     "tests/test_protocol.py": {
         "reader": "shows that the stored file keeps the vault rows",
         "seal": "tests the seal itself",
+        "vault-tree": "its cheater snippets name the vault tree",
         "disarm": "reads the allow-list and checks that the guard names and the tripwire's agree",
     },
     "tests/tripwire.py": {
@@ -48,6 +65,7 @@ _RULES: dict[str, dict[str, str]] = {
         "import:pyarrow": "patches pyarrow's Parquet, dataset, IPC and Feather entry points",
         "import:importlib": "finds and imports the optional libraries (pandas, torch) when installed",
         "disarm": "reads the allow-list it enforces, and unwraps classmethod and staticmethod entry points to wrap them",
+        "vault-tree": "computes the vault roots that the readers are judged against",
     },
     "tests/test_tripwire.py": {
         "exec": "executes a string to show that the tripwire sees code built at run time",

@@ -17,24 +17,42 @@ from olsprime.models.baselines import (
     honest_baselines,
 )
 from olsprime.models.decision import FEE_SCHEDULES, apply_long_flat, long_flat, round_trip_cost
+from olsprime.models.matrix import (
+    ARMS,
+    CUSUM_THRESHOLD,
+    ArmsResult,
+    MatrixConfig,
+    MatrixSystem,
+    Scope,
+    cusum_threshold,
+    run_arms,
+)
 
 __all__ = [
+    "ARMS",
     "BASELINE_NAMES",
+    "CUSUM_THRESHOLD",
     "FEE_SCHEDULES",
     "PREDICTION_SCHEMA",
+    "ArmsResult",
     "Baseline",
     "Cheater",
     "Climatology",
     "LabelLeak",
     "MaMomentum",
+    "MatrixConfig",
+    "MatrixSystem",
     "RandomTurnover",
     "Ridge",
+    "Scope",
     "XGBoost",
     "apply_long_flat",
     "buy_and_hold",
+    "cusum_threshold",
     "describe",
     "flat",
     "honest_baselines",
     "long_flat",
     "round_trip_cost",
+    "run_arms",
 ]

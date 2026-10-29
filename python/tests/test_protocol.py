@@ -14,6 +14,7 @@ from olsprime import protocol, universe
 from olsprime.data import quality
 from olsprime.data.binance_vision import (
     Month,
+    archive_relpath,
     build_parquet,
     cached_archives,
     download_klines,
@@ -277,20 +278,30 @@ def test_known_at_is_never_before_the_bar_is_final(tmp_path):
     assert (loaded["known_at"] >= loaded["open_time"] + timedelta(hours=1, milliseconds=-1)).all()
 
 
-def test_build_parquet_still_stores_and_reports_every_row(tmp_path):
+def test_build_parquet_leaves_the_vault_months_out_and_says_so(tmp_path, caplog):
+    # The downloader refuses a vault month, so the January archive is put in the cache by hand (as a
+    # store from before the physical seal has it).
     bucket = FakeBucket()
-    months = [Month(2025, 12), Month(2026, 1)]
-    for month in months:
+    dec, jan = Month(2025, 12), Month(2026, 1)
+    for month in (dec, jan):
         bucket.add_month("BTCUSDT", "1d", month, month_rows(month, DAY_MS))
     with bucket.client() as client:
-        download_klines(["BTCUSDT"], ["1d"], months, raw_dir=tmp_path / "raw", client=client)
+        download_klines(["BTCUSDT"], ["1d"], [dec], raw_dir=tmp_path / "raw", client=client)
+    jan_zip = tmp_path / "raw" / archive_relpath("BTCUSDT", "1d", jan)
+    jan_zip.parent.mkdir(parents=True, exist_ok=True)
+    key = "data/" + archive_relpath("BTCUSDT", "1d", jan)
+    jan_zip.write_bytes(bucket.objects[key])
+    jan_zip.with_name(jan_zip.name + ".CHECKSUM").write_bytes(bucket.objects[key + ".CHECKSUM"])
     assert len(cached_archives(tmp_path / "raw", "BTCUSDT", "1d")) == 2
-    report = build_parquet("BTCUSDT", "1d", raw_dir=tmp_path / "raw", parquet_dir=tmp_path / "parquet")
-    assert report.rows == 31 + 31 and report.is_clean
+    with caplog.at_level("WARNING"):
+        report = build_parquet("BTCUSDT", "1d", raw_dir=tmp_path / "raw", parquet_dir=tmp_path / "parquet")
+    assert any("BTCUSDT-1d-2026-01.zip" in r.getMessage() and "vault" in r.getMessage() for r in caplog.records)
+    assert report.rows == 31 and report.is_clean
     path = parquet_path(tmp_path / "parquet", "BTCUSDT", "1d")
-    assert json.loads(path.with_name("BTCUSDT.quality.json").read_text())["rows"] == 62
-    assert pl.read_parquet(path).height == 62  # the file keeps the vault rows
-    assert load_klines("BTCUSDT", "1d", data_dir=tmp_path).height == 31  # the sealed read does not
+    assert json.loads(path.with_name("BTCUSDT.quality.json").read_text())["rows"] == 31
+    assert protocol.stored_row_count(path) == 31  # no vault row in the table
+    assert pl.read_parquet(path)["open_time"].max() < VAULT.start  # the file itself, unsealed, holds none either
+    assert load_klines("BTCUSDT", "1d", data_dir=tmp_path).height == 31
 
 
 # --- Readers ------------------------------------------------------------------------
@@ -388,13 +399,16 @@ READERS = frozenset(
         "read_parquet", "scan_parquet", "read_table", "ParquetFile", "read_ipc", "scan_ipc", "read_ipc_stream",
         "read_delta", "scan_delta", "read_database", "scan_pyarrow_dataset", "from_pandas", "from_arrow",
         "deserialize",
+        # added in iteration 3: wrapped by the tripwire, missing here until the vault-tree work compared the two lists
+        "read_database_uri", "read_ipc_schema", "read_parquet_metadata", "read_parquet_schema", "scan_arrow_c_stream",
+        "scan_external_reader", "scan_iceberg", "scan_lance",
     }
 )  # fmt: skip
 # Names that read raw text or archives (the downloaded cache).
 RAW_READERS = frozenset(
     {
         "read_csv", "scan_csv", "read_csv_batched", "read_klines_zip", "ZipFile", "genfromtxt", "loadtxt",
-        "read_json", "read_ndjson", "scan_ndjson", "read_avro", "read_excel",
+        "read_json", "read_ndjson", "scan_ndjson", "read_avro", "read_excel", "read_lines", "scan_lines", "read_ods",
     }
 )
 # Names that load code or attributes by string, which no name filter can follow.
@@ -423,7 +437,7 @@ DISARM_ATTRIBUTES = frozenset(
 )  # fmt: skip
 # Test files that hold the seal allowances. A helper imported from one of them puts that file on the stack of
 # the call, and the loaders' exemption for files that may open a fake vault would cover the caller too.
-EXEMPT_TESTS = frozenset({"test_tripwire", "test_protocol", "test_manifest"})
+EXEMPT_TESTS = frozenset({"test_tripwire", "test_protocol", "test_manifest", "test_vault"})
 # What other tests may take from them: data builders and readers of a log, nothing that runs a loader.
 SAFE_TEST_HELPERS = frozenset({"bars", "store", "utc", "access_lines", "open_vault"})  # open_vault: a seal-patch of its own
 GUARD_MODULES = frozenset({"conftest", "tripwire", "allowlist"})  # tests/conftest.py, tests/tripwire.py, tests/allowlist.py
@@ -431,6 +445,15 @@ GUARD_MODULES = frozenset({"conftest", "tripwire", "allowlist"})  # tests/confte
 # (protocol), and the variable's name as a string, spelled out or built by concatenation.
 VAULT_KEY_NAMES = frozenset({"open_vault", "vault_key_file", "OPEN_ENV"})
 VAULT_KEY_STRING = "OLSPRIME_OPEN_VAULT"
+# The vault tree of the physical seal (iteration 3), outside data/. Only olsprime/vault.py and olsprime/protocol.py
+# reach it (plus the files that define, isolate or judge it, by the allow-list): the names that find its root, its files
+# and its identity, and the strings that spell the two variables and the default folder.
+VAULT_TREE_NAMES = frozenset(
+    {"vault_dir", "default_vault_dir", "VAULT_DIR_ENV", "IDENTITY_ENV", "vault_tree_klines_path", "read_identity", "decrypt_vault_bytes"}
+)
+# "OLSPRIME_VAULT_" is the prefix of both variables: it also catches an f-string or a concatenation that spells the
+# rest from a variable (f"OLSPRIME_VAULT_{name}"), where only the first fragment is a literal.
+VAULT_TREE_STRINGS = ("OLSPRIME_VAULT_", "ols-prime-vault")
 # Code run from a string: the bare builtins only, since ``re.compile`` and ``expr.list.eval`` are ordinary
 # (olsprime/universe.py compiles a regular expression). ``builtins.eval`` is caught through MODULE_ATTRIBUTES.
 EXEC_BUILTINS = frozenset({"eval", "exec", "compile"})
@@ -715,6 +738,8 @@ def _extra_findings(tree: ast.AST, add) -> None:
             text = _text(node)
             if text is not None and VAULT_KEY_STRING in text:
                 add("seal-patch", node, f"the name {VAULT_KEY_STRING} forges a key of the vault")
+            if text is not None and any(spelled in text for spelled in VAULT_TREE_STRINGS):
+                add("vault-tree", node, "the text names the vault tree, its folder or its identity variable")
 
 
 def notebook_code(text: str) -> tuple[str, list[str]]:
@@ -787,6 +812,8 @@ def findings(source: str, filename: str) -> list[tuple[str, str]]:
                 add("dynamic", node, name)
             elif name == SEAL:
                 add("seal", node, name)
+            elif name in VAULT_TREE_NAMES:
+                add("vault-tree", node, f"{name} reaches the vault tree")
         # Relative imports (``from .binance_vision import ...``) are skipped on purpose: they can only name
         # a module inside the package, and every module that reads data is already named in ALLOWED or
         # flagged by its own file. Today ``olsprime/data/binance_vision.py`` is the only data-reading
@@ -1114,7 +1141,24 @@ CHEATERS += [
     ("s4-builtins-import", "zf = __builtins__['__import__']('zip' + 'file')", {"dynamic"}),
 ]
 
+CHEATERS += [
+    ("v1-vault_dir", "from olsprime.paths import vault_dir\nroot = vault_dir()", {"vault-tree"}),
+    ("v1a-vault_dir-through-paths", "from olsprime import paths\nroot = paths.vault_dir() / 'parquet'", {"vault-tree"}),
+    ("v1b-the-variable-by-name", "import os\nroot = os.environ['OLSPRIME_VAULT_DIR']", {"vault-tree"}),
+    ("v1c-the-variable-concatenated", "import os\nroot = os.environ['OLSPRIME_VAULT_' + 'DIR']", {"vault-tree"}),
+    ("v1d-the-identity-variable", "import os\nkey = os.environ.get('OLSPRIME_VAULT_IDENTITY')", {"vault-tree"}),
+    ("v1e-the-default-folder", "from pathlib import Path\nroot = Path.home() / 'ols-prime-vault'", {"vault-tree"}),
+    ("v1f-the-tree-file-of-a-pair", "from olsprime.protocol import vault_tree_klines_path\nvault_tree_klines_path('BTCUSDT', '1d')", {"vault-tree"}),
+    ("v1g-decrypt-by-hand", "from olsprime.protocol import decrypt_vault_bytes\ndecrypt_vault_bytes(blob, what='x')", {"vault-tree"}),
+    ("v1h-the-identity-reader", "from olsprime import protocol\nprotocol.read_identity(path)", {"vault-tree"}),
+    ("v1i-the-variable-in-an-fstring", "import os\nos.environ[f'OLSPRIME_VAULT_{name}']", {"vault-tree"}),
+    ("v2-read_parquet_schema", "import polars as pl\npl.read_parquet_schema('x')", {"reader"}),
+    ("v2a-read_parquet_metadata", "import polars as pl\npl.read_parquet_metadata('x')", {"reader"}),
+    ("v2b-scan_lines", "import polars as pl\npl.scan_lines('x')", {"raw-reader"}),
+]
+
 CONTROLS += [
+    ("the-vault-module-by-name", "from olsprime import vault\nvault.status(data_root, vault_root)\nvault.plan_text(1)"),
     ("getattr-called-on-own-object", "value = getattr(config, 'name', None)\nvars(config)"),
     ("data-module-used-by-name", "from olsprime.data import survey\nsurvey.run(path)"),
     ("tests-helpers", "from tests.fakes import klines_csv\nfrom tests.test_protocol import bars"),

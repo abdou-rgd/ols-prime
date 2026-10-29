@@ -159,7 +159,41 @@ Remaining limits, stated plainly:
 - **No test needs the real store, and CI is the evidence.** GitHub Actions runs the whole suite (`uv run --locked pytest`, `.github/workflows/ci.yml`) on runners that have no `data/` at all. No test skips or branches on whether real data exist: the only skips in `python/tests` are `test_decision.py` (a Rust source file), `test_stats.py` (the slow flag) and a symbolic-link check in `test_tripwire.py`, and none tests a `.exists()` on a data path.
 - A reader captured before `conftest.py` is loaded (by a plugin, say) is not wrapped.
 - `pandas`, `torch` and `duckdb` are not installed in this environment, so those wrappers are untested against the real libraries.
-- The vault rows still sit in the same files as the rest, and in the quality reports of the two pairs that have them (see above). Keeping them in a separate tree, unreachable without both keys, is the planned physical seal (iteration 3).
+- Since stage 1 of the physical seal (below), no file under `data/` holds a vault row. The vault rows sit in the vault tree, in plaintext, guarded in-process only, until stage 2.
+
+**The physical seal (iteration 3).** The vault months leave `data/` in two stages, with `uv run python -m olsprime.vault {plan,move,encrypt,keygen,status}` (`python/olsprime/vault.py`).
+- **Stage 1, out of `data/`.** `move` works in two phases.
+  - First it rebuilds, into a staging folder (`data/parquet.vault-stage/`), every Parquet file that holds vault rows, from that pair's non-vault archives. Each rebuild is checked before any table is touched. Its sealed read must equal the old file's, frame for frame, schema included. Its stored row count must equal the old file's sealed count, so no vault row is left.
+  - Then the old file and its quality report are hard-linked into the vault tree, and the new file is renamed over the old path. The path therefore always holds the old file or the new one.
+  - The vault archives and their `.CHECKSUM` files are renamed into the tree once `is_verified` passes on each.
+  - Nothing is deleted. A journal makes the move resumable, and `MANIFEST.json` lists every file with its size, SHA-256 and original path.
+  - The journal pins the SHA-256 of every archive and of its `.CHECKSUM` file when the plan is made. `move` checks them all before it touches a table.
+  - A file held open by another process stops `move` with one refusal line. Nothing is lost, and running `move` again resumes.
+  - The vault tree is `$OLSPRIME_VAULT_DIR`, else `<parent of the repository>/ols-prime-vault`: outside the repository and on the same volume, so that renames and links work. A root inside the repository, nested with the data root or on another volume is refused.
+- **Stage 2, encrypted.** `encrypt --recipient age1…` writes each file of the tree to `<name>.age`, and records each ciphertext's SHA-256. It uses age X25519 through `pyrage` 1.4.0, which binds Rust's `age` crate.
+  - Plaintext goes only with `--remove-plaintext`, which is Abdou's to pass.
+  - The identity (`keygen --out`, on a medium taken away) must never be stored on this machine.
+  - `encrypt` cannot check that the recipient matches an identity Abdou holds. So stage 2 runs in three steps, after audit pass 1b:
+    1. `encrypt --recipient age1…` writes the `.age` files and keeps the plaintext.
+    2. `verify-decrypt`, with `OLSPRIME_VAULT_IDENTITY` naming the identity on its removable medium, decrypts every `.age` file in memory and compares each SHA-256 with the manifest. If all match, it writes a stamp into `MANIFEST.json`: the time, the count, the SHA-256 of the public recipient, and the ciphertext hash of each file it opened. The identity is never written or printed.
+    3. `encrypt --recipient age1… --remove-plaintext` removes plaintext only if the stamp exists, was made for that recipient, and covers the ciphertext of every file. A new `encrypt` voids the stamp, so `verify-decrypt` must run again after it.
+  - The stamp is part of the manifest's digest, so the manifest must never be edited by hand.
+- **Refusals.** `download_month`, the downloader's command and the archive downloads refuse a vault month (`VaultMonthRefused`) before any request. `build_parquet` leaves out every archive of a vault month, with a warning that names it. Fetching the vault months for the final evaluation will go through the vault module, a later step.
+- **Guards.**
+  - The runtime tripwire treats the vault root like the repository's `data/`. The static guard flags the names and strings that reach the vault tree (rule `vault-tree`) outside `vault.py`, `protocol.py`, `paths.py` and the test guards.
+  - Comparing the tripwire's targets with the static guard's lists found 11 polars readers the static guard did not flag, such as `read_parquet_metadata`, `scan_iceberg` and `read_lines`. They are flagged now.
+- **Limits, in plain words.**
+  - The vault months are public on data.binance.vision. The seal stops our own pipeline and our agents, not a person who downloads them.
+  - Until stage 2, the vault tree is plaintext, outside `data/`, and guarded only in-process.
+  - Until the identity leaves this machine, stage 2 is only as safe as that file.
+  - The tool reads no vault row, but the process that runs it sees file names, sizes and the Parquet footers' statistics. A table whose footer lacks statistics is not scanned for stray vault bars.
+- **Status, 2026-10-29: stage 1, moved, plaintext.**
+  - **Before the move.** `plan` found 36 archives (788 kB), only BTCUSDT and ETHUSDT, 1 h and 1 d, 2026-01 → 2026-09, all verified. It found 4 tables holding 13,650 vault rows, and no other table with a bar at or after 2026-01-01. `plan --verify` rebuilt the four tables in a temporary folder and found every sealed read identical.
+  - **The move.** It ran after audit pass 1b cleared it, on the audited code of commit `767e2c0`, with no other process reading `data/`. It renamed 72 files (the 36 archives and their `.CHECKSUM` files) and rebuilt 4 Parquet files, in 7 seconds.
+  - **The tree.** It holds 80 files, 8,981,586 bytes: the 72, plus the four old tables and their quality reports, hard-linked with their pre-move bytes and SHA-256. Its `MANIFEST.json` digest is `3c4dd451b89cb987e0af8d6cb51e6828b07069c95a0589a3410183363a25d01b`. Every archive's SHA-256 equals its `.CHECKSUM`, and the journal ends with every table swapped.
+  - **`data/`.** It holds 843 Parquet files with 9,964,021 stored rows, all of them sealed rows. Only the four rebuilt tables changed, in bytes, hash and stored rows (73,285 at 1 h and 3,059 at 1 d each). The data manifest's digest is now `7c5f2397f0e767d357f1a21390094d3743d89df5d90e54392e7b0a4b9cfc4447`.
+  - **The sealed view did not move.** The hourly panel keeps its fingerprint (`e64b39d8…`). Report n°1, re-run with `--check`, reproduces every number. Only its provenance lines differ: the commit, the code digest, the data manifest digest, and the hash and stored rows of the two daily tables it reads.
+  - No read opened the vault: `runs/vault/` does not exist.
 
 **Quirks to handle downstream.** The quality report (`{SYMBOL}.quality.json` beside each Parquet file) counts them.
 - **Timestamps.** From 2025-01-01, spot files use microseconds. The parser reads the unit from each value's magnitude and stores milliseconds UTC.
@@ -173,6 +207,18 @@ Remaining limits, stated plainly:
   So a bar's values count as final at `known_at = max(close_time, open_time + interval − 1 ms)`, which `load_klines` adds, and never at the stored `close_time` alone. The vault seal cuts on `known_at`, and any Matrix entry built from a bar must use it as its time.
 - **The last gap** in the 1 h series starts on 2023-03-24 at 13:00.
 - **Ticker reuse.** `LUNAUSDT` is the old LUNA until 2022-05-13 and the new LUNA from 2022-05-31. Cut every series at its gaps before computing returns. The survey above lists the likely cases among the members.
+
+**Hourly panel (iteration 3).** `uv run python -m olsprime.features.panel --summary` builds the panel that Matrix reads (`python/olsprime/features/panel.py`) in memory, and writes `runs/<UTC date>-panel/summary.json`. On 2026-10-29:
+- **Runtime.** 12 to 41 s, depending on the load of the machine, with peak memory near 2 GB. The command does not measure memory on Windows: `peak_rss_mb` is null there.
+- **Rows.** Rows exist only in the months when a pair is a member of the universe: 2,273 member months, 1,655,881 hourly rows from 2017-10 to 2024-12.
+- **Pairs.** 233 distinct pairs. The other 41 of the 274 members first join in 2025, so they have no row in the development period. Months have between 2 members (1,440 rows, 2017-11) and 30 (22,320 rows).
+- **The cut.** Bars come through `load_klines`, which keeps the vault out. They are then cut to `known_at < 2025-01-01` before features and labels, so a label that needs a 2025 bar is null. The validation year's bars are loaded into memory and dropped there: none reaches a feature, a label or a model.
+- **Labels.** 1,631,784 rows are labelled (24,097 have no exit bar), and 1,591,462 are complete (every feature and the label). The complete rows split into down 29.4 %, neutral 43.6 % and up 27.1 %.
+- **The sub-panel** of the panel's future-invariance test: BTCUSDT, ETHUSDT, BNBUSDT, XRPUSDT, ADAUSDT, LTCUSDT, TRXUSDT, LINKUSDT, MATICUSDT and DOGEUSDT.
+- **Months.** A row's month is the month of its bar's open, after audit pass 1a. Before, it was the month of the decision time, which a late close at a month's last hour would move into the next month. Rebuilt with the new rule, the panel has the same fingerprint: no member's bar closes late at a month's last hour.
+- **Fingerprint** (SHA-256 over every column): `e64b39d8784af6039dc4810a1247fd957af94a8fe76240563855c45ba0442508`.
+- **Files.** Nothing is cached in Parquet, so only `olsprime.protocol` opens a file.
+- **License.** The panel is derived from Binance Vision, so it keeps CC BY-NC-SA 4.0: non-commercial, never redistributed.
 
 ## 2. Reference parameters
 

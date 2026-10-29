@@ -43,4 +43,19 @@ pub enum OlsError {
     /// A shape parameter is out of its domain.
     #[error("invalid shape: {0}")]
     InvalidShape(&'static str),
+    /// A per-coordinate ridge scale `sⱼ` must be finite and non-negative.
+    #[error("invalid scale {value} at coordinate {index}: expected a finite value >= 0")]
+    InvalidScale { index: usize, value: f64 },
+    /// A per-coordinate kernel scale `σⱼ` divides the features: it must be finite and positive.
+    #[error("invalid sigma {value} at coordinate {index}: expected a finite value > 0")]
+    InvalidSigma { index: usize, value: f64 },
+    /// A kernel width `τ` must be finite and positive.
+    #[error("invalid kernel width {0}: expected a finite value > 0")]
+    InvalidBandwidth(f64),
+    /// A neighbour count `k` must be at least 1.
+    #[error("invalid neighbour count {0}: expected at least 1")]
+    InvalidNeighbours(usize),
+    /// A window spans a positive number of milliseconds.
+    #[error("invalid window of {0} ms: expected a positive span")]
+    InvalidWindow(i64),
 }

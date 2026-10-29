@@ -12,6 +12,11 @@ left out so that the same data gives the same digest tomorrow. :func:`verify_man
 recomputes it. The vault state (``vault_open``) is part of the body, because it changes the
 sealed counts.
 
+The manifest also reports the vault tree (``olsprime.vault``): its stage (0 in ``data/``, 1 moved and
+plaintext, 2 encrypted), file count, bytes, and the digest of the tree's own ``MANIFEST.json``. That
+summary reads names, footers and sizes, never a vault row. It is part of the body, so moving or
+encrypting the vault changes this manifest's digest.
+
 This module opens no Parquet file: the row counts and the spans come from helpers of
 :mod:`olsprime.protocol`, the one module that reads stored tables. A manifest built with
 the vault open logs each read to ``ACCESS.log``, like any read of the vault.
@@ -43,6 +48,7 @@ from olsprime.protocol import (
     stored_row_count,
     vault_open,
 )
+from olsprime.vault import tree_summary
 
 log = logging.getLogger(__name__)
 
@@ -107,6 +113,7 @@ def build_manifest(data_dir: Path, *, generated_at: datetime | None = None) -> d
         "schema_version": SCHEMA_VERSION,
         "vault_start": _iso(VAULT.start),
         "vault_open": vault_open(),
+        "vault_tree": tree_summary(data_dir),
         "files": entries,
         "totals": {
             "files": len(entries),
@@ -149,6 +156,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     print(
         f"{totals['files']} files, {totals['bytes']:,} bytes, {totals['stored_rows']:,} stored rows, "
         f"{totals['sealed_rows']:,} sealed rows; vault {'OPEN' if manifest['vault_open'] else 'sealed'}"
+    )
+    tree = manifest["vault_tree"]
+    print(
+        f"vault tree: stage {tree['stage']}, {tree['files']} files, {tree['bytes']:,} bytes, manifest {tree['manifest_digest']}; "
+        f"still under data/: {tree['archives_still_in_data']} archives, {tree['tables_still_in_data']} tables"
     )
     print(f"digest {manifest['digest']}")
     print(f"written to {out}")

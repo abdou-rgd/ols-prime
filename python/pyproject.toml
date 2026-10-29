@@ -10,6 +10,7 @@ dependencies = [
     "olsprime-rs",
     "polars>=1.20",
     "pyarrow>=17",
+    "pyrage==1.4.0",
     "scipy>=1.18.1",
     # Windows has no system time zone database; zoneinfo needs it for UTC datetimes.
     "tzdata>=2024.1; sys_platform == 'win32'",
