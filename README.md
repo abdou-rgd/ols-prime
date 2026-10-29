@@ -53,18 +53,21 @@ uv run python -m olsprime.bench.report1
 
 The first command downloads and checks the archives. On the development machine, the second runs H1, the future-invariance test, in seven to eight minutes with its default four processes. The third writes [Report n°1](docs/reports/report-1.md) in about 75 seconds. `report1 --check <run folder>` re-runs a report and compares it byte for byte.
 
-The Kani proofs need Linux (WSL2 works). Four of the twenty-one harnesses finish. On the development machine they take 14 to 16 minutes run four at a time (`-j 4 --output-format=terse`), or 18 minutes one after another:
+The Kani proofs need Linux (WSL2 works). Five of the twenty-one harnesses finish:
 - the two of iteration 1: every buy gate blocks every buy, and sells are never gated;
-- the function contract of `product`;
+- the function contracts of `product` and of `max_qty_within`;
 - a lemma that the specifications' 128-bit products never wrap.
 
+On the development machine, run four at a time (`-j 4 --output-format=terse`), the five take about two hours. The contract of `max_qty_within` takes most of that: 122 minutes on 2026-10-29, under load from other jobs, and 72.5 minutes alone on a GitHub runner. The other four take 14 to 18 minutes together.
+
 ```bash
-cargo kani -p risk --exact -Z function-contracts -Z stubbing --no-assert-contracts --harness proofs::buy_gates_block_every_buy --harness proofs::sells_are_never_gated --harness proofs::product_contract --harness proofs::exact_never_wraps
+cargo kani -p risk --exact -Z function-contracts -Z stubbing --no-assert-contracts --harness proofs::buy_gates_block_every_buy --harness proofs::sells_are_never_gated --harness proofs::product_contract --harness proofs::exact_never_wraps --harness proofs::max_qty_within_contract
 ```
 
 `cargo kani -p risk`, with the same flags, runs all of them.
-- The contracts of the four helpers that divide (`notional_floor`, `notional_ceil`, `max_qty_within`, `round_down_to_lot`) are written in `crates/risk/src/spec.rs`. They are not proven yet: each ran out of time at 40 minutes. Property tests are the evidence for them for now.
+- The contracts of the three other helpers that divide (`notional_floor`, `notional_ceil`, `round_down_to_lot`) are written in `crates/risk/src/spec.rs`. They are not proven yet. Each gave no verdict in 340 minutes on a GitHub runner, and Z3 and Bitwuzla gave none in 45 minutes either. Property tests are the evidence for them for now.
 - So did the `check_order` harnesses that use those contracts as stubs.
+- Never pass `--cbmc-args --bitwuzla` as is: CBMC 6.11's Bitwuzla back end gives false proofs on Rust's overflow checks ([diffblue/cbmc#8723](https://github.com/diffblue/cbmc/issues/8723)).
 
 [`kani.yml`](.github/workflows/kani.yml) keeps both lists.
 

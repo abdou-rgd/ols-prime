@@ -159,7 +159,7 @@ Remaining limits, stated plainly:
 - **No test needs the real store, and CI is the evidence.** GitHub Actions runs the whole suite (`uv run --locked pytest`, `.github/workflows/ci.yml`) on runners that have no `data/` at all. No test skips or branches on whether real data exist: the only skips in `python/tests` are `test_decision.py` (a Rust source file), `test_stats.py` (the slow flag) and a symbolic-link check in `test_tripwire.py`, and none tests a `.exists()` on a data path.
 - A reader captured before `conftest.py` is loaded (by a plugin, say) is not wrapped.
 - `pandas`, `torch` and `duckdb` are not installed in this environment, so those wrappers are untested against the real libraries.
-- Until stage 1 of the physical seal runs (below), the vault rows sit in the same files as the rest, and in the quality reports of the two pairs that have them (see above).
+- Since stage 1 of the physical seal (below), no file under `data/` holds a vault row. The vault rows sit in the vault tree, in plaintext, guarded in-process only, until stage 2.
 
 **The physical seal (iteration 3).** The vault months leave `data/` in two stages, with `uv run python -m olsprime.vault {plan,move,encrypt,keygen,status}` (`python/olsprime/vault.py`).
 - **Stage 1, out of `data/`.** `move` works in two phases.
@@ -171,7 +171,7 @@ Remaining limits, stated plainly:
 - **Stage 2, encrypted.** `encrypt --recipient age1…` writes each file of the tree to `<name>.age`, and records each ciphertext's SHA-256. It uses age X25519 through `pyrage` 1.4.0, which binds Rust's `age` crate.
   - Plaintext goes only with `--remove-plaintext`, which is Abdou's to pass.
   - The identity (`keygen --out`, on a medium taken away) must never be stored on this machine.
-  - `encrypt` cannot check that the recipient matches an identity Abdou holds. So run it first without `--remove-plaintext`, decrypt one file with the real identity, and only then remove plaintext.
+  - `encrypt` cannot check that the recipient matches an identity Abdou holds. So run it first without `--remove-plaintext`, decrypt one file with the real identity, and only then remove plaintext. Audit pass 1b asks for more before stage 2: a `verify-decrypt` command that decrypts every file in memory and compares its SHA-256 with the manifest, and a `--remove-plaintext` that refuses until it has run.
 - **Refusals.** `download_month`, the downloader's command and the archive downloads refuse a vault month (`VaultMonthRefused`) before any request. `build_parquet` leaves out every archive of a vault month, with a warning that names it. Fetching the vault months for the final evaluation will go through the vault module, a later step.
 - **Guards.**
   - The runtime tripwire treats the vault root like the repository's `data/`. The static guard flags the names and strings that reach the vault tree (rule `vault-tree`) outside `vault.py`, `protocol.py`, `paths.py` and the test guards.
@@ -181,7 +181,13 @@ Remaining limits, stated plainly:
   - Until stage 2, the vault tree is plaintext, outside `data/`, and guarded only in-process.
   - Until the identity leaves this machine, stage 2 is only as safe as that file.
   - The tool reads no vault row, but the process that runs it sees file names, sizes and the Parquet footers' statistics. A table whose footer lacks statistics is not scanned for stray vault bars.
-- **Status, 2026-10-29: stage 0.** `plan` found 36 archives (788 kB), only BTCUSDT and ETHUSDT, 1 h and 1 d, 2026-01 → 2026-09, all verified. It found 4 tables holding 13,650 vault rows, and no other table with a bar at or after 2026-01-01. `plan --verify` rebuilt the four tables in a temporary folder and found every sealed read identical. The real move runs after the audit.
+- **Status, 2026-10-29: stage 1, moved, plaintext.**
+  - **Before the move.** `plan` found 36 archives (788 kB), only BTCUSDT and ETHUSDT, 1 h and 1 d, 2026-01 → 2026-09, all verified. It found 4 tables holding 13,650 vault rows, and no other table with a bar at or after 2026-01-01. `plan --verify` rebuilt the four tables in a temporary folder and found every sealed read identical.
+  - **The move.** It ran after audit pass 1b cleared it, on the audited code of commit `767e2c0`, with no other process reading `data/`. It renamed 72 files (the 36 archives and their `.CHECKSUM` files) and rebuilt 4 Parquet files, in 7 seconds.
+  - **The tree.** It holds 80 files, 8,981,586 bytes: the 72, plus the four old tables and their quality reports, hard-linked with their pre-move bytes and SHA-256. Its `MANIFEST.json` digest is `3c4dd451b89cb987e0af8d6cb51e6828b07069c95a0589a3410183363a25d01b`. Every archive's SHA-256 equals its `.CHECKSUM`, and the journal ends with every table swapped.
+  - **`data/`.** It holds 843 Parquet files with 9,964,021 stored rows, all of them sealed rows. Only the four rebuilt tables changed, in bytes, hash and stored rows (73,285 at 1 h and 3,059 at 1 d each). The data manifest's digest is now `7c5f2397f0e767d357f1a21390094d3743d89df5d90e54392e7b0a4b9cfc4447`.
+  - **The sealed view did not move.** The hourly panel keeps its fingerprint (`e64b39d8…`). Report n°1, re-run with `--check`, reproduces every number. Only its provenance lines differ: the commit, the code digest, the data manifest digest, and the hash and stored rows of the two daily tables it reads.
+  - No read opened the vault: `runs/vault/` does not exist.
 
 **Quirks to handle downstream.** The quality report (`{SYMBOL}.quality.json` beside each Parquet file) counts them.
 - **Timestamps.** From 2025-01-01, spot files use microseconds. The parser reads the unit from each value's magnitude and stores milliseconds UTC.
