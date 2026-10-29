@@ -15,6 +15,13 @@
 //! - [`Matrix`]: an append-only memory whose ranges are read through a binary tree of
 //!   [`SuffStats`], with exact signed attributions.
 //!
+//! Matrix also keeps its nodes in centred form ([`CentredStats`], merged by the update of
+//! Chan, Golub and LeVeque), read by the centred ridge with a free intercept and a penalty per
+//! coordinate ([`CentredFit`]). On top of it sit the batch readouts the evaluation needs:
+//! [`Matrix::ridge_batch`] (queries × windows × penalties, a [`ReadStatus`] per cell) and
+//! [`Matrix::kernel_batch`] (exact softmax and kNN over a window). Both run in parallel and are
+//! bit-identical whatever the thread count.
+//!
 //! The mathematics behind each property test is in `docs/DESIGN.md`.
 //!
 //! ```
@@ -41,14 +48,20 @@
 //! # Ok::<(), ols_core::OlsError>(())
 //! ```
 
+mod batch;
+mod centred;
 mod error;
+mod kernel;
 mod matrix;
 mod ridge;
 mod rls;
 mod stats;
 
+pub use batch::{ReadStatus, RidgeBatch, RidgeFootprint, RidgeGrid};
+pub use centred::{CentredFit, CentredRidge, CentredStats};
 pub use error::OlsError;
-pub use matrix::{Matrix, Readout, Summary};
+pub use kernel::{KernelBatch, KernelFootprint, KernelSpec, exp_neg};
+pub use matrix::{CentredReadout, Matrix, Readout, Summary, Window};
 pub use nalgebra;
 pub use ridge::{
     Attention, RidgeConfig, RidgeModel, ols_attention, residual_sum_squares, ridge_fit, solve_query,

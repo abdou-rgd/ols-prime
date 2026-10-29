@@ -4,9 +4,12 @@
 //! arrays with one entry per row. Matrices come back C-ordered: `beta` is (q, p), attention
 //! weights (queries, keys).
 
-use numpy::{PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods};
+use numpy::{
+    PyArray1, PyArray2, PyArrayMethods, PyReadonlyArray1, PyReadonlyArray2, PyUntypedArrayMethods,
+};
 use ols_core::OlsError as RsOlsError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 use super::{Float, Int, array2, check_alloc, dmatrix, dvector, ols_error, rows2, shape2, vec1};
 use crate::convert::{self, MICROSECOND_TIMES_FROM, stats_blocks};
@@ -517,6 +520,245 @@ impl Summary {
     }
 }
 
+/// The float64 blocks of one [`ols_core::CentredStats`]: `M_xx`, `M_yx`, `M_yy`, `x̄`, `ȳ`.
+fn centred_blocks(p: usize, q: usize) -> [(usize, usize); 5] {
+    [(p, p), (q, p), (q, q), (p, 1), (q, 1)]
+}
+
+/// Centred statistics of unit-weight entries (`ols_core::CentredStats`): the count, the means
+/// `x̄`, `ȳ` and the centred sums `M_xx = Σ (x − x̄)(x − x̄)ᵀ`, `M_yx`, `M_yy`. Immutable;
+/// `merged` returns the statistics of a union (Chan–Golub–LeVeque).
+#[pyclass(module = "olsprime_rs", frozen, eq)]
+#[derive(Debug, Clone, PartialEq)]
+pub struct CentredStats {
+    inner: ols_core::CentredStats,
+}
+
+#[pymethods]
+impl CentredStats {
+    /// The statistics of rows `xs` (n, p) and `ys` (n, q), in one corrected two-pass scan.
+    #[staticmethod]
+    fn from_rows(xs: PyReadonlyArray2<'_, f64>, ys: PyReadonlyArray2<'_, f64>) -> PyResult<Self> {
+        let ((n, p), (m, q)) = (shape2(&xs), shape2(&ys));
+        if n != m {
+            return Err(shape_error(n, m));
+        }
+        if p == 0 || q == 0 {
+            return Err(ols_error(RsOlsError::InvalidShape(
+                "p and q must be at least 1",
+            )));
+        }
+        check_alloc(
+            || format!("CentredStats(p={p}, q={q})"),
+            &centred_blocks(p, q),
+        )?;
+        let (_, _, xs) = rows2(&xs, "xs")?;
+        let (_, _, ys) = rows2(&ys, "ys")?;
+        ols_core::CentredStats::from_rows(&xs, &ys, p, q)
+            .map(|inner| Self { inner })
+            .map_err(ols_error)
+    }
+
+    /// The statistics of the union of two disjoint sets of entries.
+    fn merged(&self, other: &Self) -> PyResult<Self> {
+        self.inner
+            .merged(&other.inner)
+            .map(|inner| Self { inner })
+            .map_err(ols_error)
+    }
+
+    #[getter]
+    fn p(&self) -> usize {
+        self.inner.p()
+    }
+
+    #[getter]
+    fn q(&self) -> usize {
+        self.inner.q()
+    }
+
+    #[getter]
+    fn count(&self) -> u64 {
+        self.inner.count()
+    }
+
+    /// The count as a float, the `n` of the formulas.
+    #[getter]
+    fn n(&self) -> f64 {
+        self.inner.n()
+    }
+
+    /// The most entries summed by one scan behind these statistics, a term of the refusal
+    /// threshold.
+    #[getter]
+    fn longest_scan(&self) -> u64 {
+        self.inner.longest_scan()
+    }
+
+    /// The depth of the tree of merges behind these statistics (0 for one scan).
+    #[getter]
+    fn depth(&self) -> u32 {
+        self.inner.depth()
+    }
+
+    /// `x̄`, shape (p,); zeros for the empty set.
+    #[getter]
+    fn mean_x<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_slice(py, self.inner.mean_x())
+    }
+
+    /// `M_xx`, shape (p, p), exactly symmetric.
+    #[getter]
+    fn m_xx<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        array2(py, &self.inner.m_xx())
+    }
+
+    /// `ȳ`, shape (q,).
+    #[getter]
+    fn mean_y<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_slice(py, self.inner.mean_y())
+    }
+
+    /// `M_yx = Σ (y − ȳ)(x − x̄)ᵀ`, shape (q, p).
+    #[getter]
+    fn m_yx<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        array2(py, &self.inner.m_yx())
+    }
+
+    /// `M_yy`, shape (q, q), exactly symmetric.
+    #[getter]
+    fn m_yy<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        array2(py, &self.inner.m_yy())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CentredStats(p={}, q={}, count={})",
+            self.inner.p(),
+            self.inner.q(),
+            self.inner.count()
+        )
+    }
+}
+
+/// A centred ridge read of Matrix for one query over a range; only `Matrix.centred_query`
+/// makes one, and only the memory that made it accepts it.
+#[pyclass(module = "olsprime_rs", frozen)]
+pub struct CentredReadout {
+    inner: ols_core::CentredReadout,
+}
+
+#[pymethods]
+impl CentredReadout {
+    #[getter]
+    fn start(&self) -> usize {
+        self.inner.start()
+    }
+
+    #[getter]
+    fn end(&self) -> usize {
+        self.inner.end()
+    }
+
+    /// The range's mean state `x̄`, shape (p,).
+    #[getter]
+    fn mean_x<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        PyArray1::from_slice(py, self.inner.mean_x())
+    }
+
+    /// The dual direction `a = (M_xx + Λ)⁻¹ (x_q − x̄)`, shape (p,).
+    #[getter]
+    fn a<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        dvector(py, self.inner.a())
+    }
+
+    /// `ŷ = ȳ + β (x_q − x̄)`, shape (q,): the bits `ridge_batch` gives for the same cell.
+    #[getter]
+    fn forecast<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        dvector(py, self.inner.forecast())
+    }
+
+    /// `(x_q − x̄)ᵀ (M_xx + Λ)⁻¹ (x_q − x̄)`.
+    #[getter]
+    fn leverage(&self) -> f64 {
+        self.inner.leverage()
+    }
+
+    /// The range's residual sum of squares at this penalty, per outcome, shape (q,).
+    #[getter]
+    fn rss<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        dvector(py, self.inner.rss())
+    }
+
+    fn __repr__(&self) -> String {
+        format!(
+            "CentredReadout(start={}, end={}, forecast={:?})",
+            self.inner.start(),
+            self.inner.end(),
+            self.inner.forecast().as_slice()
+        )
+    }
+}
+
+/// A window argument: `None` for every entry up to `as_of`, else the span in ms, > 0.
+fn window_arg(window: Option<&Int>, name: &str) -> PyResult<ols_core::Window> {
+    match window {
+        None => Ok(ols_core::Window::ALL),
+        Some(span) => ols_core::Window::last(span.get(name)?).map_err(ols_error),
+    }
+}
+
+/// The decision times of a batch, refused at or above `MICROSECOND_TIMES_FROM` as in `push`.
+fn as_of_ms(as_of: &PyReadonlyArray1<'_, i64>) -> PyResult<Vec<i64>> {
+    let as_of = vec1(as_of, "as_of")?;
+    if let Some((i, t)) = convert::first_microsecond_time(&as_of) {
+        return Err(microseconds(&format!("as_of[{i}]"), t));
+    }
+    Ok(as_of)
+}
+
+/// `x_q` must be (len(as_of), p).
+fn check_queries(x_q: &PyReadonlyArray2<'_, f64>, m: usize, p: usize) -> PyResult<()> {
+    let (rows, cols) = shape2(x_q);
+    if cols != p {
+        return Err(shape_error(p, cols));
+    }
+    if rows != m {
+        return Err(shape_error(m, rows));
+    }
+    Ok(())
+}
+
+/// `a · b`, saturated: a saturated count is refused by [`check_alloc`] anyway.
+fn mul(a: usize, b: usize) -> usize {
+    a.saturating_mul(b)
+}
+
+/// A word count from `ols-core`'s footprints as one [`check_alloc`] block.
+fn words(w: u128) -> [(usize, usize); 1] {
+    [(usize::try_from(w).unwrap_or(usize::MAX), 1)]
+}
+
+/// Values row-major, as a fresh numpy array of `shape`.
+fn shaped<'py, T: numpy::Element>(
+    py: Python<'py>,
+    values: Vec<T>,
+    shape: &[usize],
+) -> PyResult<Bound<'py, numpy::PyArrayDyn<T>>> {
+    PyArray1::from_vec(py, values).reshape(shape)
+}
+
+fn codes(status: &[ols_core::ReadStatus]) -> Vec<u8> {
+    status.iter().map(|s| s.code()).collect()
+}
+
+/// Entry indices as int64; an index is below the entry count, which fits.
+fn indices(v: &[usize]) -> Vec<i64> {
+    v.iter()
+        .map(|&i| i64::try_from(i).unwrap_or(i64::MAX))
+        .collect()
+}
+
 /// Matrix: an append-only memory of `(time, state, outcome)` entries read through a tree of
 /// sufficient statistics (`ols_core::Matrix`). Push an entry only once its outcome is known,
 /// stamped with the time it became known.
@@ -690,6 +932,272 @@ impl Matrix {
             .map_err(ols_error)
     }
 
+    /// Index range `(start, end)` of the entries a decision at `as_of` reads through `window`:
+    /// `as_of − window < time <= as_of`, or every `time <= as_of` for `window=None`. `as_of`
+    /// is refused at or above `MICROSECOND_TIMES_FROM` as in `time_range`; `window` must be
+    /// > 0 ms.
+    #[pyo3(signature = (as_of, window = None))]
+    fn window_range(&self, as_of: Int, window: Option<Int>) -> PyResult<(usize, usize)> {
+        let as_of: i64 = as_of.get("as_of")?;
+        if as_of >= MICROSECOND_TIMES_FROM {
+            return Err(microseconds("as_of", as_of));
+        }
+        let window = window_arg(window.as_ref(), "window")?;
+        Ok(self.inner.window_range(as_of, window))
+    }
+
+    /// The centred statistics of entries `[start, end)`, read from the tree of centred nodes.
+    fn centred_stats(&self, start: Int, end: Int) -> PyResult<CentredStats> {
+        let (p, q) = self.inner.dims();
+        check_alloc(
+            || format!("CentredStats(p={p}, q={q})"),
+            &centred_blocks(p, q),
+        )?;
+        self.inner
+            .centred_range_stats(start.get("start")?, end.get("end")?)
+            .map(|inner| CentredStats { inner })
+            .map_err(ols_error)
+    }
+
+    /// The centred ridge read of entries `[start, end)` for `x_q` (p,): a free intercept and
+    /// `Λ = rho · n · diag(scale)`, with `rho >= 0` and `scale` (p,) finite and >= 0.
+    fn centred_query(
+        &self,
+        x_q: PyReadonlyArray1<'_, f64>,
+        start: Int,
+        end: Int,
+        rho: Float,
+        scale: PyReadonlyArray1<'_, f64>,
+    ) -> PyResult<CentredReadout> {
+        let (start, end) = (start.get("start")?, end.get("end")?);
+        let rho = rho.get("rho")?;
+        let (x_q, scale) = (vec1(&x_q, "x_q")?, vec1(&scale, "scale")?);
+        let (p, _) = self.inner.dims();
+        if scale.len() != p {
+            return Err(shape_error(p, scale.len()));
+        }
+        let cfg = ols_core::CentredRidge::new(rho, &scale).map_err(ols_error)?;
+        self.inner
+            .centred_query(&x_q, start, end, &cfg)
+            .map(|inner| CentredReadout { inner })
+            .map_err(ols_error)
+    }
+
+    /// The signed weight `1/n + (x_i − x̄)ᵀ a` of every entry of the readout's range, shape
+    /// (end − start,). They sum to one, and `weights @ ys` is the forecast.
+    fn centred_weights<'py>(
+        &self,
+        py: Python<'py>,
+        readout: &CentredReadout,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let w = self
+            .inner
+            .centred_weights(&readout.inner)
+            .map_err(ols_error)?;
+        Ok(PyArray1::from_vec(py, w))
+    }
+
+    /// The exact contribution of entries `[start, end)` (inside the readout's range) to its
+    /// forecast, shape (q,): the sum of their `weight · y`, from their statistics alone.
+    fn centred_contribution<'py>(
+        &self,
+        py: Python<'py>,
+        readout: &CentredReadout,
+        start: Int,
+        end: Int,
+    ) -> PyResult<Bound<'py, PyArray1<f64>>> {
+        let (start, end) = (start.get("start")?, end.get("end")?);
+        let c = self
+            .inner
+            .centred_contribution(&readout.inner, start, end)
+            .map_err(ols_error)?;
+        Ok(dvector(py, &c))
+    }
+
+    /// The centred ridge read of M queries under W windows and R penalties, in parallel.
+    ///
+    /// `x_q` (M, p) and `as_of` (M,) int64 ms; `windows` a list of spans in ms (> 0) or `None`
+    /// for all history; `rhos` (R,) and `scale` (p,) as in `centred_query`. Returns a dict:
+    /// `forecast` (M, W, R, q), `status` (M, W, R) uint8, `start`, `end` and `count`
+    /// (M, W) int64, and `leverage` (M, W, R) and `rss` (M, W, R, q) when asked for. A cell
+    /// whose status is not `STATUS_OK` is NaN in every output. Bit-identical to
+    /// `centred_query` cell by cell, whatever `threads` (0: every core). Runs without the GIL.
+    #[pyo3(signature = (x_q, as_of, windows, rhos, scale, *, leverage = false, rss = false,
+                        threads = Int::from(0)))]
+    #[allow(clippy::too_many_arguments)]
+    fn ridge_batch<'py>(
+        &self,
+        py: Python<'py>,
+        x_q: PyReadonlyArray2<'_, f64>,
+        as_of: PyReadonlyArray1<'_, i64>,
+        windows: Vec<Option<Int>>,
+        rhos: PyReadonlyArray1<'_, f64>,
+        scale: PyReadonlyArray1<'_, f64>,
+        leverage: bool,
+        rss: bool,
+        threads: Int,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let threads: usize = threads.get("threads")?;
+        let (p, q) = self.inner.dims();
+        let m = as_of.len();
+        check_queries(&x_q, m, p)?;
+        let windows = windows
+            .iter()
+            .enumerate()
+            .map(|(i, w)| window_arg(w.as_ref(), &format!("windows[{i}]")))
+            .collect::<PyResult<Vec<_>>>()?;
+        let rhos = vec1(&rhos, "rhos")?;
+        let scale = vec1(&scale, "scale")?;
+        if scale.len() != p {
+            return Err(shape_error(p, scale.len()));
+        }
+        let grid = ols_core::RidgeGrid::new(&windows, &rhos, &scale)
+            .map_err(ols_error)?
+            .with_leverage(leverage)
+            .with_rss(rss);
+        let (nw, nr) = (windows.len(), rhos.len());
+        let what = |part: &'static str| {
+            move || format!("ridge_batch: {part}, for {m} queries x {nw} windows x {nr} penalties")
+        };
+        let cells = mul(nw, nr);
+        let mut arrays = vec![
+            ("the forecast", (m, mul(cells, q))),
+            ("the status", (m, cells)),
+            ("each of start, end and count", (m, nw)),
+        ];
+        if leverage {
+            arrays.push(("the leverage", (m, cells)));
+        }
+        if rss {
+            arrays.push(("the rss", (m, mul(cells, q))));
+        }
+        for (part, block) in arrays {
+            check_alloc(what(part), &[block])?;
+        }
+        let footprint = grid.footprint(p, q, m, threads);
+        check_alloc(
+            what("the factorizations of every thread"),
+            &words(footprint.cache_words),
+        )?;
+        let (_, _, x_q) = rows2(&x_q, "x_q")?;
+        let as_of = as_of_ms(&as_of)?;
+        let inner = &self.inner;
+        let b = py
+            .detach(move || inner.ridge_batch(&x_q, &as_of, &grid, threads))
+            .map_err(ols_error)?;
+        let count: Vec<usize> = b.end.iter().zip(&b.start).map(|(e, s)| e - s).collect();
+        let out = PyDict::new(py);
+        out.set_item("forecast", shaped(py, b.forecast, &[m, nw, nr, q])?)?;
+        out.set_item("status", shaped(py, codes(&b.status), &[m, nw, nr])?)?;
+        out.set_item("start", shaped(py, indices(&b.start), &[m, nw])?)?;
+        out.set_item("end", shaped(py, indices(&b.end), &[m, nw])?)?;
+        out.set_item("count", shaped(py, indices(&count), &[m, nw])?)?;
+        if let Some(h) = b.leverage {
+            out.set_item("leverage", shaped(py, h, &[m, nw, nr])?)?;
+        }
+        if let Some(r) = b.rss {
+            out.set_item("rss", shaped(py, r, &[m, nw, nr, q])?)?;
+        }
+        Ok(out)
+    }
+
+    /// The exact softmax (Nadaraya-Watson) and kNN reads of M queries over one window, in
+    /// parallel.
+    ///
+    /// `x_q` (M, p) and `as_of` (M,) int64 ms; `window` a span in ms (> 0) or `None`; `sigma`
+    /// (p,) the per-feature scale (> 0) of `u = x / sigma`; `taus` (T,) the widths (> 0) of
+    /// `w = exp(−‖u_q − u_i‖² / (2 tau²))`; `ks` (K,) int64 neighbour counts (>= 1), ties to
+    /// the lowest entry index. Returns a dict: `softmax` (M, T, q), `softmax_status` (M, T)
+    /// uint8, `knn` (M, K, q), `knn_status` (M, K) uint8, and `start`, `end` and `count` (M,)
+    /// int64. A cell whose status is not `STATUS_OK` is NaN. Bit-identical whatever `threads`
+    /// (0: every core) and whatever the other queries. Runs without the GIL.
+    #[pyo3(signature = (x_q, as_of, window, sigma, taus, ks, *, threads = Int::from(0)))]
+    #[allow(clippy::too_many_arguments)]
+    fn kernel_batch<'py>(
+        &self,
+        py: Python<'py>,
+        x_q: PyReadonlyArray2<'_, f64>,
+        as_of: PyReadonlyArray1<'_, i64>,
+        window: Option<Int>,
+        sigma: PyReadonlyArray1<'_, f64>,
+        taus: PyReadonlyArray1<'_, f64>,
+        ks: PyReadonlyArray1<'_, i64>,
+        threads: Int,
+    ) -> PyResult<Bound<'py, PyDict>> {
+        let threads: usize = threads.get("threads")?;
+        let (p, q) = self.inner.dims();
+        let m = as_of.len();
+        check_queries(&x_q, m, p)?;
+        let window = window_arg(window.as_ref(), "window")?;
+        let sigma = vec1(&sigma, "sigma")?;
+        if sigma.len() != p {
+            return Err(shape_error(p, sigma.len()));
+        }
+        let taus = vec1(&taus, "taus")?;
+        let ks = vec1(&ks, "ks")?
+            .iter()
+            .enumerate()
+            .map(|(i, &k)| match usize::try_from(k) {
+                Ok(k) if k >= 1 => Ok(k),
+                _ => Err(pyo3::exceptions::PyValueError::new_err(format!(
+                    "ks[{i}] = {k}: expected a neighbour count >= 1"
+                ))),
+            })
+            .collect::<PyResult<Vec<usize>>>()?;
+        let spec = ols_core::KernelSpec::new(window, &sigma, &taus, &ks).map_err(ols_error)?;
+        let (nt, nk) = (taus.len(), ks.len());
+        let what = |part: &'static str| {
+            move || format!("kernel_batch: {part}, for {m} queries, {nt} widths and {nk} counts")
+        };
+        for (part, block) in [
+            ("the softmax", (m, mul(nt, q))),
+            ("the softmax status", (m, nt)),
+            ("the knn", (m, mul(nk, q))),
+            ("the knn status", (m, nk)),
+            ("each of start, end and count", (m, 1)),
+            ("the window ranges", (m, 2)),
+        ] {
+            check_alloc(what(part), &[block])?;
+        }
+        let as_of = as_of_ms(&as_of)?;
+        let footprint = self.inner.kernel_footprint(&as_of, &spec, threads);
+        let union = footprint.union_entries;
+        for (part, w) in [
+            (
+                "the copy of u = x / sigma over the windows' union",
+                footprint.u_words,
+            ),
+            ("the copy of y over the windows' union", footprint.y_words),
+            (
+                "the candidates and sums of every thread",
+                footprint.state_words,
+            ),
+        ] {
+            check_alloc(
+                move || format!("kernel_batch: {part} ({union} entries)"),
+                &words(w),
+            )?;
+        }
+        let (_, _, x_q) = rows2(&x_q, "x_q")?;
+        let inner = &self.inner;
+        let b = py
+            .detach(move || inner.kernel_batch(&x_q, &as_of, &spec, threads))
+            .map_err(ols_error)?;
+        let count: Vec<usize> = b.end.iter().zip(&b.start).map(|(e, s)| e - s).collect();
+        let out = PyDict::new(py);
+        out.set_item("softmax", shaped(py, b.softmax, &[m, nt, q])?)?;
+        out.set_item(
+            "softmax_status",
+            shaped(py, codes(&b.softmax_status), &[m, nt])?,
+        )?;
+        out.set_item("knn", shaped(py, b.knn, &[m, nk, q])?)?;
+        out.set_item("knn_status", shaped(py, codes(&b.knn_status), &[m, nk])?)?;
+        out.set_item("start", PyArray1::from_vec(py, indices(&b.start)))?;
+        out.set_item("end", PyArray1::from_vec(py, indices(&b.end)))?;
+        out.set_item("count", PyArray1::from_vec(py, indices(&count)))?;
+        Ok(out)
+    }
+
     fn __repr__(&self) -> String {
         let (p, q) = self.inner.dims();
         format!(
@@ -709,6 +1217,17 @@ pub(super) fn register(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<Readout>()?;
     m.add_class::<Summary>()?;
     m.add_class::<Matrix>()?;
+    m.add_class::<CentredStats>()?;
+    m.add_class::<CentredReadout>()?;
+    for (name, status) in [
+        ("STATUS_OK", ols_core::ReadStatus::Ok),
+        ("STATUS_EMPTY", ols_core::ReadStatus::Empty),
+        ("STATUS_SINGULAR", ols_core::ReadStatus::Singular),
+        ("STATUS_NON_FINITE", ols_core::ReadStatus::NonFinite),
+        ("STATUS_TOO_FEW", ols_core::ReadStatus::TooFew),
+    ] {
+        m.add(name, status.code())?;
+    }
     m.add_function(wrap_pyfunction!(ridge_fit, m)?)?;
     m.add_function(wrap_pyfunction!(solve_query, m)?)?;
     m.add_function(wrap_pyfunction!(residual_sum_squares, m)?)?;

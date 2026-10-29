@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 24f400e0cbec8d346a012e6528e15b984dc7a995028e9a99efd9775301bfad45 # shrinks to d = Data { p: 1, q: 1, xs: [0.0], ys: [0.0], x_q: [0.0] }, steps = [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0], later = Data { p: 1, q: 1, xs: [0.0], ys: [0.0], x_q: [0.0] }, queries = [(0, [0.0, 0.0, 0.0, 0.0])], sorted = false, block_log2 = 0, threads = 2
