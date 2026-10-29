@@ -121,8 +121,9 @@ pub struct KernelBatch {
     pub softmax_status: Vec<ReadStatus>,
     /// kNN means, M × K × q.
     pub knn: Vec<f64>,
-    /// M × K: [`ReadStatus::Ok`], [`ReadStatus::Empty`], [`ReadStatus::TooFew`] or
-    /// [`ReadStatus::NonFinite`].
+    /// M × K: [`ReadStatus::Ok`], [`ReadStatus::Empty`], [`ReadStatus::TooFew`] (k above the
+    /// window's count), or [`ReadStatus::NonFinite`] for every k ≤ n of a query whose window
+    /// holds a distance that overflows to +∞.
     pub knn_status: Vec<ReadStatus>,
     /// First entry of each window, M.
     pub start: Vec<usize>,
@@ -239,6 +240,10 @@ struct State {
     worst: f64,
     kcap: usize,
     min: f64,
+    /// Whether a distance of the window overflowed to +∞: its kNN cells are then
+    /// [`ReadStatus::NonFinite`], since the order among +∞ distances is not the order of the
+    /// true distances.
+    overflow: bool,
     /// `[t][c][lane]`.
     acc: Vec<f64>,
     /// `[t][lane]`.
@@ -438,6 +443,7 @@ fn kernel_chunk(sh: &Shared<'_>, p: usize, q: usize, c: KernelChunk<'_>) {
                 worst: f64::INFINITY,
                 kcap,
                 min: f64::INFINITY,
+                overflow: false,
                 acc: vec![0.0; nt * q * LANES],
                 accw: vec![0.0; nt * LANES],
             }
@@ -462,6 +468,7 @@ fn kernel_chunk(sh: &Shared<'_>, p: usize, q: usize, c: KernelChunk<'_>) {
             let blocks = (lead + n).div_ceil(BLOCK);
             distances(sh, p, uq, off / BLOCK, &mut dist[..blocks * BLOCK]);
             let d = &dist[lead..lead + n];
+            st.overflow |= !all_finite(d);
             knn_update(st, d, a);
             if nt > 0 {
                 softmax_update(st, sh, q, d, &mut w[..n], a, off);
@@ -535,6 +542,12 @@ fn knn_update(st: &mut State, d: &[f64], a: usize) {
             }
         }
     }
+}
+
+/// Whether every distance is below +∞ (distances are never NaN). Without short-circuit, so
+/// that it vectorizes.
+fn all_finite(d: &[f64]) -> bool {
+    d.iter().fold(true, |ok, &x| ok & (x < f64::INFINITY))
 }
 
 /// Keeps the `kcap` smallest candidates, in no particular order, and lowers `worst` to the
@@ -680,9 +693,13 @@ fn finish_knn(
             *s = ReadStatus::Empty;
         } else if k > n {
             *s = ReadStatus::TooFew;
+        } else if st.overflow {
+            *s = ReadStatus::NonFinite;
         } else {
+            // With every distance finite the buffer holds the `kcap ≥ k` nearest; `get` keeps
+            // the read total anyway.
             for (cc, oc) in o.iter_mut().enumerate() {
-                *oc = cum[(k - 1) * q + cc] / k as f64;
+                *oc = cum.get((k - 1) * q + cc).map_or(f64::NAN, |c| c / k as f64);
             }
             if !o.iter().all(|v| v.is_finite()) {
                 o.fill(f64::NAN);

@@ -126,6 +126,7 @@ The CUSUM of `matrix-cusum`:
   - Each decision's recursive residual of the `fwd_return` readout, its realized `fwd_return` minus the forecast made at the decision time, is divided by its predictive standard deviation, σ̂·√(1 + 1/n_w + x̃ᵀ(M_xx + Λ)⁻¹x̃). Here x̃ is the query's features minus the window's means, M_xx the window's centred cross-products, and σ̂² the window's residual mean square at the decision time.
   - The day's raw value is the mean of these over members. It is divided by s, the standard deviation of the raw daily values over the days of the last fit's selection rows, recomputed with that fit's window and ρ. The members' residuals move together, so the raw mean does not have unit variance: s gives back the unit variance that the threshold assumes.
 - **Timing.** Day d's value is known with its labels, at the exit open, 01:00 UTC on d + 1, and it enters the CUSUM then. An alarm acts at the first 00:00 UTC after that instant. The arm refits there, on rows whose labels are known by the fit time minus 24 h, and the CUSUM restarts at 0.
+  - A day's value is computed entirely with the fit in force at its decision time: its readouts, σ̂, leverage and s. The restarted CUSUM takes only the days decided after the refit, so the day decided just before it is left out.
 - **Threshold.** A two-sided Page CUSUM with k = 0.5. Its threshold is set by simulation, before any result, to give an average run length of 365 days under independent N(0, 1) values. That is about 6 false alarms over the 2,191 test days, against 72 monthly fits.
 
 If the exact kernel readouts cannot run over the 365-day window within the iteration, H3 runs at the 30-day window for all three of its arms. This fallback is fixed here, before any result.
@@ -256,3 +257,4 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
   - Defined more tightly: the selection rows, the paired bootstrap of the Brier skill score, the variant count (8, 18 in all), a row's month (that of its bar's open), and the panel H1's members with no bar after a cut.
   - Stated as limits: the upper wick at odd cuts in H1, and the panel H1's inputs from other members.
   - The adversary's report gains an attenuation curve, the families it never produces, the share of constant twins and the mean per-cut rate.
+- 2026-10-29, after audit pass 1b and before any Matrix run: the CUSUM's day that straddles a refit is defined. Its value uses the fit in force at its decision time, and the restarted CUSUM leaves it out.

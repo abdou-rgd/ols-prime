@@ -296,3 +296,29 @@ fn footprints_bound_the_union_and_the_threads() {
     assert_eq!(three.state_words, 3 * one.state_words);
     assert_eq!(m.kernel_footprint(&[], &spec, 0).union_entries, 0);
 }
+
+/// The audit's probe: two distances overflow to +∞. The kNN cells become statuses, never a
+/// panic; the softmax, whose weights at +∞ are exactly 0, still reads the two finite entries.
+#[test]
+fn an_overflowing_distance_gives_non_finite_knn_cells() {
+    let mut m = Matrix::new(1, 1, 1).unwrap();
+    for (i, x) in [1e200, -1e200, 1e200, 0.0].into_iter().enumerate() {
+        m.push(i as i64, &[x], &[i as f64]).unwrap();
+    }
+    let spec = KernelSpec::new(Window::ALL, &[1.0], &[1.0], &[1, 2, 4, 5]).unwrap();
+    for threads in [1, 3] {
+        let b = m.kernel_batch(&[1e200], &[3], &spec, threads).unwrap();
+        assert_eq!(
+            b.knn_status,
+            [
+                ReadStatus::NonFinite,
+                ReadStatus::NonFinite,
+                ReadStatus::NonFinite,
+                ReadStatus::TooFew
+            ]
+        );
+        assert!(b.knn.iter().all(|v| v.is_nan()));
+        assert_eq!(b.softmax_status, [ReadStatus::Ok]);
+        assert_eq!(b.softmax, [1.0]); // the mean of y at entries 0 and 2
+    }
+}
