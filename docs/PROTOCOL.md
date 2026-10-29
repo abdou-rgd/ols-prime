@@ -288,3 +288,10 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
 - 2026-10-29, after audit pass 1e and before any official Matrix run. No rule, threshold, grid, seed or period changes.
   - **Identical hours.** Each comparison gives the share of hours at which both arms' hourly log-losses are identical and the count of informative hours, with the words "few informative hours" above one half (Scoring; the count after audit pass 1f). Two arms that read the same cells give exactly equal losses. A part where they differ at only a handful of hours would otherwise show an ordinary p-value, with degrees of freedom counting every hour.
   - **A part's words.** A comparison on the previewed months or on the others says whether the rule is met. "Passes" stays the word of the whole period's verdicts.
+- 2026-10-29, during the official runs, after the panel H1 and the adversary and before Report n°2's verdicts. No rule, statistic, threshold, grid, seed or period changes.
+  - **The first official Report n°2 stopped on an internal check.**
+    - The run was at commit `3a22daa`. The arms ran over the whole test period. Then the first ECE, `climatology-panel`'s, differed from `stats.ece` by 1.3 × 10⁻⁹ relative, above that check's fixed tolerance of 10⁻⁹.
+    - The cause is rounding. `stats.ece` adds a bin's rows in one sequential sum, and climatology repeats one calibrated forecast over many rows, so the rounding errors add up instead of cancelling.
+    - A probe on synthetic data reproduced the gap. A lost row, the defect the check is there for, moves the ECE about 300 times more than the new tolerance.
+    - The tolerance is now 4·n·ε, about eight times the worst-case rounding of the two sums over n rows: 1.2 × 10⁻⁹ in absolute terms for 1.4 million rows.
+    - The run wrote no file. Its traceback showed one number, `climatology-panel`'s ECE over the test period, 0.0029. No other number of Report n°2 was seen before the re-run, which scores the same arms with the same rules.

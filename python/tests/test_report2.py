@@ -305,6 +305,25 @@ def test_the_ece_by_hours_is_the_ece_of_the_rows():
     assert out["estimate"] == pytest.approx(stats.ece(p, y, 10), rel=1e-12)
 
 
+def test_the_ece_check_lets_rounding_through_but_not_a_lost_row():
+    """Climatology repeats one calibrated forecast over many rows. At the panel's size, the ECE by hours and
+    stats.ece then differ through rounding alone by more than 1e-9 of the small ECE: the official run of
+    2026-10-29 stopped on that check."""
+    rng = np.random.default_rng(20261029)
+    sc = _scored(52_000, 27)
+    n = sc.hour.size
+    shares = np.array([0.294, 0.436, 0.270])
+    y = rng.choice(3, size=n, p=shares)
+    p = np.tile(shares, (n, 1))
+    ece = stats.ece(p, y, 10)
+    gap = abs(np.abs(r2.ece_bins(p, y, sc, 10).sum(axis=0)).sum() / n - ece)
+    assert gap > 1e-9 * ece  # the old check, rel_tol 1e-9, stopped here
+    assert gap <= r2.ece_tolerance(n)
+    out = r2.ece_interval(p, y, sc, rng.random(sc.hours.size), CFG, "ece", "test")
+    assert out["n_boot"] == CFG.n_boot
+    assert abs(stats.ece(p[1:], y[1:], 10) - ece) > 100 * r2.ece_tolerance(n)  # a lost row still trips it
+
+
 def test_the_bootstrap_is_seeded_by_tag_and_brackets_the_mean():
     rng = np.random.default_rng(11)
     x = rng.standard_normal(300)

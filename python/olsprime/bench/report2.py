@@ -214,13 +214,25 @@ def ece_bins(p: np.ndarray, y: np.ndarray, sc: Scored, n_bins: int) -> np.ndarra
     return out.reshape(sc.hours.size, n_bins)
 
 
+def ece_tolerance(n: int) -> float:
+    """How far the ECE by hours and ``stats.ece`` may differ through rounding alone, over n rows.
+
+    ``stats.ece`` adds a bin's rows in one sequential sum. When one forecast repeats over many rows,
+    as climatology's does within a fit, the rounding errors add up instead of cancelling: 1.3e-9
+    relative on the panel, which stopped the official run of 2026-10-29. Either sum is off by at
+    most about n eps / 2, so 4 n eps is safe. A real defect, a row lost or put in another bin,
+    moves the ECE by about 1/n.
+    """
+    return 4.0 * n * float(np.finfo(np.float64).eps)
+
+
 def ece_interval(p: np.ndarray, y: np.ndarray, sc: Scored, brier_hourly: np.ndarray, cfg: Report2Config, *tag: str) -> dict[str, Any]:
     """Top-label ECE on the scored rows; the bootstrap resamples whole hours (block: PW of the hourly Brier)."""
     d = ece_bins(p, y, sc, cfg.ece_bins)
     est = float(np.abs(d.sum(axis=0)).sum() / sc.count.sum())
     check = stats.ece(p, y, cfg.ece_bins)
-    if not math.isclose(est, check, rel_tol=1e-9, abs_tol=1e-12):
-        raise AssertionError(f"ECE {est} differs from stats.ece {check}")
+    if abs(est - check) > ece_tolerance(int(sc.count.sum())):
+        raise AssertionError(f"ECE {est} differs from stats.ece {check} by more than rounding")
     b = _block(brier_hourly)
     parts = []
     t = sc.hours.size
