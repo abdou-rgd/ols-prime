@@ -697,3 +697,62 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
     - The registered check, at least 0.1 with an interval above every honest arm's, stands. Its result is reported as it falls.
   - **`cheat-stamp-day`, a fifth control**, described in "Planted training-time leaks". Its memory is made only of labels not yet known. It shows whether H1 catches a stamp leak that gives skill, whatever `cheat-stamp`'s skill turns out to be. With it, the panel H1 is projected at about 9 hours, under the 12-hour budget.
   - **Three verdicts, reported apart:** H1 as `docs/HYPOTHESES.md` defines it, the skill check control by control, and `pos-window`'s check. A failed skill check is a finding about the control, reported beside H1's verdict, never folded into it or dropped.
+- 2026-10-30, after audit passes 4c to 4f and their second looks, before any encoder run on real data and before the first `explain` call (`runs/explain/CONTACTS.log` does not exist yet). No rule, statistic, threshold, grid, seed or period changes. Where the section leaves a choice, the build's reading is fixed here. Descriptions are added beside registered verdicts, and one line of the wave-1 entry is corrected.
+  - **Audit pass 4c**, on Report n°2's series, the power study, the twins and the getters: no Blocker and no Major point, three Minor points and three Nits, all fixed before the study runs. GO for Report n°2's re-run and the twins. Its second look gave GO for the power study, with one Minor point and three Nits, all fixed.
+    - Every command-line run of the study goes through a pool whose workers use one BLAS thread, so every worker count gives the same bytes. In one process, the main process's multithreaded BLAS moved the last bits of 7 of 5,452 values of `power.json`, never a rate.
+    - On Windows a worker's pipe sometimes breaks (WinError 6), in about one test run in four. The pool is then rebuilt and only the calls without a result run again, at most three times. A pool in which no call finishes for 1,800 s counts as broken. Each restart is recorded in `run.json`. A call is a pure function of its arguments, and a pool broken on purpose by the audit gave the same bytes.
+    - The study refuses a series whose recomputed comparisons differ from `report2.json`'s by more than 10⁻⁹ relative, instead of only recording it. Every value the comparison records is checked, the count of identical hours included, and so is climatology's mean log-loss.
+    - The reader refuses a path outside the runs folder before it reads a byte.
+    - The audit's bolder check is added as a description: the variance ratio each block length should give, predicted from the series' own autocovariances, beside the measured one. Each no-flips ratio is given with its standard error, about 14 %.
+  - **Audit pass 4d**, on `olsprime.explain`, in three looks: two Major points, seven Minor points and six Nits, all fixed. GO for the five whys.
+    - The residual that closed a forecast's parts was zero by construction. It is now bounded, and a residual above its bound stops the call (exit 3).
+    - The shared environment held an extension built before `beta` and `mean_y`. It was synced, and every call probes the extension before it reads anything.
+    - Each tree's partition is recounted group by group, not only checked by its sum.
+    - A Matrix-free twin of the ridge forecast, in numpy, rebuilds each explained ridge forecast within a stated bound (the audit's bolder check).
+    - One limit is stated, not fixed: check 1 holds the range of the entries behind σ² to the panel's stamps, not their values.
+  - **Audit pass 4e**, on the encoder's core and its panel H1: no Blocker and no Major point, three Minor points and four Nits. GO for the panel H1 and for Report n°3's fits on this core.
+    - A resume is refused if the build changed: torch, CUDA, cuDNN, Python, the platform, the GPU or its driver, and on CPU the thread count, as well as the config, the code and the manifest. The refusal names each field that changed. The platform holds WSL2's kernel version, so a kernel update between a stop and a resume also refuses the resume.
+    - The registered scope test runs at the first cut. The same test also runs at every regular cut, as a description (below).
+    - Torch's documentation lists `cumsum` on a CUDA tensor among the operations that raise in deterministic mode. On the RTX 3060 it neither raised nor drifted, and it matched the CPU's sum to the bit on the audit's probe. The pre-check remains the gate.
+    - **A correction of the wave-1 entry.** `pos-window`'s label sums the 24 one-bar returns in fp64, as built, not in fp32. On 38,144 synthetic rows the two readings class every row alike, the closest margin being 308 fp32 ulps.
+  - **Audit pass 4f**, on Report n°3: no Blocker, one Major point, seven Minor points and five Nits, all fixed before any fit. Its second look gave GO for the fits and the score, with three Minor points and three Nits, all fixed. It stopped a run at seven points where a file is written, and every resume gave the same bytes.
+    - A saved part is checked against its folder: its arm, seed and year, and its checkpoint's and forecasts' own records. A copied folder would otherwise have been scored as another arm (the Major point).
+    - A timing file that fails its digest stops the score, instead of reading as absent.
+    - Every stage binds the code and manifest digests, and the score refuses two timing files drawn on different samples.
+    - `report3.json` lists the fits' builds. Report n°3 is registered only if every fit ran on CUDA with one build, and H13's timing only if it ran on CUDA with the GPU named.
+    - The tree is frozen at the fits' commit: the timings, the score and `--check` run at that commit. A fix found in between waits until `--check` has passed.
+  - **The panel H1, as built.** Audit pass 4e accepted every reading.
+    - At a compared decision, the memory's stamps and statistics are the window's range among the stamp-sorted entries, those entries' stamp, symbol and open time, the window's raw moments and the readout. They are read through a no-op hook in `predict`.
+    - Inputs are compared as rows keyed by open time and symbol. The order of the episodes is the weeks' stamps and each epoch's permutation. The step, parameter and missing-window counts are compared too.
+    - A control must be caught in each direction where it is predicted caught, and in neither where it is not. That is stricter than iteration 3, which took the union of the directions.
+    - The pre-check compares the memory up to each fit year's last cut. The registered scope test runs at the first cut, with the fit reloaded from its file.
+    - Every system's predicted pattern follows one rule, computed per cut through the system's own hooks: a system is predicted caught at a cut when a compared item reads a label whose `label_known_at` is after the cut hour.
+    - `cheat-stamp` and `cheat-stamp-day` put a row's own label in its memory at its decision time. That is their leak, by design.
+    - The purge cuts take the seeds of a 9th and a 10th cut of the same schedule (k = 8 and 9 in `perturbation_at`), and their mirror follows the parity of k.
+    - `pos-window` is scored on the cut years. A row without a label of its own is dropped and counted.
+    - The CPU fallback's floor is computed per system, from its own three unperturbed runs.
+    - Exit codes: 2 if the pre-check fails, 1 if H1 fails, 3 if H1 holds and a skill check or `pos-window`'s check fails.
+  - **Report n°3, as built.** Audit pass 4f accepted every reading.
+    - H13's timing uses each arm's seed-1 fit of 2024. The 12,288 timed rows are drawn with the seed 20261030 from the scored rows that have a valid window. The Matrix timing uses the same sample, by its digest.
+    - The memory readout is timed where `predict` computes it, on the CPU in fp64. It costs the same for every arm, about a fifth of the whole pass on synthetic data, so it pulls the ratio toward 1: it can only make a holding H13 fail.
+    - Within each repeat the arms run in the order `enc-ols`, `enc-softmax`, `enc-linear`, so `enc-ols` and `enc-softmax` alternate.
+    - H13's ratio is median(`enc-ols`) / median(`enc-softmax`), as registered.
+    - Each Matrix arm is timed by its own readout at the last fit's choices, and `matrix-adaptive` at `matrix-select`'s ρ.
+    - Every stage of Report n°3 runs in WSL2, on the Ryzen 5 3600 and the RTX 3060. Matrix's CPU column uses the portable build there, where the process's peak memory is `ru_maxrss`. That peak is the whole process's, panel and windows included, and the memory's own size is given beside it. Matrix's parameters are 0: its choices are selections.
+    - The statistics' parameters come from Report n°2's `config.json`. The panel is checked by its fingerprint, and every scored row is paired one for one before any training.
+  - **Descriptions, beside the registered verdicts.** None enters a verdict.
+    - The scope test at every regular cut, for the honest arms and `cheat-stamp`, in the pre-check stage (audit pass 4e's bolder check). It loads the honest fit of the cut's year and trains nothing that H1 does not train.
+    - H13: the readout's own time, beside the attention operator's and the whole pass; and the median of the per-repeat ratios, beside the ratio of medians.
+    - H4's two bounds on the three seed-matched pairs, and in the reversed direction, `enc-softmax` non-inferior to `enc-ols` (audit pass 4f's bolder check).
+  - **`explain head`, its readings**, fixed before it is built.
+    - It explains only scored rows of 2019–2024, which Report n°3 forecasts, so every call needs `--test-months` and is logged. A row before 2019 is refused: no fit of Report n°3 is in force there.
+    - The model is the `enc-ols` checkpoint of the fit in force at the row's decision time, seed by seed, verified by its digest and against its folder.
+    - Per block and head, W = Q̃ (K̃ᵀK̃ + Λ)⁻¹ K̃ᵀ over the row's 64-bar window. Its rank is at most 9.
+    - The row of W is the decision bar's: 64 signed weights, oldest first.
+    - The diagonal mass is trace(W) / 64. The decision token's own weight is given beside it.
+    - The effective rank is the exponential of the Shannon entropy of W's normalized singular values (Roy and Vetterli, 2007).
+    - Every row must sum to 1 within `row_sum_tolerance`. The row's forecast, recomputed from the checkpoint, must equal the saved one, to the bit where the fits' computation is reproduced. Either failure stops the call.
+  - **Contacts with the real data in this iteration so far**, all from a clean clone of 221591c on Windows, before any `explain` call and any encoder run:
+    1. Report n°2's re-run, `--compare-with runs/2026-10-29-report2`, 2026-10-30 02:42–03:05 UTC. It reads 2017-10 → 2024-12 and scores 2019-01 → 2024-12, as in iteration 3. The five allowed differences were met and every other byte matched. `series.npz`'s SHA-256 is `03916fda8ffa9f97709216b2365e7a224dd8c8d71448d75035a7824fdc9cc0b9`.
+    2. Its `--check`, 03:05–03:28 UTC: the four files were byte-identical, `series.npz` included.
+    3. The twins, twice, at 03:28 and 03:29 UTC, byte-identical. They read BTCUSDT's and ETHUSDT's daily bars through 2024-12, as iteration 3's H1 and adversary did.

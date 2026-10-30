@@ -76,11 +76,21 @@ def world(tmp_path_factory):
     for seed, (s, n) in enumerate(HOURS.items()):
         store(root, fake_bars(s, n, seed=seed, start=START), s, "1h")
     universe = universe_frame({s: MONTHS for s in HOURS})
-    run = tmp_path_factory.mktemp("run")
+    runs_root = tmp_path_factory.mktemp("runs-root")  # the series reader opens only a run under the runs root
+    run = runs_root / "run"
+    run.mkdir()
     r2.run_report(CFG, run, data_dir=root, universe=universe, manifest=FAKE_MANIFEST, provenance=PROVENANCE)
     sha = json.loads((run / "report2.json").read_text(encoding="utf-8"))["series"]["sha256"]
-    arrays, _, _, _ = power.load_series(run / r2.SERIES_FILE, sha, ALL_KEYS)
-    return {"root": root, "universe": universe, "run": run, "sha": sha, "arrays": arrays}
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("OLSPRIME_RUNS_DIR", str(runs_root))
+        arrays, _, _, _ = power.load_series(run / r2.SERIES_FILE, sha, ALL_KEYS)
+    return {"root": root, "universe": universe, "run": run, "sha": sha, "arrays": arrays, "runs_root": runs_root}
+
+
+@pytest.fixture(autouse=True)
+def runs_root_holds_the_run(sealed_vault, world, monkeypatch):
+    """After the conftest's isolation (``sealed_vault``), the runs root is the one that holds the world's run."""
+    monkeypatch.setenv("OLSPRIME_RUNS_DIR", str(world["runs_root"]))
 
 
 def call(world, argv: list[str], tmp_path: Path, *, run: Path | None = None, sha: str | None = None, factory=MatrixSystem,
@@ -216,7 +226,7 @@ def test_the_forecast_check_passes_at_a_scored_row_for_every_arm(world, tmp_path
 
 def _bit_flipped_run(world, tmp_path: Path, arm: str, i: int) -> tuple[Path, str]:
     """A copy of the run whose series.npz differs by one bit, at ``arm``'s probability of row i, with its digest re-recorded."""
-    new = tmp_path / "flipped"
+    new = world["runs_root"] / f"flipped-{tmp_path.name}"  # under the runs root, which the series reader requires
     new.mkdir()
     arrays = {k: np.array(v) for k, v in world["arrays"].items()}
     j = [str(x) for x in arrays["arms"]].index(arm)

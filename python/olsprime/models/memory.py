@@ -23,7 +23,11 @@ Causality and bits
   sequentially along the summed axis, so the value at i depends on entries 0..i only, in a fixed
   order, and never on the array's length or on later entries. :func:`prefix_moments` checks that
   this holds (``causal=True``, the default, refuses a CUDA tensor). Training (where every input
-  precedes the fit) may run its prefix sums on the GPU with ``causal=False``.
+  precedes the fit) may run its prefix sums on the GPU with ``causal=False``. Torch 2.15's docs
+  still list ``cumsum`` on a CUDA floating tensor among the ops that raise under
+  ``use_deterministic_algorithms(True)``; on torch 2.15.0+cu134 and the RTX 3060 it does not raise,
+  is bit-stable across calls and prefix lengths, and matched the CPU's sequential sum to the bit on
+  a 5,000 × 100 fp64 probe (audit 4e). The pre-check remains the gate.
 - Each query's solve depends on its own window's statistics and its own key only.
 """
 

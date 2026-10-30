@@ -38,23 +38,36 @@ or not the one the run's ``report2.json`` records.
   curve and detectable delta stand beside the constant one.
 - **Conditional on the seed.** Every replicate's bootstrap draws from the registered seed, as the rule
   would: the Wilson intervals describe the rule with that seed (common random numbers across replicates).
-- **A diagnostic.** At the size point, the variance ratio: the replicates' mean squared error over
-  their mean squared DM standard error, and the DM size it implies. A replicate keeps only the T / L
-  block sums of the series, so at large L the size is conditional on those few sums.
+- **A diagnostic, measured.** At the size point, the variance ratio: the replicates' mean squared error
+  over their mean squared DM standard error, and the DM size it implies. A replicate keeps only the
+  T / L block sums of the series, so at large L the size is conditional on those few sums.
+- **The same diagnostic, predicted before it is read** (audit pass 4c). A flip in blocks of L keeps a
+  pair of hours k apart with probability (L - k)+ / L over the offsets, so from the centred difference
+  alone the expected ratio is computed exactly over the offsets and signs (``predicted_ratio``), with
+  a Monte-Carlo band of three standard errors around the measured one; a measured ratio outside its
+  band is flagged. With no flips, the Bartlett long-run variance up to the largest L over DM's
+  23-lag rectangular one estimates DM's over-rejection on the observed dependence
+  (``no_flip_ratio``). Both describe; neither changes a registered output.
 - **Before the study**, the rule is recomputed on the observed differences by ``report2.compare_arms``
-  and compared with ``report2.json``, number by number; a difference is recorded, not refused, since
-  the digest already ties the series to its run.
+  and compared with ``report2.json``, number by number: a difference beyond rounding (``REPRODUCTION_BOUND``)
+  refuses the series; below it, it is recorded.
+- **The path, before the bytes.** ``load_series`` reads only a file under the runs root, symlinks
+  resolved, and never one under a data root or the vault key's folder.
 - **Speed.** The resampled mean is linear in the series: for a fixed T, block length and seed the
   index matrix is fixed, and the 2,000 resampled means of many replicates are one product of the
   count matrix (2,000 x T) with the replicates (T x n). Replicates are grouped by their recomputed
   block length, across L and design points, and run through that product in worker processes, each
-  with one BLAS thread (``--workers 1`` runs in-process, as the tests must). The intervals equal those
-  of the direct path ``x[idx].mean(axis=1)`` up to the last bits of the means.
+  with one BLAS thread; the command always runs its jobs in a process pool, ``--workers 1`` included,
+  so the bytes do not depend on the worker count. The intervals equal those of the direct path
+  ``x[idx].mean(axis=1)`` up to the last bits of the means.
+- **Memory.** A bootstrap job holds about 8 T x ``Batches.columns`` bytes of replicates, 2 x 2,000 x T
+  of counts and 8 x 100 x T of one product chunk: 0.6 GB at T = 50,626 and 1,024 columns, so about
+  0.6 GB per worker (``run.json`` records the estimate).
 
 Outputs, to ``runs/<UTC date>-power/`` (suffixed if taken) or ``--out``: ``power.json`` and
-``power.md`` (byte-identical on re-runs), ``config.json`` (the configuration, the series' digest,
-the Report n°2 run it came from and the provenance) and ``run.json`` (wall clock only). JSON is
-written with sorted keys.
+``power.md`` (byte-identical on re-runs, whatever the worker count), ``config.json`` (the
+configuration, the execution, the series' digest, the Report n°2 run it came from and the
+provenance) and ``run.json`` (wall clock and memory estimate only). JSON is written with sorted keys.
 """
 
 from __future__ import annotations
@@ -71,7 +84,8 @@ import time
 import zipfile
 import zlib
 from collections.abc import Iterator, Sequence
-from concurrent.futures import Future, ProcessPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, wait
+from concurrent.futures.process import BrokenProcessPool
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -84,7 +98,7 @@ from olsprime.bench import provenance as prov_mod
 from olsprime.bench import report2 as r2
 from olsprime.bench.adversary import wilson
 from olsprime.eval import stats
-from olsprime.paths import runs_dir
+from olsprime.paths import REPO_ROOT, data_dir, runs_dir
 
 POWER_FILE = "power.md"
 DM_ALPHA = 0.05  # the registered DM threshold, as in report2.passes
@@ -175,6 +189,32 @@ class SeriesRefused(ValueError):
 SERIES_KEYS_READ = ("arms", "hours", "count", "log_loss")
 
 
+def _under(path: Path, root: Path) -> bool:
+    return path.is_relative_to(root.resolve())
+
+
+def run_output(path: Path) -> Path:
+    """``path`` with its symlinks resolved, if it is a file under the runs root and under no data root or vault key folder.
+
+    Checked before a byte is read, so that the series reader can only ever open a run's output. The data roots are
+    ``data_dir()`` (``$OLSPRIME_DATA_DIR``) and the repository's ``data/``; the vault key folder is ``<runs>/vault``.
+    The vault tree of the physical seal lies outside the repository and is named only by ``vault.py`` and
+    ``protocol.py``: a path in it is refused here only because it is not under the runs root, so a runs root set
+    inside the vault tree would not be caught (naming that tree here needs a ``vault-tree`` allowance).
+    """
+    try:
+        real = path.resolve(strict=True)
+    except OSError as e:
+        raise SeriesRefused(f"{path}: cannot be resolved ({e.strerror or e})") from None
+    runs = runs_dir()
+    if not real.is_file() or not _under(real, runs):
+        raise SeriesRefused(f"{path}: not a file under the runs root {runs}, once symlinks are resolved ({real})")
+    for root in (data_dir(), REPO_ROOT / "data", runs / "vault"):
+        if _under(real, root):
+            raise SeriesRefused(f"{path}: under {root}, which the series reader never opens ({real})")
+    return real
+
+
 def load_series(path: Path, sha256: str, keys: Sequence[str] = SERIES_KEYS_READ) -> tuple[dict[str, np.ndarray], dict[str, Any], dict[str, Any], str]:
     """The hourly series of a Report n°2 run, read only if the file's SHA-256 is ``sha256`` and the run's ``report2.json`` says so.
 
@@ -183,7 +223,7 @@ def load_series(path: Path, sha256: str, keys: Sequence[str] = SERIES_KEYS_READ)
     that were hashed, without pickles. This is the one reader of ``series.npz`` in the package.
     """
     keys = tuple(dict.fromkeys((*SERIES_KEYS_READ, *keys)))
-    path = Path(path)
+    path = run_output(Path(path))
     want = sha256.strip().lower()
     data = path.read_bytes()
     digest = hashlib.sha256(data).hexdigest()
@@ -192,6 +232,7 @@ def load_series(path: Path, sha256: str, keys: Sequence[str] = SERIES_KEYS_READ)
     report_path, config_path = path.parent / "report2.json", path.parent / "config.json"
     if not report_path.is_file() or not config_path.is_file():
         raise SeriesRefused(f"{path.parent}: no report2.json and config.json beside the series, so its run cannot vouch for it")
+    report_path, config_path = run_output(report_path), run_output(config_path)
     report_bytes = report_path.read_bytes()
     report = json.loads(report_bytes)
     rec = report.get("series")
@@ -324,13 +365,16 @@ def boot_counts(idx: np.ndarray, t: int) -> np.ndarray:
 
 def count_matrix(t: int, block: int, n_boot: int, seed: int) -> np.ndarray:
     """(n_boot, t) counts of the registered bootstrap's index paths, in uint16; exactly the paths of ``report2.mean_interval``."""
-    parts = []
+    out = np.empty((n_boot, t), dtype=np.uint16)  # filled in place: no second copy of the counts at the peak
+    done = 0
     for idx in r2._chunks(t, block, n_boot, seed):
         counts = boot_counts(idx, t)
         if counts.max() > np.iinfo(np.uint16).max:
             raise OverflowError("an hour appears more than 65,535 times in one bootstrap path")
-        parts.append(counts.astype(np.uint16))
-    return np.concatenate(parts, axis=0)
+        out[done : done + counts.shape[0]] = counts
+        done += counts.shape[0]
+    assert done == n_boot
+    return out
 
 
 def grouped_means(counts: np.ndarray, x: np.ndarray, *, product_columns: int = 256, chunk_rows: int = 100) -> np.ndarray:
@@ -424,38 +468,26 @@ def _job_boot(job: _Job, block: int, columns: np.ndarray) -> np.ndarray:
 
     The count matrix depends on T, the block and the comparison's seed only, so one job serves every L and every point.
     """
+    counts = count_matrix(job.c.size, block, job.rule.n_boot, job.rule.seed(job.comp.a, job.comp.b))  # first: its build peak holds no replicates
     reps = _Replicates(job)
     x = np.empty((job.c.size, columns.shape[0]))
     for k, (length, p, r) in enumerate(columns):
         x[:, k] = reps.shifted(reps.base(int(length), int(r)), job.points[int(length)][int(p)], int(r))
-    counts = count_matrix(job.c.size, block, job.rule.n_boot, job.rule.seed(job.comp.a, job.comp.b))
     means = grouped_means(counts, x, product_columns=job.product_columns)
     return np.column_stack(interval_from_means(means, job.rule.level))
 
 
 class _Inline:
-    """``workers = 1``: run each job at once in this process. Pools pickle their results, which pytest's tripwire refuses."""
+    """``study(..., workers=1)`` without ``pool``: run each job at once in this process, for the tests' small studies.
 
-    def __enter__(self) -> _Inline:
-        return self
+    The command never uses it (``run_study`` always runs a process pool, ``--workers 1`` included). In this process
+    a multi-threaded BLAS sums the long dot products of Diebold-Mariano and Politis-White (``stats._hac``'s
+    ``c @ c``) in another order, so a few diagnostic floats can differ from the pool's in their last bits.
+    """
 
-    def __exit__(self, *exc: object) -> None:
-        return None
-
-    def submit(self, fn: Any, *args: Any) -> Future:
-        fut: Future = Future()
-        fut.set_result(fn(*args))
-        return fut
-
-
-@contextlib.contextmanager
-def _executor(workers: int) -> Iterator[Any]:
-    if workers <= 1:
-        with _Inline() as ex:
-            yield ex
-        return
-    with _one_blas_thread(), ProcessPoolExecutor(max_workers=workers) as pool:
-        yield pool
+    @staticmethod
+    def run(calls: Sequence[tuple[Any, tuple[Any, ...]]]) -> list[Any]:
+        return [fn(*args) for fn, args in calls]
 
 
 @contextlib.contextmanager
@@ -473,6 +505,72 @@ def _one_blas_thread() -> Iterator[None]:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+POOL_RESTARTS = 3  # a pool that broke or stalled is rebuilt this many times at most
+STALL_SECONDS = 1800.0  # no call finished for this long: the pool is taken as hung (a bootstrap job at T = 50,626 takes minutes)
+
+
+class PoolFailed(RuntimeError):
+    """A worker process died, or no call finished for ``STALL_SECONDS``: the pool cannot finish its calls."""
+
+
+def _run_calls(calls: Sequence[tuple[Any, tuple[Any, ...]]], workers: int, pool: bool, restarts: list[str], *,
+               stall_seconds: float = STALL_SECONDS) -> list[Any]:  # fmt: skip
+    """Every call's result, in the order of ``calls``: in this process (``_Inline``) when ``workers`` <= 1 and not
+    ``pool``, else in a ``ProcessPoolExecutor`` of ``max(1, workers)`` spawned processes with one BLAS thread each.
+
+    On this Windows machine (CPython 3.12.10) a spawned worker sometimes dies at start-up with ``OSError: [WinError 6]``
+    on its call queue's semaphore, which breaks the pool, and a pool sometimes hangs: 3 pools in 25 with the
+    command's imports (scipy.stats, polars) in the workers, none in 25 without (scratch ``pool_stress_mod.py``).
+    ``multiprocessing.Pool`` broke none in 50 outside pytest but hangs under pytest's tripwire, so it is not used.
+    So a pool that breaks (``BrokenProcessPool``) or in which no call finishes for ``stall_seconds`` is shut down, its
+    workers stopped, and rebuilt; the calls without a result run again, up to ``POOL_RESTARTS`` times, each restart
+    noted in ``restarts``. A call is a pure function of its arguments, so a call run twice gives the same bytes. An
+    exception raised by a call itself is re-raised as it is.
+    """
+    if workers <= 1 and not pool:
+        return _Inline.run(calls)
+    results: list[Any] = [None] * len(calls)
+    done = [False] * len(calls)
+    for attempt in range(POOL_RESTARTS + 1):
+        with _one_blas_thread():
+            executor = ProcessPoolExecutor(max_workers=max(1, int(workers)))
+            finished_cleanly = False
+            try:
+                pending = {executor.submit(fn, *args): k for k, (fn, args) in enumerate(calls) if not done[k]}
+                while pending:
+                    finished, _ = wait(pending, timeout=stall_seconds, return_when=FIRST_COMPLETED)
+                    if not finished:
+                        raise PoolFailed(f"no call finished for {stall_seconds:g} s")
+                    for fut in finished:
+                        k = pending.pop(fut)
+                        if isinstance(fut.exception(), BrokenProcessPool):
+                            raise PoolFailed(f"a worker died ({fut.exception()})")
+                        results[k], done[k] = fut.result(), True  # a call's own exception propagates from here, unchanged
+                executor.shutdown(wait=True)
+                finished_cleanly = True
+                return results
+            except (PoolFailed, BrokenProcessPool) as e:
+                _stop_pool(executor)
+                if attempt == POOL_RESTARTS:
+                    raise PoolFailed(f"the pool failed {POOL_RESTARTS + 1} times; last: {e}") from e
+                restarts.append(f"pool rebuilt: {e}; {sum(done)} of {len(calls)} calls done")
+            finally:
+                if not finished_cleanly:  # a failed pool, or a call that raised: no worker outlives the call
+                    _stop_pool(executor)
+    return results
+
+
+def _stop_pool(executor: ProcessPoolExecutor) -> None:
+    """Cancel what is queued, stop the executor and terminate its live workers (twice is harmless)."""
+    processes = list((getattr(executor, "_processes", None) or {}).values())  # the executor's own workers
+    executor.shutdown(wait=False, cancel_futures=True)
+    for proc in processes:
+        if proc.is_alive():
+            proc.terminate()
+    for proc in processes:
+        proc.join(timeout=30)
 
 
 # --- The study --------------------------------------------------------------------------------
@@ -532,48 +630,147 @@ def _classify(comp: Comparison, point: Point, res: np.ndarray, margin_abs: float
     out["blocks"] = {"min": int(blocks.min()), "median": float(np.median(blocks)), "max": int(blocks.max()), "distinct": int(np.unique(blocks).size)}
     if point.name == "size":
         ok = np.isfinite(upper)
-        se2 = float(np.mean(((upper[ok] - mean[ok]) / t95) ** 2))
-        ratio = float(np.mean((mean[ok] - point.shift) ** 2)) / se2
+        b = ((upper[ok] - mean[ok]) / t95) ** 2
+        a = (mean[ok] - point.shift) ** 2
+        se2 = float(np.mean(b))
+        ratio = float(np.mean(a)) / se2
         out["variance_ratio"] = ratio
-        out["dm_size_from_ratio"] = float(2.0 * st.norm.sf(st.norm.ppf(1.0 - DM_ALPHA / 2.0) / math.sqrt(ratio)))
+        # Monte-Carlo standard error of a ratio of means (delta method): sd(a - R b) / (sqrt(n) mean(b))
+        out["variance_ratio_se"] = float(np.std(a - ratio * b, ddof=1) / (math.sqrt(a.size) * se2)) if a.size > 1 else math.nan
+        out["dm_size_from_ratio"] = dm_size_from_ratio(ratio)
     return out
+
+
+def dm_size_from_ratio(ratio: float) -> float:
+    """The two-sided size of a 5 % DM test whose variance is too small by ``ratio`` (normal approximation)."""
+    return float(2.0 * st.norm.sf(st.norm.ppf(1.0 - DM_ALPHA / 2.0) / math.sqrt(ratio)))
+
+
+# --- The variance ratio, predicted before it is read ----------------------------------------------
+
+BAND_SE = 3.0  # a measured ratio more than three Monte-Carlo standard errors from its prediction is flagged
+
+
+def hln_factor(t: int, h: int) -> float:
+    """Harvey-Leybourne-Newbold: DM's statistic is multiplied by sqrt of this, so its variance is divided by it."""
+    return (t + 1 - 2 * h + h * (h - 1) / t) / t
+
+
+def flip_moments(c: np.ndarray, length: int, lags: int) -> tuple[float, float]:
+    """Exact expectations, over the L offsets and the random signs, for block flips of the centred series c.
+
+    - ``n``: T E[mean^2] = (1/T) E[sum of squared block sums]: a pair of hours k apart counts when both sit in one
+      block, which happens with probability (L - k)+ / L over the offsets.
+    - ``d``: the expectation of the rectangular kernel's sum on the replicate, gamma_0 + 2 sum_{k <= lags} of its
+      lag-k products, each pair counted when in one block, before the replicate's own mean is removed.
+
+    Sums are elementwise (``np.sum``), not BLAS dot products, so they do not depend on threads.
+    """
+    t = c.size
+    prods = [c[:-k] * c[k:] for k in range(1, lags + 1)]
+    g0 = float(np.sum(c * c)) / t
+    n_sum = d_sum = 0.0
+    for offset in range(int(length)):
+        b = block_index(t, length, offset)
+        sums = np.bincount(b, weights=c)
+        n_sum += float(np.sum(sums * sums)) / t
+        d = g0
+        for k, p in enumerate(prods, start=1):
+            d += 2.0 * float(np.sum(p[b[:-k] == b[k:]])) / t
+        d_sum += d
+    return n_sum / length, d_sum / length
+
+
+def predicted_ratio(c: np.ndarray, length: int, h: int) -> float:
+    """The variance ratio expected at block length L from c alone: E[mean^2] over E[DM's squared standard error].
+
+    E[mean^2] = n / T. DM's squared standard error is its rectangular kernel sum, with the replicate's mean removed,
+    over T x the HLN factor; removing the mean takes about mean^2 from each of its 2 lags + 1 terms, so its
+    expectation is (d - (2 lags + 1) n / T) / (T x HLN). Hence ratio = n HLN / (d - (2 lags + 1) n / T). At L = h the
+    kernel covers every lag a flip keeps, and the ratio is 1 up to that last term.
+    """
+    lags = h - 1
+    n, d = flip_moments(c, length, lags)
+    return n * hln_factor(c.size, h) / (d - (2 * lags + 1) * n / c.size)
+
+
+def no_flip_ratio(c: np.ndarray, h: int, bandwidth: int) -> float:
+    """With no flips, DM's over-rejection on the observed dependence: the Bartlett long-run variance with ``bandwidth``
+    (weights (M - k) / M, the flips' own weights at L = M) over DM's rectangular sum with h - 1 lags, times HLN.
+
+    An estimate: dependence longer than the bandwidth is not seen, and the full sum of a centred series'
+    autocovariances is 0, so a bandwidth is needed.
+    """
+    t = c.size
+    gam = np.array([float(np.sum(c * c))] + [float(np.sum(c[:-k] * c[k:])) for k in range(1, min(bandwidth, t))]) / t
+    w = (bandwidth - np.arange(gam.size)) / bandwidth
+    lrv = gam[0] + 2.0 * float(np.sum(w[1:] * gam[1:]))
+    rect = gam[0] + 2.0 * float(np.sum(gam[1:h]))
+    return lrv * hln_factor(t, h) / rect
+
+
+def variance_prediction(c: np.ndarray, block_lengths: Sequence[int], h: int) -> dict[str, Any]:
+    """The predicted ratio at each L, and with no flips (bandwidth M: the largest L). The no-flip ratio is a Bartlett
+    long-run variance, whose relative standard error is about sqrt(4 M / (3 T)) (Newey and West): ``ratio_se``, about 14 %
+    at M = 720 and T = 50,626."""
+    bandwidth = int(max(block_lengths))
+    nf = no_flip_ratio(c, h, bandwidth)
+    return {"per_block_length": {str(L): predicted_ratio(c, int(L), h) for L in block_lengths},
+            "no_flips": {"ratio": nf, "ratio_se": nf * math.sqrt(4.0 * bandwidth / (3.0 * c.size)), "dm_size_implied": dm_size_from_ratio(nf),
+                         "bartlett_bandwidth": bandwidth}}  # fmt: skip
 
 
 def observed_rule(ll: dict[str, np.ndarray], comp: Comparison, rule: Rule, clim: float) -> dict[str, Any]:
     """The registered rule on the observed difference, by report2's own path (``compare_arms``)."""
     c = r2.compare_arms(ll, comp.a, comp.b, clim, rule.report2_config())
-    keep = ("mean_diff", "share_of_climatology", "dm_statistic", "dm_p", "dm_se", "upper_95_one_sided", "bootstrap", "passes")
+    keep = ("mean_diff", "share_of_climatology", "dm_statistic", "dm_p", "dm_se", "dm_kernel", "dm_lags", "dm_note", "upper_95_one_sided",
+            "bootstrap", "passes", "hours", "identical_hours", "share_of_hours_identical")  # the rule, its kernel and the identical hours
     return {k: c[k] for k in keep}
 
 
-def reproduction(mine: dict[str, Any], recorded: dict[str, Any]) -> dict[str, Any]:
+REPRODUCTION_BOUND = 1e-9  # relative; see reproduction
+
+
+def reproduction(mine: dict[str, Any], recorded: dict[str, Any], *, name: str = "") -> dict[str, Any]:
     """Whether the rule recomputed from the series gives report2.json's numbers to the bit, and else how far they are.
 
-    The digest already ties the series to its run, so a difference here says the environment moved (a numpy
-    or scipy version, a BLAS), not the data: it is recorded, and the study still runs.
+    Below ``REPRODUCTION_BOUND`` (1e-9 relative) a difference is rounding: another numpy, scipy or BLAS sums the
+    same hours in another order, which moves a float by some 1e-16 to 1e-12 (the p-value's tail transforms
+    included). Above it, the series is not the one the run's verdicts were computed on: one hour moved in 50,626
+    moves a mean or a Diebold-Mariano statistic by some 1e-6 or more. So a float beyond the bound, or any other
+    value that differs (a verdict, a block length, a missing number), refuses the series with ``SeriesRefused``;
+    below it, the difference is recorded and the study runs.
     """
     flat_mine = {**{k: v for k, v in mine.items() if k != "bootstrap"}, **{f"bootstrap.{k}": v for k, v in mine["bootstrap"].items()}}
     flat_rec = {**{k: v for k, v in recorded.items() if k in mine and k != "bootstrap"},
                 **{f"bootstrap.{k}": v for k, v in recorded.get("bootstrap", {}).items()}}  # fmt: skip
-    worst, differ = 0.0, []
+    worst, differ, beyond = 0.0, [], []
     for k, v in flat_mine.items():
         r = flat_rec.get(k)
-        if v != r:
-            differ.append(k)
-            if isinstance(v, float) and isinstance(r, float) and r != 0.0:
-                worst = max(worst, abs(v - r) / abs(r))
+        if v == r:
+            continue
+        differ.append(k)
+        if isinstance(v, float) and isinstance(r, float) and math.isfinite(v) and math.isfinite(r):
+            rel = abs(v - r) / max(abs(v), abs(r))
+            worst = max(worst, rel)
+            if rel <= REPRODUCTION_BOUND:
+                continue
+        beyond.append(f"{k}: {r!r} in report2.json, {v!r} recomputed")
+    if beyond:
+        raise SeriesRefused(f"{name or 'a comparison'}: the rule recomputed from the series differs from report2.json beyond "
+                            f"rounding ({REPRODUCTION_BOUND:g} relative): " + "; ".join(beyond))  # fmt: skip
     return {"identical": not differ, "differing": sorted(differ), "max_relative_difference": worst}
 
 
 def study(ll: dict[str, np.ndarray], comparisons: Sequence[Comparison], rule: Rule, cfg: PowerConfig, *,
           climatology: str = r2.CLIMATOLOGY, workers: int = 1, batches: Batches = Batches(),
-          timings: dict[str, float] | None = None) -> dict[str, Any]:  # fmt: skip
+          timings: dict[str, float] | None = None, pool: bool = False, restarts: list[str] | None = None) -> dict[str, Any]:  # fmt: skip
     """The size and power of the pass rule on each comparison's hourly difference.
 
     Deterministic: every replicate, its group and its result follow from the data and the design alone;
-    ``workers`` and ``batches`` only cut the same computations into jobs. With ``workers`` > 1 the jobs
-    run in processes with one BLAS thread each; with 1 they run here, where a multi-threaded BLAS may
-    round the long dot products of Politis-White and Diebold-Mariano differently in the last bits.
+    ``workers`` and ``batches`` only cut the same computations into jobs. With ``pool`` or ``workers`` > 1 the jobs
+    run in a process pool with one BLAS thread each, and the bytes do not depend on ``workers``; with neither they
+    run here (``_Inline``), for small studies.
     """
     cfg.check()
     clim = float(ll[climatology].mean())
@@ -591,40 +788,40 @@ def study(ll: dict[str, np.ndarray], comparisons: Sequence[Comparison], rule: Ru
             continue
         jobs[i] = _Job(c, comp, cfg, rule, {L: tuple(design_points(comp, cfg, clim, L)) for L in cfg.block_lengths}, batches.product_columns)
     timings = {} if timings is None else timings
+    restarts = [] if restarts is None else restarts
     started = time.perf_counter()
     step = batches.replicates
-    with _executor(int(workers)) as pool:
-        futures = {}
-        for i, job in jobs.items():
-            for length in cfg.block_lengths:
-                for s in range(0, cfg.size_replicates, step):
-                    futures[(i, length, s)] = pool.submit(_job_dm, job, length, s, min(s + step, cfg.size_replicates))
-        first = {(i, L): np.concatenate([futures[(i, L, s)].result() for s in range(0, cfg.size_replicates, step)])
-                 for i in jobs for L in cfg.block_lengths}  # fmt: skip
-        timings["dm_and_politis_white"] = time.perf_counter() - started
-        started = time.perf_counter()
-        boot_futures = []
-        groups = 0
-        for i in jobs:
-            keys = [(i, length) for length in cfg.block_lengths]
-            # every replicate of the comparison, L by L in the config's order: L, point, rep, p, mean, upper, block
-            res = np.concatenate([np.column_stack([np.full(first[k].shape[0], k[1], dtype=np.float64), first[k]]) for k in keys])
-            starts = np.cumsum([0] + [first[k].shape[0] for k in keys])
-            for block in np.unique(res[:, 6].astype(np.int64)):
-                rows = np.flatnonzero(res[:, 6] == block)  # deterministic: the order of the replicates, not of the workers
-                groups += 1
-                for s in range(0, rows.size, batches.columns):
-                    part = rows[s : s + batches.columns]
-                    cols = res[part][:, :3].astype(np.int64)
-                    boot_futures.append((keys, starts, part, pool.submit(_job_boot, jobs[i], int(block), cols)))
-        boot = {key: np.full((first[key].shape[0], 3), np.nan) for key in first}
-        for keys, starts, part, fut in boot_futures:
-            values = fut.result()
-            which = np.searchsorted(starts, part, side="right") - 1
-            for w, key in enumerate(keys):
-                sel = which == w
-                boot[key][part[sel] - starts[w]] = values[sel]
-        timings["grouped_bootstrap"] = time.perf_counter() - started
+    phase_a = [(_job_dm, (job, length, s, min(s + step, cfg.size_replicates)))
+               for job in jobs.values() for length in cfg.block_lengths for s in range(0, cfg.size_replicates, step)]  # fmt: skip
+    keys_a = [(i, length) for i in jobs for length in cfg.block_lengths for _ in range(0, cfg.size_replicates, step)]
+    out_a = _run_calls(phase_a, int(workers), pool, restarts)
+    first = {key: np.concatenate([r for k, r in zip(keys_a, out_a, strict=True) if k == key]) for key in dict.fromkeys(keys_a)}
+    timings["dm_and_politis_white"] = time.perf_counter() - started
+    started = time.perf_counter()
+    phase_b, where_b = [], []
+    groups = 0
+    for i in jobs:
+        keys = [(i, length) for length in cfg.block_lengths]
+        # every replicate of the comparison, L by L in the config's order: L, point, rep, p, mean, upper, block
+        res = np.concatenate([np.column_stack([np.full(first[k].shape[0], k[1], dtype=np.float64), first[k]]) for k in keys])
+        starts = np.cumsum([0] + [first[k].shape[0] for k in keys])
+        for block in np.unique(res[:, 6].astype(np.int64)):
+            rows = np.flatnonzero(res[:, 6] == block)  # deterministic: the order of the replicates, not of the workers
+            groups += 1
+            for s in range(0, rows.size, batches.columns):
+                part = rows[s : s + batches.columns]
+                phase_b.append((_job_boot, (jobs[i], int(block), res[part][:, :3].astype(np.int64))))
+                where_b.append((keys, starts, part))
+    boot = {key: np.full((first[key].shape[0], 3), np.nan) for key in first}
+    for (keys, starts, part), values in zip(where_b, _run_calls(phase_b, int(workers), pool, restarts), strict=True):
+        which = np.searchsorted(starts, part, side="right") - 1
+        for w, key in enumerate(keys):
+            sel = which == w
+            boot[key][part[sel] - starts[w]] = values[sel]
+    timings["grouped_bootstrap"] = time.perf_counter() - started
+    started = time.perf_counter()
+    predictions = {i: variance_prediction(job.c, cfg.block_lengths, rule.dm_h) for i, job in jobs.items()}
+    timings["variance_prediction"] = time.perf_counter() - started
     out_comps = []
     for i, comp in enumerate(comparisons):
         margin_abs = None if comp.margin is None else comp.margin * clim
@@ -637,6 +834,7 @@ def study(ll: dict[str, np.ndarray], comparisons: Sequence[Comparison], rule: Ru
             out_comps.append(entry)
             continue
         entry["size"], entry["power"] = {}, {}
+        entry["variance_no_flips"] = predictions[i]["no_flips"]
         if comp.margin is None and cfg.concentrated_block is not None:
             entry["power_concentrated"] = {}
         for length in cfg.block_lengths:
@@ -645,6 +843,10 @@ def study(ll: dict[str, np.ndarray], comparisons: Sequence[Comparison], rule: Ru
             pidx = first[(i, length)][:, 0].astype(np.int64)
             by_point = [res[pidx == k] for k in range(len(pts))]
             size = _classify(comp, pts[0], by_point[0], margin_abs if margin_abs is not None else 0.0, t95)
+            pred, half = predictions[i]["per_block_length"][str(length)], BAND_SE * size["variance_ratio_se"]
+            size["variance_ratio_predicted"] = pred
+            size["variance_ratio_band"] = [pred - half, pred + half]
+            size["variance_ratio_outside_band"] = bool(not pred - half <= size["variance_ratio"] <= pred + half)
             entry["size"][str(length)] = size
             if comp.margin is None:
                 for name, where in (("power", entry["power"]), ("concentrated", entry.get("power_concentrated"))):
@@ -662,7 +864,11 @@ def study(ll: dict[str, np.ndarray], comparisons: Sequence[Comparison], rule: Ru
             rate = s["pass_two_sided"]["rate"] if e["kind"] == "superiority" else s["holds"]["rate"]
             if rate > cfg.size_alert:
                 alerts.append({"hypothesis": e["hypothesis"], "a": e["a"], "b": e["b"], "block_length": int(length), "size": rate})
+    outside = [{"hypothesis": e["hypothesis"], "a": e["a"], "b": e["b"], "block_length": int(length), "measured": s["variance_ratio"],
+                "predicted": s["variance_ratio_predicted"], "band": s["variance_ratio_band"]}
+               for e in out_comps for length, s in _by_length(e.get("size", {})) if s["variance_ratio_outside_band"]]  # fmt: skip
     return {
+        "variance_ratio_outside_band": outside,
         "hours": t,
         "climatology_log_loss": clim,
         "comparisons": out_comps,
@@ -749,26 +955,44 @@ def render(power: dict[str, Any], config: dict[str, Any]) -> str:
         "registered: the pass rule with a lower. H12: the true difference sits on its margin, and the rate is that at which it holds.",
         "",
         "| comparison | L (hours) | DM | bootstrap | pass rule, two-sided | pass rule, registered | PW block: median [min, max] "
-        "| variance ratio (DM size it implies) |",
-        "|---|---|---|---|---|---|---|---|",
+        "| variance ratio, measured (DM size it implies) | predicted [band of 3 MC s.e.] |",
+        "|---|---|---|---|---|---|---|---|---|",
     ]
     for e in res["comparisons"]:
         name = f"{e['hypothesis']}: {e['a']} - {e['b']}"
         if "undefined" in e:
-            lines.append(f"| {name} | - | no test: {e['undefined']} | | | | | |")
+            lines.append(f"| {name} | - | no test: {e['undefined']} | | | | | | |")
             continue
         for length, s in _by_length(e["size"]):
             blk = f"{s['blocks']['median']:g} [{s['blocks']['min']}, {s['blocks']['max']}]"
             vr = f"{s['variance_ratio']:.3f} ({100 * s['dm_size_from_ratio']:.1f})"
+            lo, hi = s["variance_ratio_band"]
+            vp = f"{s['variance_ratio_predicted']:.3f} [{lo:.3f}, {hi:.3f}]" + (" **outside**" if s["variance_ratio_outside_band"] else "")
             if e["kind"] == "superiority":
                 lines.append(f"| {name} | {length} | {_r(s['dm'])} | {_r(s['bootstrap'])} | {_r(s['pass_two_sided'])} | "
-                             f"{_r(s['pass_registered'])} | {blk} | {vr} |")  # fmt: skip
+                             f"{_r(s['pass_registered'])} | {blk} | {vr} | {vp} |")  # fmt: skip
             else:
                 lines.append(f"| {name} | {length} | upper bound below m: {_r(s['upper_below_margin'])} | q95 below m: "
-                             f"{_r(s['q95_below_margin'])} | holds: {_r(s['holds'])} | - | {blk} | {vr} |")  # fmt: skip
+                             f"{_r(s['q95_below_margin'])} | holds: {_r(s['holds'])} | - | {blk} | {vr} | {vp} |")  # fmt: skip
     alerts = res["size_alerts"]
     lines += ["", f"Above {cfg['size_alert']:.1%}: " + ("; ".join(f"{a['hypothesis']} {a['a']} - {a['b']} at L = {a['block_length']} "
                                                                 f"({100 * a['size']:.1f} %)" for a in alerts) if alerts else "none") + "."]  # fmt: skip
+    outside = res["variance_ratio_outside_band"]
+    lines += ["", "Measured variance ratios outside their predicted band: " + ("; ".join(
+        f"{o['hypothesis']} {o['a']} - {o['b']} at L = {o['block_length']} ({o['measured']:.3f}, predicted {o['predicted']:.3f})"
+        for o in outside) if outside else "none") + "."]  # fmt: skip
+    lines += ["", "### The variance ratio with no flips", "",
+              "How much DM's variance misses on the observed dependence, estimated from each difference alone: the Bartlett long-run variance "
+              "(bandwidth below) over DM's 23-lag rectangular sum, with HLN. Dependence longer than the bandwidth is not seen. "
+              f"On this series the ratio has a standard error of about {100 * math.sqrt(4.0 * max(cfg['block_lengths']) / (3.0 * res['hours'])):.0f} % "
+              "of itself (a Bartlett estimate, sqrt(4 M / (3 T))): it describes the dependence beyond the kernel's 23 lags, it is "
+              "not a measurement of DM's size.", "",
+              "| comparison | bandwidth (hours) | ratio (s.e.) | DM size it would imply |", "|---|---|---|---|"]  # fmt: skip
+    for e in res["comparisons"]:
+        if "variance_no_flips" in e:
+            nf = e["variance_no_flips"]
+            lines.append(f"| {e['hypothesis']}: {e['a']} - {e['b']} | {nf['bartlett_bandwidth']} | {nf['ratio']:.3f} ({nf['ratio_se']:.3f}) | "
+                         f"{100 * nf['dm_size_implied']:.1f} % |")  # fmt: skip
     deltas = cfg["deltas"]
 
     def table(key: str) -> list[str]:
@@ -847,8 +1071,17 @@ def render(power: dict[str, Any], config: dict[str, Any]) -> str:
         "- The variance ratio is the replicates' mean squared error around the true difference over their mean squared DM standard "
         "error; the DM size it implies is the normal approximation 2(1 - Phi(1.96 / sqrt(ratio))). A replicate keeps only the T / L "
         "block sums of the series, so at large L the size is conditional on how those few sums happened to fall.",
+        "- The predicted ratio is computed from the centred difference alone, before the replicates are read: over the L offsets and "
+        "the signs, a pair of hours k apart stays in one block with probability (L - k)+ / L, which gives the expected squared mean; "
+        "the expected rectangular sum on a replicate keeps the same pairs among its 23 lags, less what removing the replicate's mean "
+        "takes. Its band is three Monte-Carlo standard errors of the measured ratio (delta method over the replicates). It describes; "
+        "nothing registered depends on it.",
+        "- Execution: " + ("not recorded" if config.get("execution") is None else (
+            f"a process pool, {config['execution']['blas_threads_per_job']} BLAS thread per job (the worker count is in `config.json`); "
+            "the bytes of `power.json` and of this page do not depend on it")) + ".",  # fmt: skip
         "- The observed rule, recomputed from the series by `report2.compare_arms`, reproduces every comparison of the run's "
-        "`report2.json`: " + ("yes" if power["observed_reproduces_report2"] else "NO: " + "; ".join(
+        "`report2.json`: " + ("yes, to the bit" if power["observed_reproduces_report2"] else "within rounding (below a relative "
+            f"{REPRODUCTION_BOUND:g}; beyond it the series is refused): " + "; ".join(
             f"{name}, {', '.join(v['differing'])} (largest relative difference {v['max_relative_difference']:.1e})"
             for name, v in power["observed"].items() if not v["identical"])) + ".",  # fmt: skip
         "",
@@ -859,8 +1092,23 @@ def render(power: dict[str, Any], config: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def execution_record(workers: int) -> dict[str, Any]:
+    """How the command runs its jobs: always a process pool, one BLAS thread per job, so the bytes do not depend on ``workers``."""
+    return {"workers": max(1, int(workers)), "executor": "ProcessPoolExecutor (spawn)", "blas_threads_per_job": 1}
+
+
+def job_memory(t: int, batches: Batches, n_boot: int, chunk_rows: int = 100) -> int:
+    """Bytes a bootstrap job holds at its peak, about. It builds its counts (2 n_boot t, uint16) from chunks of index
+    paths (three int64 arrays of chunk_rows x t), then its replicates (8 t columns) and their products (one float chunk
+    of counts, 8 chunk_rows t, and the means, 8 n_boot columns): the larger of the two phases."""
+    counts = 2 * n_boot * t
+    build = counts + 24 * chunk_rows * t
+    product = counts + 8 * t * batches.columns + 8 * chunk_rows * t + 8 * n_boot * batches.columns
+    return int(max(build, product))
+
+
 def config_record(cfg: PowerConfig, rule: Rule, comparisons: Sequence[Comparison], series: dict[str, Any], report_config: dict[str, Any],
-                  provenance: dict[str, Any]) -> dict[str, Any]:  # fmt: skip
+                  provenance: dict[str, Any], *, execution: dict[str, Any] | None = None) -> dict[str, Any]:  # fmt: skip
     import scipy
 
     return {
@@ -872,6 +1120,7 @@ def config_record(cfg: PowerConfig, rule: Rule, comparisons: Sequence[Comparison
         "series": series,
         "report_run": {"provenance": report_config.get("provenance"), "registered": report_config.get("registered")},
         "versions": {"numpy": np.__version__, "scipy": scipy.__version__, "python": sys.version.split()[0]},
+        "execution": execution,
         "provenance": provenance,
     }
 
@@ -887,15 +1136,19 @@ def run_study(series_path: Path, sha256: str, out: Path, *, cfg: PowerConfig = P
     arms = [str(a) for a in arrays["arms"]]
     ll = {a: np.ascontiguousarray(arrays["log_loss"][k]) for k, a in enumerate(arms)}
     clim = float(ll[r2.CLIMATOLOGY].mean())
-    if clim != report["arms"][r2.CLIMATOLOGY]["log_loss"]["estimate"]:
-        raise SeriesRefused("climatology's mean hourly log-loss in the series is not the one of report2.json")
+    recorded_clim = report["arms"][r2.CLIMATOLOGY]["log_loss"]["estimate"]
+    if not (isinstance(recorded_clim, float) and abs(clim - recorded_clim) <= REPRODUCTION_BOUND * max(abs(clim), abs(recorded_clim))):
+        raise SeriesRefused(f"climatology's mean hourly log-loss in the series differs from report2.json beyond rounding "
+                            f"({REPRODUCTION_BOUND:g} relative): {recorded_clim!r} in report2.json, {clim!r} recomputed")  # fmt: skip
     observed = {}
     for comp in comparisons:
         recorded = next((c for c in report.get("comparisons", []) if (c["a"], c["b"]) == (comp.a, comp.b)), None)
         if recorded is not None:
-            observed[f"{comp.a} - {comp.b}"] = reproduction(observed_rule(ll, comp, rule, clim), recorded)
+            name = f"{comp.a} - {comp.b}"
+            observed[name] = reproduction(observed_rule(ll, comp, rule, clim), recorded, name=name)
     timings: dict[str, float] = {}
-    result = study(ll, comparisons, rule, cfg, workers=workers, batches=batches, timings=timings)
+    restarts: list[str] = []
+    result = study(ll, comparisons, rule, cfg, workers=workers, batches=batches, timings=timings, pool=True, restarts=restarts)
     power = {
         "registered": bool(cfg.registered and report.get("registered") is True),
         "result": result,
@@ -907,14 +1160,15 @@ def run_study(series_path: Path, sha256: str, out: Path, *, cfg: PowerConfig = P
     series = {"file": series_path.name, "sha256": sha256.strip().lower(), "run": series_path.parent.name, "report2_json_sha256": report_sha}
     if provenance is None:
         provenance = {**prov_mod.record({"digest": report_config.get("provenance", {}).get("manifest_digest")})}
-    config = config_record(cfg, rule, comparisons, series, report_config, provenance)
+    config = config_record(cfg, rule, comparisons, series, report_config, provenance, execution=execution_record(workers))
     out.mkdir(parents=True, exist_ok=True)
     r2._write_json(out / "config.json", config)
     r2._write_json(out / "power.json", power)
     power, config = (json.loads((out / n).read_text(encoding="utf-8")) for n in ("power.json", "config.json"))
     (out / POWER_FILE).write_text(render(power, config), encoding="utf-8", newline="\n")
     run = {"finished_at": datetime.now(UTC).isoformat(timespec="seconds"), "seconds": round(time.perf_counter() - started, 1),
-           "stages_seconds": {k: round(v, 1) for k, v in timings.items()}, "workers": int(workers), "batches": asdict(batches)}  # fmt: skip
+           "stages_seconds": {k: round(v, 1) for k, v in timings.items()}, "workers": int(workers), "batches": asdict(batches),
+           "memory_per_bootstrap_job_bytes": job_memory(result["hours"], batches, rule.n_boot), "pool_restarts": restarts}  # fmt: skip
     r2._write_json(out / "run.json", run)
     return power
 

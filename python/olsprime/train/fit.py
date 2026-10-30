@@ -37,6 +37,9 @@ Nothing here turns a control on; they live in the bench.
   stored in the memory, used by the climatology and scored; ``pos-window`` overrides it with
   :func:`past_window_labels`. Its entries keep the stamp hook's ``label_known_at``.
 - Also :meth:`~EncoderSystem.readout_as_of` and :meth:`~EncoderSystem.slice_mask`.
+- **Read-only.** :meth:`~EncoderSystem.on_readout` sees the memory's prefix sums and window
+  bounds of every evaluation readout (the panel H1 records the window moments); it returns nothing
+  and changes nothing.
 
 Every epoch's parameters are kept (:attr:`FitResult.epoch_states`, :meth:`FitResult.epoch_digests`)
 beside the kept epoch's.
@@ -281,6 +284,9 @@ class EncoderSystem:
         """The instant a row's memory readout reads up to: its decision time."""
         return self.data.arrays.decision_ms[rows]
 
+    def on_readout(self, prefix: Any, lo: torch.Tensor, hi: torch.Tensor) -> None:
+        """Read-only: called by :meth:`predict` with the prefix sums and window bounds of its queries. Honest: nothing."""
+
     def training_mask(self) -> np.ndarray:
         """The training rows: usable, label known by the training horizon ``F - train_gap_ms`` (30 days).
 
@@ -509,6 +515,7 @@ class EncoderSystem:
         y_e = one_hot(torch.from_numpy(self.y[e_rows]), dtype=torch.float64)
         prefix = prefix_moments(z_cpu[e_at], y_e, causal=True)
         lo_q, hi_q = window_bounds(torch.from_numpy(e_stamps), torch.from_numpy(as_of), mem.window_ms)
+        self.on_readout(prefix, lo_q, hi_q)
         ro = self._readout_fixed(prefix, lo_q, hi_q, z_cpu[q_at])
         h_q = h_all[q_at.to(self.device)]
         raw = self._decide_fixed(model, h_q, ro.m.to(self.device, h_q.dtype)).to("cpu", torch.float64).numpy()

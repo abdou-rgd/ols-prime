@@ -355,8 +355,9 @@ def _series(folder: Path) -> dict:
     return arrays
 
 
-def test_series_npz_reproduces_the_reports_means_and_holds_its_rows(two_runs):
+def test_series_npz_reproduces_the_reports_means_and_holds_its_rows(two_runs, monkeypatch):
     a, _, metrics, _ = two_runs
+    monkeypatch.setenv("OLSPRIME_RUNS_DIR", str(a.parent))  # the series reader opens only a run under the runs root
     s = _series(a)
     assert [str(x) for x in s["arms"]] == list(ARMS)
     for key, kind, _ in r2.SERIES_KEYS:
