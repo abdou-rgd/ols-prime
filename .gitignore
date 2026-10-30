@@ -18,6 +18,10 @@ __pycache__/
 /runs/vault/*
 !/runs/vault/OPEN
 !/runs/vault/ACCESS.log
+# ...and explain's log of contacts with the data (docs/PROTOCOL.md, "olsprime.explain").
+!/runs/explain/
+/runs/explain/*
+!/runs/explain/CONTACTS.log
 
 # Secrets
 .env

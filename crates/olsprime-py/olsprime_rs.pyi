@@ -359,6 +359,22 @@ class CentredReadout:
     def mean_x(self) -> _F64:
         """The range's mean state, (p,)."""
     @property
+    def mean_y(self) -> _F64:
+        """The range's mean outcome, (q,) float64: the forecast at x_q = mean_x, and the bits
+        the forecast added."""
+    @property
+    def beta(self) -> _F64:
+        """beta = M_yx (M_xx + Lambda)^-1, (q, p) float64, C-ordered: the coefficients of the
+        same solve as the forecast, so that forecast = mean_y + beta @ (x_q - mean_x), and
+        beta[c, j] * (x_q[j] - mean_x[j]) is feature j's part of outcome c.
+
+        Bits: the forecast rounded each product beta[c, j] * xt[j] on its own (no fused
+        multiply-add), summed them over j = 0, 1, ... in order, then added mean_y[c] last, with
+        xt = x_q - mean_x. A Python loop over floats in that order reproduces it to the bit.
+        numpy's `beta @ xt` sums in its own order (BLAS, possibly with FMA), so it agrees only
+        within 2 * gamma(p + 1) * (|mean_y[c]| + sum_j |beta[c, j] * xt[j]|), with
+        gamma(k) = k u / (1 - k u) and u = 2**-53."""
+    @property
     def a(self) -> _F64:
         """(M_xx + Lambda)^-1 (x_q - mean_x), (p,)."""
     @property

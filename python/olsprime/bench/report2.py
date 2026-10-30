@@ -37,23 +37,35 @@ One deterministic command, as pre-registered in ``docs/PROTOCOL.md``, "Matrix on
   part's comparison says "rule met", never "passes". Under its verdicts, where they are read,
   the report says which test months the smoke runs scored.
 
-Outputs: ``report-2.md``, ``report2.json``, ``config.json`` and ``run.json`` (the only file with
-wall-clock times) to ``runs/<UTC date>-report2/`` (suffixed if taken) or ``--out``. ``--check
-DIR`` re-runs into a temporary folder and fails, with a diff, if any file but ``run.json`` differs.
+Outputs: ``report-2.md``, ``report2.json``, ``config.json``, ``series.npz`` and ``run.json`` (the only
+file with wall-clock times) to ``runs/<UTC date>-report2/`` (suffixed if taken) or ``--out``.
+
+- ``series.npz`` holds the hourly series of every arm and every scored row's probabilities, label and
+  times (:data:`SERIES_KEYS`), so that no later study refits an arm. Its bytes are the same on every
+  re-run (:func:`write_npz`), and ``report2.json`` gives its SHA-256 under ``series``.
+- ``--check DIR`` re-runs into a temporary folder and fails, with a per-file summary and a diff, if any
+  file but ``run.json`` differs, ``series.npz`` included.
+- ``--compare-with OLDER [--out DIR]`` re-runs once into a kept folder and compares it with an older
+  run that predates ``series.npz`` (iteration 3's ``runs/2026-10-29-report2/``). Only the differences
+  named in :data:`ITERATION3_ALLOWANCES`, each with its reason, are allowed; every other byte must match.
+  ``--existing`` compares the folder at ``--out`` without re-running.
 """
 
 from __future__ import annotations
 
 import argparse
 import difflib
+import hashlib
 import json
 import math
+import re
 import shutil
+import struct
 import sys
 import tempfile
 import time
 import zlib
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import asdict, dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -86,7 +98,8 @@ from olsprime.paths import runs_dir
 from olsprime.protocol import DEVELOPMENT
 
 REPORT_FILE = "report-2.md"
-COMPARED = ("config.json", "report2.json", REPORT_FILE)
+SERIES_FILE = "series.npz"
+COMPARED = ("config.json", "report2.json", REPORT_FILE, SERIES_FILE)
 CLIMATOLOGY = "climatology-panel"
 # The pre-registered comparisons: (hypothesis, arm a, arm b); the difference is a - b, a must be lower.
 COMPARISONS: tuple[tuple[str, str, str], ...] = (
@@ -217,11 +230,22 @@ def ece_bins(p: np.ndarray, y: np.ndarray, sc: Scored, n_bins: int) -> np.ndarra
 def ece_tolerance(n: int) -> float:
     """How far the ECE by hours and ``stats.ece`` may differ through rounding alone, over n rows.
 
-    ``stats.ece`` adds a bin's rows in one sequential sum. When one forecast repeats over many rows,
-    as climatology's does within a fit, the rounding errors add up instead of cancelling: 1.3e-9
-    relative on the panel, which stopped the official run of 2026-10-29. Either sum is off by at
-    most about n eps / 2, so 4 n eps is safe. A real defect, a row lost or put in another bin,
-    moves the ECE by about 1/n.
+    What the cross-check guards (``docs/PROTOCOL.md``, change log, 2026-10-29, after audit phase 2):
+
+    - A row lost or counted twice between the hourly sums and ``stats.ece``. Such a row moves the
+      ECE by about |correct - confidence| / n: for a row of climatology, whose confidence is about
+      0.44, 220 to 285 times this tolerance on the panel. A confident and right forecast, whose
+      confidence nearly equals its correctness, moves it by almost nothing.
+    - Not a row put in another bin. Both paths bin the same way, and a row moved between two bins
+      whose sums share a sign leaves the ECE unchanged: this check cannot see it.
+
+    The bound. ``stats.ece`` counts each bin's correct rows exactly and adds its confidences in one
+    sequential sum; divided by n, that sum's rounding moves the ECE by at most about
+    u n mean(confidence), with u = eps / 2, so below n eps / 2. When one forecast repeats over many
+    rows, as climatology's does within a fit, those errors add up instead of cancelling: 1.3e-9
+    relative on the panel, which stopped the official run of 2026-10-29. The hourly path adds about
+    30 rows per cell, then the cells over H hours: at most about H u. So 4 n eps is more than eight
+    times the worst case while the mean confidence stays below 0.96.
     """
     return 4.0 * n * float(np.finfo(np.float64).eps)
 
@@ -257,6 +281,14 @@ def dm_standard_error(dm: stats.DieboldMariano, d: np.ndarray, h: int) -> float:
 def passes(dm_p: float, low: float, high: float, mean: float) -> bool:
     """A comparison where a must have the lower loss: DM p < 0.05, the mean below 0, the interval below 0."""
     return bool(dm_p < 0.05 and mean < 0.0 and high < 0.0)
+
+
+def h12_rule_met(upper: float, q95: float, margin: float) -> bool:
+    """H12's non-inferiority bounds: the one-sided 95 % upper bound and the bootstrap's 95th percentile both below the margin.
+
+    The registered H12 also needs at most ``cusum_max_fits`` fits; that condition belongs to the whole period only.
+    """
+    return bool(upper < margin and q95 < margin)
 
 
 def compare_arms(ll: dict[str, np.ndarray], a: str, b: str, ll_clim: float, cfg: Report2Config, *tag: str) -> dict[str, Any]:
@@ -305,18 +337,32 @@ def _informative(c: dict[str, Any]) -> str:
 MIN_SPLIT_HOURS = 100
 
 
-def _compare_part(part: dict[str, np.ndarray], a: str, b: str, clim: float, cfg: Report2Config, name: str) -> dict[str, Any]:
+def h12_part_rule(max_fits: int) -> str:
+    """The rule an H12 part's ``rule_met`` reads, said in the JSON (audit phase 2, logged item 3)."""
+    return (f"H12's bounds on this part: upper_95_one_sided and the bootstrap's q95 both below this part's h12_margin; "
+            f"the condition on fits (at most {max_fits}) belongs to the whole period only")  # fmt: skip
+
+
+def _compare_part(
+    part: dict[str, np.ndarray], a: str, b: str, clim: float, cfg: Report2Config, name: str, *, h12_margin: float | None = None
+) -> dict[str, Any]:
     """compare_arms on one part, or a record of why it has no test: a part can hold two arms that agree at every hour.
 
     A part describes, so its comparisons say ``rule_met``: "passes" is the registered rule's word,
-    and the verdicts are those of the whole period (audit pass 1e).
+    and the verdicts are those of the whole period (audit pass 1e). With ``h12_margin``, ``rule_met``
+    is H12's own rule on that part's margin, not the superiority rule (audit phase 2, logged item 3).
     """
     d = part[a] - part[b]
     if np.all(d == d[0]):  # e.g. matrix-adaptive taking matrix-select's rho at every decision: Diebold-Mariano is undefined
         return {"a": a, "b": b, "mean_diff": float(d.mean()), "hours": int(d.size), **identical_hours(d),
                 "undefined": "the difference is the same at every hour"}  # fmt: skip
     c = compare_arms(part, a, b, clim, cfg, name)
-    c["rule_met"] = c.pop("passes")
+    generic = c.pop("passes")
+    if h12_margin is None:
+        c["rule_met"] = generic
+    else:
+        c["rule_met"] = h12_rule_met(c["upper_95_one_sided"], c["bootstrap"]["q95"], h12_margin)
+        c["rule"] = h12_part_rule(cfg.matrix.cusum_max_fits)
     return c
 
 
@@ -345,7 +391,8 @@ def preview_split(ll: dict[str, np.ndarray], br: dict[str, np.ndarray], sc: Scor
             "climatology_log_loss": clim,
             "h12_margin": cfg.h12_margin * clim,
             "bss_matrix_select": bss_interval(br["matrix-select"][keep], br[CLIMATOLOGY][keep], cfg, "bss", "matrix-select", name),
-            "comparisons": [dict(_compare_part(part, a, b, clim, cfg, name), hypothesis=h) for h, a, b in COMPARISONS],
+            "comparisons": [dict(_compare_part(part, a, b, clim, cfg, name, h12_margin=cfg.h12_margin * clim if h == "H12" else None),
+                                 hypothesis=h) for h, a, b in COMPARISONS],  # fmt: skip
         }
     return out
 
@@ -398,7 +445,7 @@ def verdicts(metrics: dict[str, Any], comparisons: list[dict[str, Any]], n_cusum
         "H10": {"holds": by[("matrix-adaptive", "matrix-select")]["passes"], "rule": "matrix-adaptive below matrix-select, passing"},
         "H11": {"holds": by[("matrix-stack", "matrix-select")]["passes"], "rule": "matrix-stack below matrix-select, passing"},
         "H12": {
-            "holds": bool(h12["upper_95_one_sided"] < margin and h12["bootstrap"]["q95"] < margin and n_cusum_fits <= cfg.matrix.cusum_max_fits),
+            "holds": h12_rule_met(h12["upper_95_one_sided"], h12["bootstrap"]["q95"], margin) and n_cusum_fits <= cfg.matrix.cusum_max_fits,
             "margin": margin,
             "upper_95_one_sided": h12["upper_95_one_sided"],
             "bootstrap_q95": h12["bootstrap"]["q95"],
@@ -484,8 +531,8 @@ def feature_ratio_summary(system: MatrixSystem, res: ArmsResult) -> dict[str, An
 # --- The report -----------------------------------------------------------------------------
 
 
-def compute(panel: pl.DataFrame, cfg: Report2Config) -> tuple[dict[str, Any], dict[str, float]]:
-    """Every number of Report n°2 from a panel, and the time of each stage (seconds)."""
+def compute(panel: pl.DataFrame, cfg: Report2Config) -> tuple[dict[str, Any], dict[str, float], dict[str, np.ndarray]]:
+    """Every number of Report n°2 from a panel, the time of each stage (seconds) and the arrays of ``series.npz``."""
     timings: dict[str, float] = {}
     t = time.perf_counter()
     system = MatrixSystem(panel, cfg.matrix)
@@ -551,7 +598,112 @@ def compute(panel: pl.DataFrame, cfg: Report2Config) -> tuple[dict[str, Any], di
         "readout": readout,
         "variants": {"before": cfg.variants_before, "this_report": len(ARMS), "total": cfg.variants_before + len(ARMS)},
     }
-    return out, timings
+    return out, timings, series_arrays(system, res, sc, ll, br)
+
+
+# --- series.npz -----------------------------------------------------------------------------
+
+# The keys of series.npz, in the archive's order, with their dtypes. A = arms (ARMS order), T = scored hours,
+# N = scored rows (in the order of Scored.rows, the panel's order), S = symbols.
+SERIES_KEYS: tuple[tuple[str, str, str], ...] = (
+    ("arms", "<U", "(A,) the arms' names, ARMS order"),
+    ("hours", "<i8", "(T,) epoch ms of each scored hour: the open of its bars"),
+    ("count", "<i8", "(T,) scored rows per hour"),
+    ("log_loss", "<f8", "(A, T) hourly mean log-loss of each arm"),
+    ("brier", "<f8", "(A, T) hourly mean Brier score of each arm"),
+    ("probs", "<f8", "(A, N, 3) every arm's probabilities at every scored row, the exact values scored"),
+    ("label", "<i8", "(N,) the class: 0 down, 1 neutral, 2 up"),
+    ("fwd_return", "<f8", "(N,) the realized forward return behind the label"),
+    ("symbol", "<i8", "(N,) code into symbols"),
+    ("symbols", "<U", "(S,) the symbols' names, sorted"),
+    ("open_time", "<i8", "(N,) epoch ms of the row's bar open"),
+    ("decision_time", "<i8", "(N,) epoch ms of the row's decision"),
+    ("label_known_at", "<i8", "(N,) epoch ms at which the row's label is known"),
+    ("hour", "<i8", "(N,) index of the row's hour into hours"),
+)
+
+
+def series_arrays(system: MatrixSystem, res: ArmsResult, sc: Scored, ll: dict[str, np.ndarray], br: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    """The arrays of ``series.npz``: the hourly series the statistics read, and the scored rows behind them."""
+    d = system.data
+    rows = res.rows[sc.rows]  # panel indices of the scored rows
+    out = {
+        "arms": np.array(ARMS),
+        "hours": sc.hours,
+        "count": sc.count,
+        "log_loss": np.stack([ll[a] for a in ARMS]),
+        "brier": np.stack([br[a] for a in ARMS]),
+        "probs": np.stack([res.probs[a][sc.rows] for a in ARMS]),
+        "label": sc.label,
+        "fwd_return": d.fwd[rows],
+        "symbol": d.symbol[rows],
+        "symbols": np.array(d.symbols),
+        "open_time": d.open_ms[rows],
+        "decision_time": d.decision_ms[rows],
+        "label_known_at": d.lka_ms[rows],
+        "hour": sc.hour,
+    }
+    return {k: np.ascontiguousarray(out[k], dtype=out[k].dtype if kind == "<U" else np.dtype(kind)) for k, kind, _ in SERIES_KEYS}
+
+
+_ZIP_DATE = (0 << 9) | (1 << 5) | 1  # 1980-01-01, the first date a zip entry can hold
+_ZIP_TIME = 0
+_ZIP_LIMIT = 0xFFFFFFFF  # no zip64: a larger archive is refused, not written differently
+
+
+class _CrcWriter:
+    """A file-like sink for ``numpy.lib.format.write_array`` that keeps the CRC-32 and size of what it passes on."""
+
+    def __init__(self, f: Any) -> None:
+        self.f, self.crc, self.size = f, 0, 0
+
+    def write(self, data: bytes) -> int:
+        view = memoryview(data).cast("B")
+        self.crc = zlib.crc32(view, self.crc)
+        self.size += view.nbytes
+        return self.f.write(view)
+
+
+def write_npz(path: Path, arrays: dict[str, np.ndarray]) -> None:
+    """Write ``arrays`` as an ``.npz`` that ``numpy.load`` reads, with the same bytes on every run.
+
+    ``np.savez`` stamps each entry with the current local time, and ``zipfile`` records the platform
+    that wrote it. This writes the zip by hand instead: entries in the order of ``arrays``, stored
+    without compression, every date 1980-01-01 00:00, version 2.0 (MS-DOS), no extra field, no
+    comment, attributes 0, and each member a version 1.0 ``.npy`` without pickles. It writes no
+    zip64 record and refuses an archive that would need one (4 GiB).
+    """
+    entries: list[tuple[bytes, int, int, int]] = []
+    with open(path, "wb") as f:
+        for name, arr in arrays.items():
+            fname = f"{name}.npy".encode("ascii")
+            offset = f.tell()
+            f.write(struct.pack("<IHHHHHIIIHH", 0x04034B50, 20, 0, 0, _ZIP_TIME, _ZIP_DATE, 0, 0, 0, len(fname), 0) + fname)
+            sink = _CrcWriter(f)
+            np.lib.format.write_array(sink, np.ascontiguousarray(arr), version=(1, 0), allow_pickle=False)
+            end = f.tell()
+            if sink.size >= _ZIP_LIMIT or end >= _ZIP_LIMIT:
+                raise ValueError(f"{path.name}: {name} takes the archive past 4 GiB, which needs zip64")
+            f.seek(offset + 14)
+            f.write(struct.pack("<III", sink.crc, sink.size, sink.size))
+            f.seek(end)
+            entries.append((fname, sink.crc, sink.size, offset))
+        start = f.tell()
+        for fname, crc, size, offset in entries:
+            f.write(struct.pack("<IHHHHHHIIIHHHHHII", 0x02014B50, 20, 20, 0, 0, _ZIP_TIME, _ZIP_DATE, crc, size, size,
+                                len(fname), 0, 0, 0, 0, 0, offset) + fname)  # fmt: skip
+        size = f.tell() - start
+        if f.tell() >= _ZIP_LIMIT or len(entries) > 0xFFFF:
+            raise ValueError(f"{path.name}: the archive needs zip64")
+        f.write(struct.pack("<IHHHHIIH", 0x06054B50, 0, 0, len(entries), len(entries), size, start, 0))
+
+
+def sha256_file(path: Path) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while chunk := f.read(1 << 24):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def config_record(cfg: Report2Config, provenance: dict[str, Any], manifest: dict[str, Any]) -> dict[str, Any]:
@@ -585,8 +737,12 @@ def _clean(value: Any) -> Any:
     return value
 
 
+def _json_bytes(obj: Any) -> bytes:
+    return (json.dumps(_clean(obj), sort_keys=True, indent=1, allow_nan=False) + "\n").encode("utf-8")
+
+
 def _write_json(path: Path, obj: Any) -> None:
-    path.write_text(json.dumps(_clean(obj), sort_keys=True, indent=1, allow_nan=False) + "\n", encoding="utf-8", newline="\n")
+    path.write_bytes(_json_bytes(obj))
 
 
 def _f(x: float | None, digits: int = 4) -> str:
@@ -627,15 +783,41 @@ def _preview_lines(m: dict[str, Any]) -> list[str]:
                 cells.append(f"{c['mean_diff']:+.5f}; no test: {c['undefined']}")
                 continue
             boot = c["bootstrap"]
+            word = "rule met" if c["rule_met"] else "rule not met"
             if h == "H12":
                 cells.append(f"{c['mean_diff']:+.5f}; upper bound {c['upper_95_one_sided']:+.5f}, bootstrap q95 {boot['q95']:+.5f}, "
-                             f"margin {p['h12_margin']:.5f}")  # fmt: skip
+                             f"margin {p['h12_margin']:.5f}{H12_PART_WORD.format(word=word)}")  # fmt: skip
             else:
-                cells.append(f"{c['mean_diff']:+.5f} [{boot['low']:+.5f}, {boot['high']:+.5f}], DM p {c['dm_p']:.4f}, "
-                             f"{'rule met' if c['rule_met'] else 'rule not met'}")  # fmt: skip
+                cells.append(f"{c['mean_diff']:+.5f} [{boot['low']:+.5f}, {boot['high']:+.5f}], DM p {c['dm_p']:.4f}, {word}")
             cells[-1] += f"; identical hours {_informative(c)}"
         lines.append(f"| {h}: {a} - {b} | " + " | ".join(cells) + " |")
-    return [*lines, ""]
+    return [*lines, "", H12_PART_NOTE.format(max_fits=m["verdicts"]["H12"]["max_fits"]), ""]
+
+
+# Audit phase 2, logged item 3: H12's parts read H12's own rule, and the report says so under the table.
+H12_PART_WORD = ", {word}"
+H12_PART_NOTE = ("H12's parts read H12's own rule: the one-sided upper bound and the bootstrap's 95th percentile both below that "
+                 "part's margin. Its condition on fits, at most {max_fits}, belongs to the whole period only.")  # fmt: skip
+
+# Audit phase 2, logged item 1: a label reads only its entry and exit bars (RESULTS.md, Report n°2's row, the correction).
+COVERAGE_BEFORE_ITERATION3 = "and for the 25 bars before it, whose labels need a bar inside it."
+COVERAGE_BEFORE = ("and for 1 + g rows of each member before a gap of g bars (25 at most): a label reads only its entry and exit "
+                   "bars, so the row just before the gap, whose entry bar falls in it, and the g rows 25 bars before the gap's "
+                   "bars, whose exit bars fall in it, have none.")  # fmt: skip
+
+
+def coverage_line(m: dict[str, Any], before: str = COVERAGE_BEFORE) -> str:
+    s = m["scored"]
+    return (
+        f"Coverage: {s['hours']} of the test months' {s['calendar_hours']} hours are scored ({s['share_of_calendar_hours']:.1%}). "
+        "An hour is scored when a member has a scored row in it. A row is not scored when a feature or its label is missing: for "
+        f"about 90 bars after a gap in a pair's bars, while the features' longest window refills, {before} An exchange outage "
+        "makes that gap for every member at once, so every verdict below is conditional on the hours away from outages."
+    )
+
+
+def series_line(series: dict[str, Any]) -> str:
+    return f"- Hourly series and scored rows (`{series['file']}`, every arm's probabilities included), SHA-256: `{series['sha256']}`."
 
 
 def render(m: dict[str, Any], config: dict[str, Any]) -> str:
@@ -665,11 +847,7 @@ def render(m: dict[str, Any], config: dict[str, Any]) -> str:
         f"{m['scored']['hours']} decision hours ({m['scored']['first_hour'][:13]} -> {m['scored']['last_hour'][:13]}). Every mean is "
         "a mean over hours of the hourly means; intervals are stationary-bootstrap 95 % percentile intervals.",
         "",
-        f"Coverage: {m['scored']['hours']} of the test months' {m['scored']['calendar_hours']} hours are scored "
-        f"({m['scored']['share_of_calendar_hours']:.1%}). An hour is scored when a member has a scored row in it. A row is not scored "
-        "when a feature or its label is missing: for about 90 bars after a gap in a pair's bars, while the features' longest window "
-        "refills, and for the 25 bars before it, whose labels need a bar inside it. An exchange outage makes that gap for every "
-        "member at once, so every verdict below is conditional on the hours away from outages.",
+        coverage_line(m),
         "",
         "## Arms",
         "",
@@ -786,6 +964,7 @@ def render(m: dict[str, Any], config: dict[str, Any]) -> str:
         "",
         *prov_mod.render_md(config["provenance"]),
         f"- Panel fingerprint: `{m['panel']['fingerprint_sha256']}`.",
+        *([series_line(m["series"])] if "series" in m else []),
         "- Parquet files read (SHA-256, stored and sealed rows; every file is in `config.json`): " + ", ".join(
             f"`{f['path']}` `{f['sha256']}` {f.get('stored_rows')}/{f.get('sealed_rows')}"
             for f in config["manifest"].get("files", [])
@@ -810,10 +989,12 @@ def run_report(
     t = time.perf_counter()
     panel = hourly_panel(universe, first=Month(*cfg.first_month), last=Month(*cfg.last_month), symbols=cfg.symbols, data_dir=data_dir)
     t_panel = time.perf_counter() - t
-    metrics, timings = compute(panel, cfg)
+    metrics, timings, series = compute(panel, cfg)
     timings = {"panel": t_panel, **timings}
     config = config_record(cfg, provenance, manifest)
     out.mkdir(parents=True, exist_ok=True)
+    write_npz(out / SERIES_FILE, series)
+    metrics["series"] = {"file": SERIES_FILE, "sha256": sha256_file(out / SERIES_FILE)}
     _write_json(out / "config.json", config)
     _write_json(out / "report2.json", metrics)
     metrics, config = (json.loads((out / n).read_text(encoding="utf-8")) for n in ("report2.json", "config.json"))
@@ -828,7 +1009,50 @@ def compared_files(folder: Path) -> list[str]:
     return [n for n in COMPARED if (folder / n).exists()]
 
 
+def _lines(data: bytes) -> list[str]:
+    return data.decode("utf-8", "replace").splitlines()
+
+
+def _file_summary(name: str, x: bytes | None, y: bytes | None, *, first: str, second: str, same: str = "identical") -> str:
+    """One line for one compared file: identical, only on one side, or its count of differing lines (bytes, for series.npz)."""
+    if x is None or y is None:
+        return f"{name}: only in {first if y is None else second}"
+    if x == y:
+        return f"{name}: {same}"
+    if name == SERIES_FILE:
+        return (f"{name}: differs (binary; {len(x)} and {len(y)} bytes, SHA-256 {hashlib.sha256(x).hexdigest()[:16]}... and "
+                f"{hashlib.sha256(y).hexdigest()[:16]}...)")  # fmt: skip
+    gone = added = 0
+    for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, _lines(x), _lines(y), autojunk=False).get_opcodes():
+        if tag != "equal":
+            gone, added = gone + i2 - i1, added + j2 - j1
+    if gone + added == 0:
+        return f"{name}: differs in its bytes, not in its lines (line endings or encoding)"
+    return f"{name}: {gone + added} differing lines ({gone} only in {first}, {added} only in {second})"
+
+
+def _read(folder: Path, name: str) -> bytes | None:
+    path = folder / name
+    return path.read_bytes() if path.is_file() else None
+
+
+def summarize_runs(expected: Path, actual: Path) -> list[str]:
+    """Each compared file, in COMPARED order: identical, or how far it differs (audit phase 2, logged item 4)."""
+    out = []
+    for name in COMPARED:
+        x, y = _read(expected, name), _read(actual, name)
+        if x is not None or y is not None:
+            out.append(_file_summary(name, x, y, first="the expected run", second="the re-run"))
+    return out
+
+
+def _unified(x: bytes, y: bytes, a: str, b: str, max_lines: int) -> str:
+    lines = list(difflib.unified_diff(_lines(x), _lines(y), a, b, lineterm="", n=1))
+    return "\n".join(lines[:max_lines]) + ("\n..." if len(lines) > max_lines else "")
+
+
 def diff_runs(expected: Path, actual: Path, *, max_lines: int = 40) -> list[str]:
+    """One problem per compared file that differs, with a diff of at most ``max_lines`` lines (none for series.npz)."""
     problems: list[str] = []
     a, b = compared_files(expected), compared_files(actual)
     for name in sorted(set(a) ^ set(b)):
@@ -837,10 +1061,15 @@ def diff_runs(expected: Path, actual: Path, *, max_lines: int = 40) -> list[str]
         x, y = (expected / name).read_bytes(), (actual / name).read_bytes()
         if x == y:
             continue
-        lines = list(difflib.unified_diff(x.decode("utf-8", "replace").splitlines(), y.decode("utf-8", "replace").splitlines(),
-                                          f"expected/{name}", f"re-run/{name}", lineterm="", n=1))  # fmt: skip
-        problems.append(f"{name}: differs\n" + "\n".join(lines[:max_lines]) + ("\n..." if len(lines) > max_lines else ""))
+        if name == SERIES_FILE:
+            problems.append(_file_summary(name, x, y, first="the expected run", second="the re-run"))
+            continue
+        problems.append(f"{name}: differs\n" + _unified(x, y, f"expected/{name}", f"re-run/{name}", max_lines))
     return problems
+
+
+def _print(text: str) -> None:
+    print(text.encode("ascii", "replace").decode("ascii"))
 
 
 def check(expected: Path, cfg: Report2Config, **kwargs: Any) -> int:
@@ -850,15 +1079,222 @@ def check(expected: Path, cfg: Report2Config, **kwargs: Any) -> int:
     scratch = Path(tempfile.mkdtemp(prefix="report2-check-"))
     try:
         run_report(cfg, scratch, **kwargs)
+        summary = summarize_runs(expected, scratch)
         problems = diff_runs(expected, scratch)
     finally:
         shutil.rmtree(scratch, ignore_errors=True)
     if problems:
         print(f"CHECK FAILED: {len(problems)} file(s) differ from {expected}")
+        for line in summary:
+            _print(f"  {line}")
         for p in problems:
-            print(p.encode("ascii", "replace").decode("ascii"))
+            _print(p)
         return 1
     print(f"check passed: {len(compared_files(expected))} files identical to {expected} (run.json excluded)")
+    for line in summary:
+        _print(f"  {line}")
+    return 0
+
+
+# --- The comparison with a run that predates series.npz (iteration 3) -------------------------
+
+
+@dataclass
+class _Older:
+    """An older run's compared files, parsed, edited by the allowances toward what the new code writes."""
+
+    config: dict[str, Any]
+    report: dict[str, Any]
+    md: list[str]
+    new_config: dict[str, Any]
+    new_report: dict[str, Any]
+    new_series_sha256: str | None
+    problems: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class Allowance:
+    """A named difference allowed between an older run and the re-run, with its reason. ``apply`` edits the older
+    run's parsed files into what the re-run must hold and returns whether it found that difference to allow."""
+
+    name: str
+    files: tuple[str, ...]
+    reason: str
+    apply: Callable[[_Older], bool]
+
+
+def _replace_line(md: list[str], old: str, new: str) -> bool:
+    hits = [i for i, line in enumerate(md) if line == old]
+    if len(hits) != 1:
+        return False
+    md[hits[0]] = new
+    return True
+
+
+def _allow_commit(s: _Older) -> bool:
+    old, new = s.config["provenance"], s.new_config.get("provenance", {})
+    if old.get("git_commit") == new.get("git_commit"):
+        return False
+    edited = {**old, "git_commit": new.get("git_commit")}
+    ok = _replace_line(s.md, prov_mod.render_md(old)[2], prov_mod.render_md(edited)[2])
+    s.config["provenance"] = edited
+    return ok
+
+
+def _allow_code(s: _Older) -> bool:
+    old, new = s.config["provenance"], s.new_config.get("provenance", {})
+    old_code, new_code = old.get("code", {}), new.get("code", {})
+    if (old_code.get("sha256"), old_code.get("files")) == (new_code.get("sha256"), new_code.get("files")):
+        return False
+    edited = {**old, "code": {**old_code, "sha256": new_code.get("sha256"), "files": new_code.get("files")}}  # globs must match
+    ok = _replace_line(s.md, prov_mod.render_md(old)[3], prov_mod.render_md(edited)[3])
+    s.config["provenance"] = edited
+    return ok
+
+
+def _allow_series(s: _Older) -> bool:
+    if "series" in s.report:
+        return False
+    rec = s.new_report.get("series")
+    digest = rec.get("sha256") if isinstance(rec, dict) else None
+    if not (isinstance(rec, dict) and set(rec) == {"file", "sha256"} and rec["file"] == SERIES_FILE and isinstance(digest, str)):
+        s.problems.append(f"report2.json: the re-run's series entry is not {{'file': '{SERIES_FILE}', 'sha256': ...}}: {rec!r}")
+        return False
+    if digest != s.new_series_sha256:
+        s.problems.append(f"report2.json: the series digest {digest} is not the SHA-256 of the re-run's {SERIES_FILE}, {s.new_series_sha256}")
+        return False
+    s.report["series"] = {"file": SERIES_FILE, "sha256": digest}
+    at = [i for i, line in enumerate(s.md) if line.startswith("- Panel fingerprint: ")]
+    if len(at) != 1:
+        return False
+    s.md.insert(at[0] + 1, series_line(s.report["series"]))
+    return True
+
+
+def _allow_coverage(s: _Older) -> bool:
+    return _replace_line(s.md, coverage_line(s.report, COVERAGE_BEFORE_ITERATION3), coverage_line(s.report))
+
+
+_H12_CELL = re.compile(r"(, margin \d+\.\d{5})(; identical hours )")
+
+
+def _allow_h12_parts(s: _Older) -> bool:
+    split = s.report.get("preview_split", {})
+    max_fits = s.config["config"]["matrix"]["cusum_max_fits"]
+    words, edited = [], False
+    for name in ("previewed", "unseen"):
+        part = split.get(name)
+        if part is None:
+            continue
+        c = next(c for c in part["comparisons"] if c["hypothesis"] == "H12")
+        if "undefined" in c:
+            continue
+        if "rule" in c:
+            return False
+        boot = c["bootstrap"]
+        if c["rule_met"] != passes(c["dm_p"], boot["low"], boot["high"], c["mean_diff"]):
+            s.problems.append(f"report2.json: the older {name} part's H12 rule_met is not the superiority rule it carried")
+            return False
+        c["rule_met"] = h12_rule_met(c["upper_95_one_sided"], boot["q95"], part["h12_margin"])
+        c["rule"] = h12_part_rule(max_fits)
+        words.append("rule met" if c["rule_met"] else "rule not met")
+        edited = True
+    rows = [i for i, line in enumerate(s.md) if line.startswith("| H12: ")]
+    if not edited or len(rows) != 1:
+        return False
+    i = rows[0]
+    cells = iter(words)
+    new_row, n = _H12_CELL.subn(lambda mt: mt.group(1) + H12_PART_WORD.format(word=next(cells)) + mt.group(2), s.md[i])
+    if n != len(words) or s.md[i + 1 : i + 3] != ["", "## Counts"]:
+        return False
+    s.md[i] = new_row
+    s.md[i + 2 : i + 2] = [H12_PART_NOTE.format(max_fits=s.report["verdicts"]["H12"]["max_fits"]), ""]
+    return True
+
+
+# The differences allowed between iteration 3's run (runs/2026-10-29-report2/) and a re-run at a later commit. Nothing else.
+ITERATION3_ALLOWANCES: tuple[Allowance, ...] = (
+    Allowance("commit", ("config.json", REPORT_FILE),
+              "the re-run is at a later commit: provenance.git_commit and the Markdown's Git commit line", _allow_commit),
+    Allowance("code digest", ("config.json", REPORT_FILE),
+              "the code changed (this file, bench/power.py and the rest of the digest's files): provenance.code's sha256 and file "
+              "count, and the Markdown's Code digest line; the globs must match", _allow_code),
+    Allowance("series", ("report2.json", REPORT_FILE),
+              "iteration 4 saves series.npz: report2.json gains series = {file, sha256}, the SHA-256 of the re-run's own file, and "
+              "the Provenance list gains its line after the panel fingerprint", _allow_series),
+    Allowance("coverage sentence", (REPORT_FILE,),
+              "audit phase 2, logged item 1: a gap of g bars leaves 1 + g rows of each member unlabelled before it, not 25 bars; "
+              "only that clause of the Coverage paragraph changes, its numbers stay", _allow_coverage),
+    Allowance("H12's rule in the parts", ("report2.json", REPORT_FILE),
+              "audit phase 2, logged item 3: each part's H12 rule_met becomes H12's own rule on that part's numbers, with a rule "
+              "key that keeps the condition on fits for the whole period; the H12 row of the previewed months' table gains its "
+              "rule word, and a note follows the table", _allow_h12_parts),
+)  # fmt: skip
+
+
+def compare_with_older(older: Path, new: Path, allowances: Sequence[Allowance] = ITERATION3_ALLOWANCES,
+                       *, max_lines: int = 40) -> tuple[list[str], list[Allowance], list[str]]:  # fmt: skip
+    """Compare a re-run in ``new`` with an older run whose files differ only by the named ``allowances``.
+
+    The older run's ``config.json``, ``report2.json`` and ``report-2.md`` are edited by each allowance
+    into what the re-run must hold, then compared byte for byte with the re-run's. ``series.npz`` must
+    be in the re-run, with the digest its ``report2.json`` gives; if the older run has one too, the two
+    must be identical. Returns the problems (empty: the comparison passes), the allowances met and a
+    per-file summary.
+    """
+    names = ("config.json", "report2.json", REPORT_FILE)
+    old_bytes = {n: _read(older, n) for n in names}
+    new_bytes = {n: _read(new, n) for n in names}
+    missing = [f"{n}: missing in {'the older run' if old_bytes[n] is None else 'the re-run'}" for n in names
+               if old_bytes[n] is None or new_bytes[n] is None]  # fmt: skip
+    series_new = new / SERIES_FILE
+    if not series_new.is_file():
+        missing.append(f"{SERIES_FILE}: missing in the re-run")
+    if missing:
+        return missing, [], []
+    parsed = {n: json.loads(old_bytes[n]) for n in ("config.json", "report2.json")}
+    problems = [f"{n}: the older file is not in the form this code writes, so it cannot be compared byte for byte"
+                for n, obj in parsed.items() if _json_bytes(obj) != old_bytes[n]]  # fmt: skip
+    if problems:
+        return problems, [], []
+    state = _Older(parsed["config.json"], parsed["report2.json"], old_bytes[REPORT_FILE].decode("utf-8").split("\n"),
+                   json.loads(new_bytes["config.json"]), json.loads(new_bytes["report2.json"]), sha256_file(series_new))  # fmt: skip
+    met = [a for a in allowances if a.apply(state)]
+    problems = list(state.problems)
+    expected = {"config.json": _json_bytes(state.config), "report2.json": _json_bytes(state.report), REPORT_FILE: "\n".join(state.md).encode("utf-8")}
+    summary = []
+    for n in names:
+        summary.append(_file_summary(n, expected[n], new_bytes[n], first="the older run", second="the re-run", same="identical after the allowances"))
+        if expected[n] != new_bytes[n]:
+            problems.append(f"{n}: differs beyond the allowances\n" + _unified(expected[n], new_bytes[n], f"older+allowances/{n}", f"re-run/{n}", max_lines))
+    series_old = _read(older, SERIES_FILE)
+    if series_old is not None and series_old != series_new.read_bytes():
+        problems.append(f"{SERIES_FILE}: the older run has one, and it differs from the re-run's")
+    summary.append(f"{SERIES_FILE}: " + ("only in the re-run" if series_old is None else "identical" if series_old == series_new.read_bytes() else "differs"))
+    return problems, met, summary
+
+
+def compare_command(older: Path, new: Path, cfg: Report2Config, *, rerun: bool, **kwargs: Any) -> int:
+    if not (older / "report2.json").is_file():
+        print(f"{older}: not a report2 run folder (no report2.json)")
+        return 2
+    if rerun:
+        if new.exists() and any(new.iterdir()):
+            print(f"{new}: not empty; the re-run goes to a new folder (or pass --existing to compare it as it is)")
+            return 2
+        run_report(cfg, new, **kwargs)
+    problems, met, summary = compare_with_older(older, new)
+    _print(f"compared {new} with {older}; allowed differences, each with its reason:")
+    for a in ITERATION3_ALLOWANCES:
+        _print(f"  [{'met' if a in met else 'not met'}] {a.name} ({', '.join(a.files)}): {a.reason}")
+    for line in summary:
+        _print(f"  {line}")
+    if problems:
+        print(f"COMPARISON FAILED: {len(problems)} difference(s) beyond the allowances")
+        for p in problems:
+            _print(p)
+        return 1
+    print("comparison passed: every other byte of config.json, report2.json and report-2.md matches")
     return 0
 
 
@@ -873,11 +1309,22 @@ def _default_out() -> Path:
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m olsprime.bench.report2", description="Report no. 2: Matrix on hourly bars.")
     parser.add_argument("--out", type=Path, default=None, help="run folder (default: <runs>/<UTC date>-report2, suffixed if taken)")
-    parser.add_argument("--check", type=Path, default=None, metavar="DIR", help="re-run and compare with the run in DIR")
+    parser.add_argument("--check", type=Path, default=None, metavar="DIR", help="re-run and compare with the run in DIR, byte for byte")
+    parser.add_argument("--compare-with", type=Path, default=None, metavar="OLDER",
+                        help="re-run once into --out (kept) and compare with OLDER under the named allowances")  # fmt: skip
+    parser.add_argument("--existing", action="store_true", help="with --compare-with: compare the folder at --out without re-running")
     args = parser.parse_args(argv)
     cfg = Report2Config()
     if args.check is not None:
+        if args.compare_with is not None:
+            parser.error("--check and --compare-with are separate commands")
         return check(args.check, cfg)
+    if args.compare_with is not None:
+        if args.existing and args.out is None:
+            parser.error("--existing needs --out")
+        return compare_command(args.compare_with, args.out or _default_out(), cfg, rerun=not args.existing)
+    if args.existing:
+        parser.error("--existing goes with --compare-with")
     out = args.out or _default_out()
     started = time.perf_counter()
     metrics = run_report(cfg, out)

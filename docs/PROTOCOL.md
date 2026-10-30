@@ -654,4 +654,28 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
   - **The purge cut saw only a leak past F − 24 h.** A second purge cut, at F − 30 days for the 2021 fit, compares the training and every epoch's parameters. A fourth control, `cheat-slice`, which trains on its own slice, is predicted caught there and not at F − 24 h. This was the audit's bolder check, and it is cheap once the first purge cut exists. The two cuts bracket the purge window.
   - **The budget had no answer** when the honest arms alone exceed it on CPU. They then retrain at four cuts, and only forecast with the honest parameters at the others.
   - **`pos-window` keeps the panel's stamp**, so that its row never sits in its own memory.
+- 2026-10-30, wave 1, before any encoder run on real data and before the first `explain` call (`runs/explain/CONTACTS.log` does not exist yet). The encoder is built and sized on synthetic data only. Nothing registered above changes. Where the section leaves a choice, the build's reading is fixed here, so that no result can choose it.
+  - **The attention block.** In every arm, Q, K and V come from one linear map with a bias. One output projection, with a bias, maps the four heads back to d_model.
+  - **`enc-ols`.**
+    - It computes O = Q̃ ((K̃ᵀK̃ + Λ)⁻¹ (K̃ᵀV)), the product W V taken in another order, with the same Cholesky factor. `head` computes W itself.
+    - Queries and keys are scaled to unit root mean square with ε = 10⁻¹².
+  - **`enc-softmax`** uses the math backend of scaled dot-product attention in training too, not only in H13's timing.
+  - **The memory.**
+    - Its key map W_z has no bias: the ridge is centred, so a bias would cancel.
+    - Its entries are the complete rows with a valid window, the same rows that train and are forecast.
+  - **The standardization** uses the population standard deviation.
+  - **The fit.**
+    - The slice loss that picks the epoch is the log-loss of the floored probabilities, as the scores read them. Training minimizes the cross-entropy before the floor.
+    - All six epochs run. There is no patience rule.
+    - The cosine reaches 10⁻⁴ at the last step of epoch 6.
+  - **The controls.**
+    - `cheat-value`'s label projection is a linear map, so it takes weight decay.
+    - `pos-window`'s label sums the window's last 24 one-bar returns in order, in fp32, and classes the sum with the row's own threshold.
+  - **Parameters:** 20,995 for `enc-softmax` and `enc-linear`, 21,003 for `enc-ols`. `cheat-value` adds 192.
+  - **Checkpoints** are written by hand in the safetensors layout and never go through pickle.
+  - **Sizing**, on a synthetic panel of 30 members, hourly from 2017-10 (`docs/ITERATIONS.md`, iteration 4).
+    - Two whole 2024 fits of `enc-ols` on the RTX 3060 were bit-identical: every epoch's parameters, the slice losses, the epoch kept and the 253,193 forecasts. The scope test passed at every prefix.
+    - So the registered H1 is planned on the GPU. Its own pre-check still runs first, on the real sub-panel.
+    - The H1 with every control is projected at about 8.7 hours, under the 12-hour budget, so every cut runs.
+  - **Contacts with the real data:** none yet.
   - **Made precise:** the honest run's fit year at the purge cuts; the concentrated grid's exact count of shifted blocks; the twins draw from bars at or before the cut; `explain`'s explicit flag; and H14's change-log line in `docs/HYPOTHESES.md`, since a narrowed claim is still a changed one.

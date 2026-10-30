@@ -1,6 +1,9 @@
 """Report n°2 (``olsprime.bench.report2``) on a synthetic store.
 
-- two runs write byte-identical compared files, and the check sees a changed byte;
+- two runs write byte-identical compared files, ``series.npz`` included, and the check sees a changed byte;
+- ``series.npz`` reproduces the report's means, carries its rows, and its digest is in ``report2.json``;
+- the comparison with an older run allows the named differences and nothing else;
+- H12's parts read H12's own rule;
 - every arm is scored, the refusals and the feature ratios are reported, the run is marked as not
   the registered one;
 - the verdict rules follow the pre-registration on hand-built numbers;
@@ -11,7 +14,9 @@ Every test runs on a fake store under a temporary data root: nothing reads the r
 
 from __future__ import annotations
 
+import hashlib
 import json
+import struct
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -336,3 +341,188 @@ def test_the_bootstrap_is_seeded_by_tag_and_brackets_the_mean():
     bss = r2.bss_interval(arm, clim, CFG, "bss", "x")
     assert bss["estimate"] == pytest.approx(1 - arm.mean() / clim.mean())
     assert 0 < bss["low"] <= bss["estimate"] <= bss["high"]
+
+
+# --- series.npz (iteration 4) ---------------------------------------------------------------
+
+
+def _series(folder: Path) -> dict:
+    """Every array of a run's series.npz, through the package's one reader of it (by digest)."""
+    from olsprime.bench import power
+
+    digest = json.loads((folder / "report2.json").read_text(encoding="utf-8"))["series"]["sha256"]
+    arrays, _, _, _ = power.load_series(folder / r2.SERIES_FILE, digest, keys=[k for k, _, _ in r2.SERIES_KEYS])
+    return arrays
+
+
+def test_series_npz_reproduces_the_reports_means_and_holds_its_rows(two_runs):
+    a, _, metrics, _ = two_runs
+    s = _series(a)
+    assert [str(x) for x in s["arms"]] == list(ARMS)
+    for key, kind, _ in r2.SERIES_KEYS:
+        assert s[key].dtype.str.startswith(kind), key
+    t, n = metrics["scored"]["hours"], metrics["scored"]["rows"]
+    assert s["log_loss"].shape == s["brier"].shape == (len(ARMS), t) and s["probs"].shape == (len(ARMS), n, 3)
+    assert s["count"].sum() == n and np.all(np.diff(s["hours"]) > 0)
+    sc = r2.Scored(np.arange(n), s["label"], s["hour"], s["hours"], s["count"])
+    for i, arm in enumerate(ARMS):  # the same arrays, the same means, to the bit
+        assert float(s["log_loss"][i].mean()) == metrics["arms"][arm]["log_loss"]["estimate"]
+        assert float(s["brier"][i].mean()) == metrics["arms"][arm]["brier"]["estimate"]
+        losses = stats.per_row_losses(s["probs"][i], s["label"])  # the scored rows give back the hourly series
+        assert np.array_equal(r2.hourly(losses.log_loss, sc), s["log_loss"][i])
+        assert np.array_equal(r2.hourly(losses.brier, sc), s["brier"][i])
+    for c in metrics["comparisons"]:
+        ia, ib = ARMS.index(c["a"]), ARMS.index(c["b"])
+        assert float((s["log_loss"][ia] - s["log_loss"][ib]).mean()) == c["mean_diff"]
+    assert [str(x) for x in s["symbols"]] == metrics["panel"]["symbols"]
+    assert np.array_equal(s["open_time"], s["hours"][s["hour"]])  # each row sits in its bar's open hour
+    assert np.all(s["decision_time"] > s["open_time"]) and np.all(s["label_known_at"] > s["decision_time"])
+    assert np.all(np.isfinite(s["fwd_return"])) and set(np.unique(s["label"]).tolist()) <= {0, 1, 2}
+    # the label is the class of fwd_return against its threshold: down rows have lower returns than up rows
+    assert s["fwd_return"][s["label"] == 0].max() < s["fwd_return"][s["label"] == 2].min()
+
+
+def test_series_npz_is_deterministic_and_its_digest_is_in_report2_json(two_runs, tmp_path):
+    a, b, metrics, _ = two_runs
+    data = (a / r2.SERIES_FILE).read_bytes()
+    assert data == (b / r2.SERIES_FILE).read_bytes()
+    assert metrics["series"] == {"file": r2.SERIES_FILE, "sha256": hashlib.sha256(data).hexdigest()}
+    assert r2.series_line(metrics["series"]) in (a / r2.REPORT_FILE).read_text(encoding="utf-8").splitlines()
+    # entries in SERIES_KEYS order, stored, every one dated 1980-01-01 00:00 in its local and central headers
+    names = [f"{k}.npy".encode() for k, _, _ in r2.SERIES_KEYS]
+    positions = [data.index(name) for name in names]
+    assert positions == sorted(positions)
+    local = struct.pack("<IHHHHH", 0x04034B50, 20, 0, 0, 0, 0x21)
+    central = struct.pack("<IHHHHHH", 0x02014B50, 20, 20, 0, 0, 0, 0x21)
+    assert data.startswith(local) and data.count(local) == len(names) and data.count(central) == len(names)
+    # a later write of the same arrays gives the same bytes, whatever the clock says
+    arrays = {k: np.arange(5, dtype=np.int64) * i for i, k in enumerate(("x", "y"))}
+    r2.write_npz(tmp_path / "one.npz", arrays)
+    r2.write_npz(tmp_path / "two.npz", arrays)
+    assert (tmp_path / "one.npz").read_bytes() == (tmp_path / "two.npz").read_bytes()
+
+
+def _older_from(new: Path, older: Path) -> None:
+    """Undo, by hand, every allowed difference: what iteration 3's code would have written for the same numbers."""
+    older.mkdir()
+    config = json.loads((new / "config.json").read_text(encoding="utf-8"))
+    report = json.loads((new / "report2.json").read_text(encoding="utf-8"))
+    md = (new / r2.REPORT_FILE).read_text(encoding="utf-8").split("\n")
+    prov = config["provenance"]
+    old_prov = {**prov, "git_commit": "b" * 40, "code": {**prov["code"], "sha256": "e" * 64, "files": prov["code"]["files"] + 1}}
+    for new_line, old_line in zip(r2.prov_mod.render_md(prov)[2:4], r2.prov_mod.render_md(old_prov)[2:4], strict=True):
+        md[md.index(new_line)] = old_line
+    config["provenance"] = old_prov
+    md.remove(r2.series_line(report.pop("series")))
+    words = []
+    for name in ("previewed", "unseen"):
+        c = next(c for c in report["preview_split"][name]["comparisons"] if c["hypothesis"] == "H12")
+        words.append("rule met" if c["rule_met"] else "rule not met")
+        boot = c["bootstrap"]
+        c["rule_met"] = r2.passes(c["dm_p"], boot["low"], boot["high"], c["mean_diff"])
+        del c["rule"]
+    i = next(i for i, line in enumerate(md) if line.startswith("| H12: "))
+    for w in words:
+        md[i] = md[i].replace(f", {w}; identical hours", "; identical hours", 1)
+    assert md[i + 2].startswith("H12's parts read H12's own rule") and md[i + 3] == ""
+    del md[i + 2 : i + 4]
+    j = next(j for j, line in enumerate(md) if line.startswith("Coverage: "))
+    md[j] = md[j].replace(r2.COVERAGE_BEFORE, r2.COVERAGE_BEFORE_ITERATION3)
+    (older / "config.json").write_bytes(r2._json_bytes(config))
+    (older / "report2.json").write_bytes(r2._json_bytes(report))
+    (older / r2.REPORT_FILE).write_bytes("\n".join(md).encode("utf-8"))
+
+
+def test_the_comparison_with_an_older_run_allows_the_named_differences_and_nothing_else(two_runs, tmp_path, capsys):
+    a, _, _, _ = two_runs
+    older = tmp_path / "older"
+    _older_from(a, older)
+    problems, met, summary = r2.compare_with_older(older, a)
+    assert problems == [], problems
+    assert [x.name for x in met] == [x.name for x in r2.ITERATION3_ALLOWANCES]
+    assert summary[-1] == f"{r2.SERIES_FILE}: only in the re-run"
+    assert all(line.endswith("identical after the allowances") for line in summary[:3])
+    assert r2.compare_command(older, a, CFG, rerun=False) == 0
+    out = capsys.readouterr().out
+    assert out.count("[met]") == len(r2.ITERATION3_ALLOWANCES) and "comparison passed" in out
+    assert any("only in the re-run" in p for p in r2.diff_runs(older, a))  # a plain diff still fails
+
+    def changed(name: str, old: bytes, new: bytes) -> list[str]:
+        bad = tmp_path / f"bad-{len(list(tmp_path.iterdir()))}"
+        bad.mkdir()
+        for n in ("config.json", "report2.json", r2.REPORT_FILE):
+            (bad / n).write_bytes((older / n).read_bytes())
+        text = (bad / name).read_bytes()
+        assert old in text, (name, old)
+        (bad / name).write_bytes(text.replace(old, new, 1))
+        return r2.compare_with_older(bad, a)[0]
+
+    report = json.loads((older / "report2.json").read_text(encoding="utf-8"))
+    ll = repr(report["arms"]["matrix-1y"]["log_loss"]["estimate"]).encode()
+    k = next(i for i in range(4, len(ll)) if ll[i : i + 1].isdigit())  # one changed digit in one number
+    one_digit = ll[:k] + (b"1" if ll[k : k + 1] != b"1" else b"2") + ll[k + 1 :]
+    # refused either as a difference beyond the allowances or, if the edited float is no longer written as Python
+    # writes it, as a file this code could not have written: the comparison fails both ways
+    assert any(p.startswith("report2.json: ") for p in changed("report2.json", ll, one_digit))
+    small = repr(report["comparisons"][0]["dm_lags"]).encode()  # an integer: the edit stays canonical
+    assert any(p.startswith("report2.json: differs beyond the allowances")
+               for p in changed("report2.json", b'"dm_lags": ' + small, b'"dm_lags": ' + small + b"1"))  # fmt: skip
+    hours = str(report["scored"]["hours"]).encode()  # a digit inside the Coverage line, whose clause may change
+    assert any(p.startswith(f"{r2.REPORT_FILE}: differs") for p in changed(r2.REPORT_FILE, b"Coverage: " + hours, b"Coverage: 9" + hours))
+    assert any(p.startswith("config.json: differs") for p in changed("config.json", b'"n_boot": 200', b'"n_boot": 201'))
+    assert any(p.startswith(f"{r2.REPORT_FILE}: differs") for p in changed(r2.REPORT_FILE, b"## Arms", b"## Arm"))
+    # an older H12 part whose rule_met was not the superiority rule it carried is refused, not rewritten
+    h12 = next(c for c in report["preview_split"]["unseen"]["comparisons"] if c["hypothesis"] == "H12")
+    word, other = (b"true", b"false") if h12["rule_met"] else (b"false", b"true")
+    text = (older / "report2.json").read_bytes()
+    at = text.index(b'"rule_met": ', text.index(b'"hypothesis": "H12"', text.index(b'"unseen"')))  # keys are sorted: it follows
+    assert text[at + 12 : at + 12 + len(word)] == word
+    bad = tmp_path / "bad-rule"
+    bad.mkdir()
+    for n in ("config.json", r2.REPORT_FILE):
+        (bad / n).write_bytes((older / n).read_bytes())
+    (bad / "report2.json").write_bytes(text[: at + 12] + other + text[at + 12 + len(word) :])
+    problems, met, _ = r2.compare_with_older(bad, a)
+    assert any("not the superiority rule" in p for p in problems) and "H12's rule in the parts" not in [x.name for x in met]
+    capsys.readouterr()
+
+
+def test_h12s_parts_read_h12s_own_rule(two_runs):
+    a, _, metrics, _ = two_runs
+    for name in ("previewed", "unseen"):
+        part = metrics["preview_split"][name]
+        c = next(c for c in part["comparisons"] if c["hypothesis"] == "H12")
+        assert c["rule_met"] == r2.h12_rule_met(c["upper_95_one_sided"], c["bootstrap"]["q95"], part["h12_margin"])
+        assert "whole period only" in c["rule"] and "at most 36" in c["rule"]
+        assert all("rule" not in o for o in part["comparisons"] if o["hypothesis"] != "H12")
+    report = (a / r2.REPORT_FILE).read_text(encoding="utf-8")
+    assert r2.H12_PART_NOTE.format(max_fits=36) in report
+    row = next(line for line in report.splitlines() if line.startswith("| H12: "))
+    assert row.count("rule met") + row.count("rule not met") == 2
+    # on hand-built numbers: a difference far inside the margin meets H12's rule, though it fails the superiority rule
+    rng = np.random.default_rng(4)
+    y = 1.0 + 0.1 * rng.random(400)
+    part = {"x": y + 0.001 * rng.standard_normal(400), "y": y}
+    c = r2._compare_part(part, "x", "y", 1.0, CFG, "t", h12_margin=0.05)
+    assert c["rule_met"] is True and r2.compare_arms(part, "x", "y", 1.0, CFG, "t")["passes"] is False
+
+
+def test_the_per_file_summary_comes_first(two_runs, tmp_path, capsys):
+    a, _, _, _ = two_runs
+    copy = tmp_path / "copy"
+    copy.mkdir()
+    for name in r2.compared_files(a):
+        (copy / name).write_bytes((a / name).read_bytes())
+    assert r2.summarize_runs(a, copy) == [f"{n}: identical" for n in r2.COMPARED]
+    md = (copy / r2.REPORT_FILE).read_bytes()
+    (copy / r2.REPORT_FILE).write_bytes(md.replace(b"## Arms", b"## Armz", 1))
+    (copy / r2.SERIES_FILE).write_bytes((a / r2.SERIES_FILE).read_bytes() + b"\0")
+    summary = r2.summarize_runs(a, copy)
+    assert summary[2] == f"{r2.REPORT_FILE}: 2 differing lines (1 only in the expected run, 1 only in the re-run)"
+    assert summary[3].startswith(f"{r2.SERIES_FILE}: differs (binary; ")
+    assert any(p.startswith(f"{r2.SERIES_FILE}: differs") for p in r2.diff_runs(a, copy))
+
+
+def test_the_ece_docstring_says_what_the_check_cannot_see():
+    doc = r2.ece_tolerance.__doc__
+    assert "Not a row put in another bin" in doc and "cannot see it" in doc and "counted twice" in doc

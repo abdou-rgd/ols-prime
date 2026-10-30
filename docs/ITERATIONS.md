@@ -412,6 +412,31 @@ The first official run of H1 (commit 9c414ca) also held. CI on Linux then showed
   - The machine: the RTX 3060 12 GB in WSL2.
   - Colab: 194.04 compute units on 2026-10-29, used only if the sizing rules the 3060 out.
   - The time of one fit of `enc-ols` on the 2024 fit's training set, measured on a synthetic panel of the real shape in wave 1. The numbers, and the schedule they allow, are written here before any encoder run.
+  - **Measured on 2026-10-30, synthetic data only.**
+    - The panel: 30 members, hourly from 2017-10. The 2024 fit trains on 1,558,575 rows over 323 weeks, an upper bound, since real members list later.
+    - The build: RTX 3060 12 GB in WSL2, driver 617.42, CUDA 13.4, cuDNN 9.26.0, torch 2.15.0+cu134, with the deterministic settings on.
+
+    | | `enc-ols` | `enc-softmax` | `enc-linear` |
+    |---|---|---|---|
+    | Training step, median | 0.471 s | 0.442 s | 0.300 s |
+    | Peak memory in training | 1.85 GB | 2.68 GB | 2.09 GB |
+    | Time per 10⁴ decisions, H13's conditions | 0.142 s | 0.134 s | 0.093 s |
+
+    - One whole 2024 fit of `enc-ols` took 945 s: 6 epochs, 1,938 steps. Forecasting its 253,193 rows took 5.1 s.
+    - **Determinism.** Two such fits were bit-identical: every epoch's parameters, the slice losses, the epoch kept and every forecast. The scope test passed at every prefix. So the registered H1 runs on the GPU. Its own pre-check still runs first, on the real sub-panel.
+    - **Two signs, before any real run.**
+      - On these synthetic rows, `enc-ols` takes 1.06 times `enc-softmax`'s time. H13 needs 0.9 or less. Its registered measurement is the one on the real rows.
+      - On a small synthetic panel, `pos-window` with `enc-ols` reached a Brier skill score of 0.53, against the 0.5 it needs, and kept its last epoch.
+  - **Projections.**
+    - H4 and H5's 54 fits (3 arms × 3 seeds × 6 fits) take about 7.4 GPU-hours.
+    - The panel H1, with its pre-check and every control, takes about 8.7 hours. That is under the 12-hour budget, so every cut runs.
+    - Each of LFM3's ablations and H6 takes about 2.9 GPU-hours.
+  - **The schedule.** Everything runs on the 3060, so Colab is not needed. In order:
+    1. the pre-check on the real sub-panel;
+    2. H1 with its controls;
+    3. the 54 fits;
+    4. H13's timing and the cost table;
+    5. then, while time remains, LFM3's ablations and H6.
 
 **The five whys**, written before the first call of `explain`.
 - Every call on 2019–2024 comes after the frozen design is committed.
