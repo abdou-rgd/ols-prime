@@ -710,10 +710,11 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
     - Each tree's partition is recounted group by group, not only checked by its sum.
     - A Matrix-free twin of the ridge forecast, in numpy, rebuilds each explained ridge forecast within a stated bound (the audit's bolder check).
     - One limit is stated, not fixed: check 1 holds the range of the entries behind σ² to the panel's stamps, not their values.
-  - **Audit pass 4e**, on the encoder's core and its panel H1: no Blocker and no Major point, three Minor points and four Nits. GO for the panel H1 and for Report n°3's fits on this core.
-    - A resume is refused if the build changed: torch, CUDA, cuDNN, Python, the platform, the GPU or its driver, and on CPU the thread count, as well as the config, the code and the manifest. The refusal names each field that changed. The platform holds WSL2's kernel version, so a kernel update between a stop and a resume also refuses the resume.
+  - **Audit pass 4e**, on the encoder's core and its panel H1: no Blocker and no Major point, three Minor points and four Nits. GO for the panel H1 and for Report n°3's fits on this core. Its second look, at commit `abbc7d1`, gave GO for the panel H1 on the GPU, with one Minor point, on this entry's wording, corrected here, and five Nits. It trained `cheat-stamp`'s run 1 in four orders, and every part came out byte-identical.
+    - A resume is refused if the build changed: torch and its CUDA build, cuDNN, Python, the platform, the GPU and the driver passed by `--driver`, and on CPU the thread count, as well as the config, the code and the manifest. The refusal names each field that changed. The platform holds WSL2's kernel version, so a kernel update between a stop and a resume also refuses the resume.
+    - **A limit.** On CUDA the identity does not hold the CPU's thread count, although the memory's readout runs on the CPU there. The audit found the prefix sums and the readout bit-identical with 1, 2, 4 and 6 threads.
     - The registered scope test runs at the first cut. The same test also runs at every regular cut, as a description (below).
-    - Torch's documentation lists `cumsum` on a CUDA tensor among the operations that raise in deterministic mode. On the RTX 3060 it neither raised nor drifted, and it matched the CPU's sum to the bit on the audit's probe. The pre-check remains the gate.
+    - Torch 2.15's documentation lists `cumsum` on a CUDA floating tensor among the operations that act deterministically under `use_deterministic_algorithms(True)`; older releases listed it among those that raise. On the RTX 3060 it neither raised nor drifted across calls and prefix lengths, and it matched the CPU's sequential sum to the bit on a 5,000 × 100 fp64 probe. The pre-check remains the gate.
     - **A correction of the wave-1 entry.** `pos-window`'s label sums the 24 one-bar returns in fp64, as built, not in fp32. On 38,144 synthetic rows the two readings class every row alike, the closest margin being 308 fp32 ulps.
   - **Audit pass 4f**, on Report n°3: no Blocker, one Major point, seven Minor points and five Nits, all fixed before any fit. Its second look gave GO for the fits and the score, with three Minor points and three Nits, all fixed. It stopped a run at seven points where a file is written, and every resume gave the same bytes.
     - A saved part is checked against its folder: its arm, seed and year, and its checkpoint's and forecasts' own records. A copied folder would otherwise have been scored as another arm (the Major point).
@@ -741,7 +742,7 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
     - Every stage of Report n°3 runs in WSL2, on the Ryzen 5 3600 and the RTX 3060. Matrix's CPU column uses the portable build there, where the process's peak memory is `ru_maxrss`. That peak is the whole process's, panel and windows included, and the memory's own size is given beside it. Matrix's parameters are 0: its choices are selections.
     - The statistics' parameters come from Report n°2's `config.json`. The panel is checked by its fingerprint, and every scored row is paired one for one before any training.
   - **Descriptions, beside the registered verdicts.** None enters a verdict.
-    - The scope test at every regular cut, for the honest arms and `cheat-stamp`, in the pre-check stage (audit pass 4e's bolder check). It loads the honest fit of the cut's year and trains nothing that H1 does not train.
+    - The scope test at every regular cut, for the honest arms and `cheat-stamp`, in the pre-check stage (audit pass 4e's bolder check). It loads each system's unperturbed run 1 of the cut's year; `cheat-stamp`'s is the control's own fit, the one H1 uses. At the registered setting, every system at every cut, it trains nothing that H1 does not train.
     - H13: the readout's own time, beside the attention operator's and the whole pass; and the median of the per-repeat ratios, beside the ratio of medians.
     - H4's two bounds on the three seed-matched pairs, and in the reversed direction, `enc-softmax` non-inferior to `enc-ols` (audit pass 4f's bolder check).
   - **`explain head`, its readings**, fixed before it is built.
@@ -756,3 +757,18 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
     1. Report n°2's re-run, `--compare-with runs/2026-10-29-report2`, 2026-10-30 02:42–03:05 UTC. It reads 2017-10 → 2024-12 and scores 2019-01 → 2024-12, as in iteration 3. The five allowed differences were met and every other byte matched. `series.npz`'s SHA-256 is `03916fda8ffa9f97709216b2365e7a224dd8c8d71448d75035a7824fdc9cc0b9`.
     2. Its `--check`, 03:05–03:28 UTC: the four files were byte-identical, `series.npz` included.
     3. The twins, twice, at 03:28 and 03:29 UTC, byte-identical. They read BTCUSDT's and ETHUSDT's daily bars through 2024-12, as iteration 3's H1 and adversary did.
+- 2026-10-30, before the first `explain` call and before any encoder run on real data (`runs/explain/CONTACTS.log` does not exist yet). Report n°3 cannot be built as written on the Windows runs of Report n°2, so it is given a Report n°2 run made in WSL2. No rule, statistic, threshold, grid, seed or period changes.
+  - **What was found.** On the same input bytes, `np.log` and `np.exp` give different last bits on Windows and in WSL2's Linux.
+    - So the panel's log-based columns differ in their last bits between the two platforms: among the features the returns, volatilities, moving-average gaps and ranges, and also the threshold and the forward return. The panel's fingerprint differs with them.
+    - On identical synthetic bars, exactly representable on both sides, the times, the labels, `f_qvol_z_30` and `f_taker_7` matched, and the other columns did not.
+    - The `explain head` engineer found it, and the orchestrator reproduced it.
+  - **Why it matters.**
+    - Every stage of Report n°3 runs in WSL2, and Report n°3 checks its panel against Report n°2's fingerprint before any training. Every Report n°2 run so far was made on Windows, so Report n°3 would be refused.
+    - Scoring an encoder trained on Linux features against Matrix forecasts made from Windows features would not compare two systems on one panel either.
+  - **What is done.**
+    - Report n°2 is re-run in WSL2, from the clean WSL2 clone, with the registered configuration.
+    - Report n°3 reads that run, by its series' digest: its panel and fingerprint, `matrix-select`'s series for H5, and `climatology-panel`'s log-loss for H4's margin.
+    - `explain head` runs in WSL2 too, on Report n°3's folder.
+    - The Windows runs remain Report n°2's record of iteration 3. `why`, `series` and `sample` keep reading the Windows re-run.
+  - **A description, beside it.** The two runs of Report n°2 are compared: the scored rows and their labels, each arm's scores, and the verdicts of H2, H3, H10, H11 and H12. A verdict that the platform's last bits can move is the first finding to report.
+  - The panel H1 for the encoder arms is not affected: it builds its sub-panel and compares its own runs, all in WSL2.

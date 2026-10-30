@@ -477,6 +477,7 @@ The first official run of H1 (commit 9c414ca) also held. CI on Linux then showed
 | 2 | Audit pass 4e, on the encoder's core and its panel H1 | `leakage-auditor` | `audit-code-4e.md` |
 | 2 | Audit pass 4f, on Report n°3's runner | `leakage-auditor` | `audit-code-4f.md` |
 | 3 | `explain head`, on Report n°3's checkpoints | `ml-engineer` | `explain-head.md` |
+| 3 | Audit pass 4g, on `explain head` | `leakage-auditor` | `audit-code-4g.md` |
 | 3 | Official runs and rows | orchestrator, `experiment-runner` | `runs.md` |
 | 4 | Audit of the code and the results | `leakage-auditor` | `audit.md` |
 | 5 | Learning page | `teacher` | `learning-page.md` |

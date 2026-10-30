@@ -54,9 +54,11 @@ Each call is logged automatically. Record the line count of `CONTACTS.log` in th
 
 ### 5. The encoder (audit passes 4e and 4f: GO; from the WSL2 clone)
 1. The panel H1 on the GPU: `python -m olsprime.bench.encoder_h1 --device cuda --stage all --driver 617.42 --out <runs>/2026-10-30-encoder-h1`. The pre-check runs first and gates the H1 stage. Pass the same `--out` on any restart: the default folder carries the UTC date.
-2. Report n°3's fits, arm by arm: `enc-ols`, `enc-softmax`, `enc-linear`, 3 seeds × 6 fits each.
-3. On a quiet machine (no Kani, nothing heavy on Windows): H13's timing and the Matrix timing, both in WSL2; then the score stage and `--check`.
-4. If time remains: LFM3's ablations, then H6.
+2. **Report n°2's re-run in WSL2** (added on 2026-10-30: `np.log` and `np.exp` differ in their last bits between Windows and Linux, so the panel's fingerprint does; see the change log). On the CPU, while the H1 runs if memory allows: `python -m olsprime.bench.report2 --compare-with <runs>/2026-10-30-report2 --out <runs>/2026-10-30-report2-wsl`. The comparison is expected to fail on the numbers' last bits: it is the description of the two platforms, not a gate. Then `--check <runs>/2026-10-30-report2-wsl` in WSL2. Report n°3 reads this run, by its series' digest.
+3. Report n°3's fits, arm by arm: `enc-ols`, `enc-softmax`, `enc-linear`, 3 seeds × 6 fits each, with `--series <runs>/2026-10-30-report2-wsl/series.npz` and its digest.
+4. On a quiet machine (no Kani, nothing heavy on Windows): H13's timing and the Matrix timing, both in WSL2; then the score stage and `--check`.
+5. `explain head` in WSL2, on Report n°3's folder, after audit pass 4g.
+6. If time remains: LFM3's ablations, then H6.
 
 ### 6. Kani
 The five proven harnesses, in WSL2 with `-j 2`, from the WSL2 clone, before the H13 timing. Use the flags of `KANI_FLAGS` in `.github/workflows/kani.yml`, never `--bitwuzla`.
