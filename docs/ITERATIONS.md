@@ -368,3 +368,127 @@ The first official run of H1 (commit 9c414ca) also held. CI on Linux then showed
 - **From forecasts to trades.** A portfolio simulator turns the Matrix arms' probabilities into long/flat positions through the risk kernel, at Coinbase's and Kraken's fees. Does a BSS of 0.013 survive a round trip of about 1 %?
 
 **Learning page.** [L'arbre et le coffre](https://claude.ai/artifact/8AkKGG3q97u8jU2Z9BjpbK), in French, written by `teacher` and checked by the orchestrator. It is private to Abdou's account.
+
+## Iteration 4 — Learned features, and what a verdict is worth (2026-10-30)
+
+**Goal.** This is roadmap phase 3, the OLS Prime encoder, made bolder as iteration 3's outcome proposes: learn the features, and know what a verdict is worth.
+- The encoder: OLS-attention heads trained from scratch on the hourly panel, reading Matrix as their memory.
+  - H4 compares them with softmax and linear attention at equal parameter count.
+  - H5 compares them with Matrix alone.
+  - H13 asks whether they are also cheaper to run.
+- The size and power of the pass rule, so that "does not hold" reads as "no difference" or as "too weak to see".
+- An instrument, `olsprime.explain`, that says why a forecast is what it is.
+- A bolder check of H1: two cheaters that leak at training time must be caught on GPU, where bits are harder to keep.
+
+**Deliverables.**
+1. **Report n°2's series.** `series.npz` holds its hourly series and scored rows. Its SHA-256 goes in `report2.json`, so that no later study refits an arm.
+   - Audit phase 2's four logged items are folded in.
+   - Report n°2 is re-run once and compared with iteration 3's run. Only named lines may differ.
+2. **The size and power of the pass rule.** `python -m olsprime.bench.power` reads `series.npz` by its digest and refits nothing.
+3. **`olsprime.explain`.**
+   - `why` breaks a Matrix forecast into the memory's tree nodes and into per-feature parts, with two loud checks. For it, `CentredReadout` gains `beta` and `mean_y`.
+   - `head` shows the OLS heads' W, once the encoder exists.
+   - Every call is logged in `runs/explain/CONTACTS.log`. Its first use is the five whys below.
+4. **The encoder.**
+   - torch is added to the lock without moving a locked package: CPU on Windows and CI, CUDA in WSL2.
+   - The arms `enc-ols`, `enc-softmax` and `enc-linear`, with the memory over learned keys, training in weekly episodes, yearly fits and three seeds.
+   - Report n°3: H4, H5, H13 and the cost table.
+   - The panel H1 for the encoder arms on GPU, with `cheat-stamp` and `cheat-value`. After audits 4a and 4b, it also has two purge cuts with `cheat-purge` and `cheat-slice`, and a positive control, `pos-window`.
+   - LFM3's ablations and H6, if time remains.
+5. **H1's blind spots.** The adversary's future-shuffle twins classify its misses.
+6. **Registered now, run in iteration 5:** H14, the portfolio simulator's first claim, and H1's extreme-shape cut.
+
+**Scope, fixed before any result.** `docs/PROTOCOL.md`, "The encoder, and what a verdict is worth (iteration 4)", holds the full pre-registration.
+- **Priority if time runs out**, in the protocol's order:
+  1. the audited pre-registration;
+  2. Report n°2's series, then the size and power study;
+  3. `explain`;
+  4. the encoder's core arms with H5, H13 and the cost table, then LFM3's ablations and H6;
+  5. the twins.
+
+  A hypothesis that was not run is reported as not run.
+- **The first finding, if it happens.** If the deterministic H1 cannot catch `cheat-stamp` bit for bit on GPU, that is reported before any H4 number.
+- **Sizing, before the schedule.**
+  - The machine: the RTX 3060 12 GB in WSL2.
+  - Colab: 194.04 compute units on 2026-10-29, used only if the sizing rules the 3060 out.
+  - The time of one fit of `enc-ols` on the 2024 fit's training set, measured on a synthetic panel of the real shape in wave 1. The numbers, and the schedule they allow, are written here before any encoder run.
+  - **Measured on 2026-10-30, synthetic data only.**
+    - The panel: 30 members, hourly from 2017-10. The 2024 fit trains on 1,558,575 rows over 323 weeks, an upper bound, since real members list later.
+    - The build: RTX 3060 12 GB in WSL2, driver 617.42, CUDA 13.4, cuDNN 9.26.0, torch 2.15.0+cu134, with the deterministic settings on.
+
+    | | `enc-ols` | `enc-softmax` | `enc-linear` |
+    |---|---|---|---|
+    | Training step, median | 0.471 s | 0.442 s | 0.300 s |
+    | Peak memory in training | 1.85 GB | 2.68 GB | 2.09 GB |
+    | Time per 10⁴ decisions, H13's conditions | 0.142 s | 0.134 s | 0.093 s |
+
+    - One whole 2024 fit of `enc-ols` took 945 s: 6 epochs, 1,938 steps. Forecasting its 253,193 rows took 5.1 s.
+    - **Determinism.** Two such fits were bit-identical: every epoch's parameters, the slice losses, the epoch kept and every forecast. The scope test passed at every prefix. So the registered H1 runs on the GPU. Its own pre-check still runs first, on the real sub-panel.
+    - **Two signs, before any real run.**
+      - On these synthetic rows, `enc-ols` takes 1.06 times `enc-softmax`'s time. H13 needs 0.9 or less. Its registered measurement is the one on the real rows.
+      - On a small synthetic panel, `pos-window` with `enc-ols` reached a Brier skill score of 0.53, against the 0.5 it needs, and kept its last epoch.
+  - **Projections.**
+    - H4 and H5's 54 fits (3 arms × 3 seeds × 6 fits) take about 7.4 GPU-hours.
+    - The panel H1, with its pre-check and every control, takes about 8.7 hours. That is under the 12-hour budget, so every cut runs.
+    - Each of LFM3's ablations and H6 takes about 2.9 GPU-hours.
+  - **The schedule.** Everything runs on the 3060, so Colab is not needed. In order:
+    1. the pre-check on the real sub-panel;
+    2. H1 with its controls;
+    3. the 54 fits;
+    4. H13's timing and the cost table;
+    5. then, while time remains, LFM3's ablations and H6.
+
+**The five whys**, written before the first call of `explain`.
+- Every call on 2019–2024 comes after the frozen design is committed.
+- What a call shows on those months is exploratory: no hypothesis of this iteration is tested on it.
+
+1. Why do `matrix-1y` and `knn-1y` tie?
+2. Does the Brier skill of the 18 previewed months come from a few hours, or from the whole 2019–2020 regime?
+3. Are hours with a high negative mass worse calibrated?
+4. Which feature carries the gain over climatology?
+5. What did the model do around the 2020-06-28 outage?
+
+(1), (2) and (5) get numbers in the outcome. (3) and (4) are answered only once the encoder is frozen, and are labelled "exploratory, test months".
+
+**Hypotheses touched.** H1 (the encoder arms on GPU, the training-time cheaters, the twins), H4, H5 and H13; H6 if time remains. H14 is registered.
+
+**Done when.**
+- The pre-registration was audited before any run, and every finding was fixed or logged.
+- Every check of `CLAUDE.md` is green, locally and in GitHub Actions, on Windows and Linux.
+- Every change to data, model or evaluation code has passed `leakage-auditor`.
+- `RESULTS.md` has the new rows with their variant counts. Every item not run is reported as not run.
+- The outcome and one bolder next step are recorded here, with the learning page's link.
+- The pull request is merged into `main` with a local merge commit and pushed. Abdou authorized commit, merge, push and installs for this iteration on 2026-10-29.
+
+**Plan.** Briefs are in `.claude/briefs/iteration-4/`. At most three agents run at once.
+
+| Wave | Task | Agent | Brief |
+|---|---|---|---|
+| 1 | `beta` and `mean_y` on `CentredReadout` | `rust-engineer` | `beta-getter.md` |
+| 1 | Report n°2's series; the size and power study | `ml-engineer` | `series-power.md` |
+| 1 | The encoder's core, torch and the sizing | `ml-engineer` | `encoder-core.md` |
+| 1 | Audit pass 4a, on the pre-registration | `leakage-auditor` | `audit-prereg.md` |
+| 2 | `olsprime.explain` | `ml-engineer` | `explain.md` |
+| 2 | The future-shuffle twins | `ml-engineer` | `twins.md` |
+| 2 | Audit pass 4c, on wave 1's evaluation code and the twins | `leakage-auditor` | `audit-code-4c.md` |
+| 2 | Audit pass 4d, on `olsprime.explain`, in three looks | `leakage-auditor` | `audit-code-4d.md` |
+| 2 | The encoder's panel H1 on GPU, with its controls | `ml-engineer` | `encoder-h1.md` |
+| 2 | Report n°3: the fits, H4, H5, H13 and the cost table | `ml-engineer` | `encoder-report3.md` |
+| 2 | Audit pass 4e, on the encoder's core and its panel H1 | `leakage-auditor` | `audit-code-4e.md` |
+| 2 | Audit pass 4f, on Report n°3's runner | `leakage-auditor` | `audit-code-4f.md` |
+| 3 | `explain head`, on Report n°3's checkpoints | `ml-engineer` | `explain-head.md` |
+| 3 | Audit pass 4g, on `explain head` | `leakage-auditor` | `audit-code-4g.md` |
+| 3 | Official runs and rows | orchestrator, `experiment-runner` | `runs.md` |
+| 3 | The `explain` twin's failure at one row: a diagnosis, no code change | `ml-engineer` | `twin-gap.md` |
+| 3 | LFM3's ablations and H6, built while the GPU runs | `ml-engineer` | `ablations.md` |
+| 3 | Audit pass 4h, on the ablations | `leakage-auditor` | `audit-code-4h.md` |
+| 4 | Audit of the code and the results | `leakage-auditor` | `audit.md` |
+| 5 | Learning page | `teacher` | `learning-page.md` |
+
+**Set up by the orchestrator before wave 1.**
+- `main` holds iteration 3 (merge commit `6e05906`, pull request abdou-rgd/ols-prime#3).
+- Work happens on the branch `iteration-4`. It was made from `origin/main` without upstream tracking, so that no push can land on `main` by mistake.
+- The Colab CLI, `google-colab-cli`, is installed with `uv tool` in WSL2. Abdou signed in on 2026-10-29.
+- The machine stays awake, and shuts down at the end of the session unless something blocks.
+
+**Before wave 2** (after audit pass 4a). The audited pre-registration is committed, and wave 2 starts only after that commit.

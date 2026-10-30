@@ -465,6 +465,9 @@ MODULE_ATTRIBUTES: dict[str, tuple[str, frozenset[str]]] = {
     "numpy": ("binary-load", frozenset({"load", "fromfile", "memmap"})),
     "shutil": ("copy", frozenset({"copy", "copyfile", "copy2", "copytree"})),
     "builtins": ("exec", EXEC_BUILTINS),
+    # torch.load unpickles, as pickle.load does (iteration 4); torch.serialization holds the same function
+    "torch": ("import:pickle", frozenset({"load"})),
+    "torch.serialization": ("import:pickle", frozenset({"load"})),
 }
 # Notebooks: a line that starts with ``%`` or ``!`` is IPython, not Python. It is blanked for the parser
 # but still scanned for these data tokens, so that ``!parquet-tools cat x.parquet`` does not slip through.
@@ -949,6 +952,12 @@ CHEATERS = [
     ("np-memmap", "import numpy as np\nnp.memmap('rows.bin')", {"binary-load"}),
     ("from-numpy-load", "from numpy import load\nload('rows.npy')", {"binary-load"}),
     ("pickle-load", "import pickle\npickle.load(open('rows.pkl', 'rb'))", {"import:pickle"}),
+    # torch.load unpickles (iteration 4, with torch installed); the run-time side is tests/test_torch_guards.py
+    ("torch-load", "import torch\ntorch.load('w.pt')", {"import:pickle"}),
+    ("torch-load-weights-only", "import torch as t\nt.load('w.pt', weights_only=True)", {"import:pickle"}),
+    ("from-torch-load", "from torch import load\nload('w.pt')", {"import:pickle"}),
+    ("torch-serialization-load", "import torch.serialization as ts\nts.load('w.pt')", {"import:pickle"}),
+    ("from-torch-serialization-load", "from torch.serialization import load as ld\nld('w.pt')", {"import:pickle"}),
     ("joblib-load", "import joblib\njoblib.load('rows.joblib')", {"import:joblib"}),
     ("shelve", "import shelve\nshelve.open('rows')", {"import:shelve"}),
     ("shutil-copy", "import shutil\nshutil.copy(src, dst)", {"copy"}),
