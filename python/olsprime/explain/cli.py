@@ -1,4 +1,4 @@
-"""The command line of ``explain``: ``why``, ``series`` and ``sample``.
+"""The command line of ``explain``: ``why``, ``series``, ``sample`` and ``head``.
 
 Usage (from ``python/``)::
 
@@ -8,6 +8,12 @@ Usage (from ``python/``)::
         [--by month] [--top 10] [--jsonl FILE]
     uv run --no-sync python -m olsprime.explain sample ARM --run DIR --sha256 HEX --test-months [--period ...] [--n 1000] [--seed 0]
         [--jsonl FILE]
+    uv run --no-sync python -m olsprime.explain head PAIR AS_OF --run REPORT3_DIR --sha256 HEX [--seed 1|2|3] --test-months
+        [--jsonl FILE]
+
+``why``, ``series`` and ``sample`` read a Report n°2 run; ``head`` reads a Report n°3 run, whose ``series.npz``
+digest its ``report3.json`` must agree with, and explains the OLS heads of its ``enc-ols`` fits
+(:mod:`olsprime.explain.head`). Only ``head`` imports torch, and only when it is called.
 
 ``AS_OF`` is the row's decision time or its bar's open (ISO 8601, UTC when no zone is given). Each answer is
 one JSON line (sorted keys, no wall clock) plus a short text summary. Without ``--jsonl`` the JSON lines
@@ -18,7 +24,8 @@ Order of a call: the arguments are checked (periods, every ``--at``, ``--jsonl``
 (``why`` and ``sample``), ``series.npz`` is hashed against the digest given; then the contact lines are
 written, and only then is the run folder opened. ``why`` writes one contact line per row asked (``AS_OF``
 and each ``--at``), all up front: a call that then stops on one row (a refusal, a loud check) has still
-logged every row it named, so the log over-counts contacts rather than missing one.
+logged every row it named, so the log over-counts contacts rather than missing one. ``head`` follows the same
+order (without the extension probe) and writes one contact line for its row, whatever the number of seeds.
 """
 
 from __future__ import annotations
@@ -98,6 +105,14 @@ def _parser() -> argparse.ArgumentParser:
     m.add_argument("--n", type=int, default=1000)
     m.add_argument("--seed", type=int, required=True)
     common(m)
+    h = sub.add_parser("head", help="what each OLS head of a fitted enc-ols attends to at one scored row, with its loud checks")
+    h.add_argument("pair")
+    h.add_argument("as_of", help="the row's decision time or its bar's open, ISO 8601 (2019-2024: scored rows only)")
+    h.add_argument("--seed", type=int, choices=(1, 2, 3), default=None, help="one seed (default: every seed of the run, each apart)")
+    h.add_argument("--run", type=Path, required=True, help="a Report n°3 run folder")
+    h.add_argument("--sha256", required=True, help="the SHA-256 of its series.npz (its report3.json must agree)")
+    h.add_argument(TEST_FLAG, dest="test_months", action="store_true", help="required: head reads test months only, logged as a contact")
+    h.add_argument("--jsonl", type=Path, default=None, help="write the JSON lines here (default: stdout, after the summaries)")
     return p
 
 
@@ -122,13 +137,21 @@ def main(
     system_factory: Callable[..., MatrixSystem] = MatrixSystem,
     out: TextIO | None = None,
     err: TextIO | None = None,
+    panel_source: Callable[[], Any] | None = None,
 ) -> int:
-    """Run one call. ``data_dir``, ``universe``, ``contacts`` and ``system_factory`` are for tests."""
+    """Run one call. ``data_dir``, ``universe``, ``contacts``, ``system_factory`` and ``panel_source`` are for tests
+    (``panel_source``: ``head``'s panel and bars for a run whose panel is not the store's, its fingerprint still required)."""
     out, err = out or sys.stdout, err or sys.stderr
     args = _parser().parse_args(argv)
     try:
         jsonl = check_jsonl(args.jsonl)
-        summaries, lines = _dispatch(args, data_dir=data_dir, universe=universe, contacts=contacts_file(contacts), system_factory=system_factory)
+        kw = {"data_dir": data_dir, "universe": universe, "contacts": contacts_file(contacts)}
+        if args.command == "head":
+            from olsprime.explain.head import run_head  # torch is imported here, and only for head
+
+            summaries, lines = run_head(args, panel_source=panel_source, **kw)
+        else:
+            summaries, lines = _dispatch(args, system_factory=system_factory, **kw)
     except Refused as exc:
         print(f"REFUSED: {exc}", file=err)
         return 2

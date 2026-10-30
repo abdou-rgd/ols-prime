@@ -479,6 +479,9 @@ The first official run of H1 (commit 9c414ca) also held. CI on Linux then showed
 | 3 | `explain head`, on Report n°3's checkpoints | `ml-engineer` | `explain-head.md` |
 | 3 | Audit pass 4g, on `explain head` | `leakage-auditor` | `audit-code-4g.md` |
 | 3 | Official runs and rows | orchestrator, `experiment-runner` | `runs.md` |
+| 3 | The `explain` twin's failure at one row: a diagnosis, no code change | `ml-engineer` | `twin-gap.md` |
+| 3 | LFM3's ablations and H6, built while the GPU runs | `ml-engineer` | `ablations.md` |
+| 3 | Audit pass 4h, on the ablations | `leakage-auditor` | `audit-code-4h.md` |
 | 4 | Audit of the code and the results | `leakage-auditor` | `audit.md` |
 | 5 | Learning page | `teacher` | `learning-page.md` |
 

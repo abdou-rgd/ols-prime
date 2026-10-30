@@ -16,7 +16,7 @@ import sys
 
 import pytest
 
-TORCH_FREE = ("olsprime.models", "olsprime.bench.report2", "olsprime.bench.power")
+TORCH_FREE = ("olsprime.models", "olsprime.bench.report2", "olsprime.bench.power", "olsprime.explain", "olsprime.explain.cli")
 ABSENT, PRESENT = 0, 3
 
 
@@ -26,6 +26,8 @@ def _child(module: str) -> None:
     came with them, ABSENT if not."""
     import olsprime.bench.power  # noqa: F401
     import olsprime.bench.report2  # noqa: F401
+    import olsprime.explain  # noqa: F401
+    import olsprime.explain.cli  # noqa: F401  (head's torch is imported in its dispatch only)
     import olsprime.models  # noqa: F401
 
     if module == "olsprime.models.encoder":
