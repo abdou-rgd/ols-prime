@@ -772,3 +772,14 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
     - The Windows runs remain Report n°2's record of iteration 3. `why`, `series` and `sample` keep reading the Windows re-run.
   - **A description, beside it.** The two runs of Report n°2 are compared: the scored rows and their labels, each arm's scores, and the verdicts of H2, H3, H10, H11 and H12. A verdict that the platform's last bits can move is the first finding to report.
   - The panel H1 for the encoder arms is not affected: it builds its sub-panel and compares its own runs, all in WSL2.
+- 2026-10-30, after audit pass 4g on `explain head`, before the first `explain` call (`runs/explain/CONTACTS.log` does not exist yet). No rule, statistic, threshold, grid, seed or period changes.
+  - **Audit pass 4g**, on `explain head`: no Blocker, one Major point, two Minor points and two Nits. GO once the Major point is fixed, before any call on a real checkpoint. Each of the build's seven interpretations was accepted.
+    - **The Major point.** `head` checked a part only against its own folder. A checkpoint changed by one bit, with its digests rewritten to match, was explained as if it were Report n°3's. `head` now refuses a part unless its checkpoint's and forecasts' digests, its count of forecasts and its epoch kept are the ones `report3.json` records for that arm, seed and year.
+    - The forecast check is a fingerprint of the forecast, not a proof of the checkpoint's bytes. The digests bound to `report3.json` are the checkpoint's identity.
+    - The registered row-sum check, on the fp32 W, is loose by three orders of magnitude. The same check on W formed in fp64 from the same Q, K and λ, with its own bound, is added beside it, and it stops the call too.
+    - The contact line names all that a call reads: the fit year's forecasts and labels, and the memory through `as_of`.
+    - The audit's bolder check, if it can be built without loosening a guard: with every seed, the recomputed forecasts, ensembled as the fits ensemble them, must equal the `enc-ols` probability of the row in Report n°3's `series.npz`, to the bit.
+  - **Contacts with the real data since the last entry**, from clean clones at `5f17a76`, whose CI was green on Linux and Windows:
+    4. The panel H1 for the encoder arms, on the GPU in WSL2, from 07:38 UTC. It reads the 10-member sub-panel's hourly bars through 2024-12, and forecasts and scores its rows in the cut years 2020, 2021, 2022 and 2024.
+    5. The power study, on Windows, from 07:38 UTC. It reads Report n°2's series `03916fda…` by its digest.
+    6. Report n°2's re-run in WSL2, from 07:39 UTC, compared with `runs/2026-10-30-report2`. It reads 2017-10 → 2024-12 and scores 2019-01 → 2024-12, as before.
