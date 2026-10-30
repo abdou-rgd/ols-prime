@@ -470,7 +470,10 @@ The first official run of H1 (commit 9c414ca) also held. CI on Linux then showed
 | 1 | Audit pass 4a, on the pre-registration | `leakage-auditor` | `audit-prereg.md` |
 | 2 | `olsprime.explain` | `ml-engineer` | `explain.md` |
 | 2 | The future-shuffle twins | `ml-engineer` | `twins.md` |
-| 2 | The encoder on the panel: Report n°3 and the GPU H1 | `ml-engineer` | `encoder-panel.md` |
+| 2 | Audit pass 4c, on wave 1's evaluation code and the twins | `leakage-auditor` | `audit-code-4c.md` |
+| 2 | Audit pass 4d, on `olsprime.explain`, in three looks | `leakage-auditor` | `audit-code-4d.md` |
+| 2 | The encoder's panel H1 on GPU, with its controls | `ml-engineer` | `encoder-h1.md` |
+| 2 | Report n°3: the fits, H4, H5, H13 and the cost table | `ml-engineer` | `encoder-report3.md` |
 | 3 | Official runs and rows | orchestrator, `experiment-runner` | `runs.md` |
 | 4 | Audit of the code and the results | `leakage-auditor` | `audit.md` |
 | 5 | Learning page | `teacher` | `learning-page.md` |

@@ -351,8 +351,18 @@ Registered on 2026-10-29, before any run of iteration 4, and audited before any 
 - **`cheat-slice`** (after audit pass 4b). `enc-ols` whose 2021 fit trains on the rows whose labels are known by F − 24 h, its own slice included.
   - It runs at the two purge cuts only.
   - It is predicted caught at F − 30 days, in both directions, and invariant at F − 24 h.
+- **`cheat-stamp-day`** (added on 2026-10-30, before any run on real data; see the change log). `enc-ols` whose memory holds only the last 24 hours by decision time, (d − 24 h, d], with every entry stamped at its decision time, in training and at test time.
+  - Every entry it reads has a label not yet known at d.
+  - It runs where `cheat-stamp` runs, with the same predicted-pattern rule and the same skill check.
+  - It shows whether H1 catches a stamp leak that gives skill.
 - **Predicted patterns.** They are computed per cut, as iteration 3's are. `cheat-stamp` and `cheat-value` are predicted caught at a cut when some compared row has a label whose exit bar opens after the cut. At the eight cuts this is expected to give `XXXXXXXX` for both; the computed prediction is the one tested.
-- **Their skill.** `cheat-stamp` and `cheat-value` must also show a Brier skill score far above every honest arm's: at least 0.1, with a 95 % interval above every honest arm's interval. It is measured on the scored rows of the sub-panel in the cuts' years, which H1's honest run forecasts for every arm.
+- **Their skill.** `cheat-stamp` and `cheat-value` must also show a Brier skill score far above every honest arm's: at least 0.1, with a 95 % interval above every honest arm's interval. So must `cheat-stamp-day`. It is measured on the scored rows of the sub-panel in the cuts' years, which H1's honest run forecasts for every arm.
+- **Three verdicts, reported apart** (made precise on 2026-10-30, before any run on real data).
+  - H1, as `docs/HYPOTHESES.md` defines it: every honest arm bit for bit at every cut, and every control caught on its predicted pattern.
+  - The skill check, control by control.
+  - `pos-window`'s check, below.
+
+  Each is reported as passing or failing, and none stands in for another.
 - **The first finding.** If H1 cannot catch `cheat-stamp` bit for bit, on the GPU or under the fallback, that is the first finding to report, before any H4 number.
 
 **The positive control, `pos-window`** (audit pass 4a's bolder check). `enc-ols`, seed 1, trained and scored on a label that lies inside its own window: the class of ln(c_t / c_{t−24}), under the panel's label rule with the row's own threshold.
@@ -654,6 +664,7 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
   - **The purge cut saw only a leak past F − 24 h.** A second purge cut, at F − 30 days for the 2021 fit, compares the training and every epoch's parameters. A fourth control, `cheat-slice`, which trains on its own slice, is predicted caught there and not at F − 24 h. This was the audit's bolder check, and it is cheap once the first purge cut exists. The two cuts bracket the purge window.
   - **The budget had no answer** when the honest arms alone exceed it on CPU. They then retrain at four cuts, and only forecast with the honest parameters at the others.
   - **`pos-window` keeps the panel's stamp**, so that its row never sits in its own memory.
+  - **Made precise:** the honest run's fit year at the purge cuts; the concentrated grid's exact count of shifted blocks; the twins draw from bars at or before the cut; `explain`'s explicit flag; and H14's change-log line in `docs/HYPOTHESES.md`, since a narrowed claim is still a changed one.
 - 2026-10-30, wave 1, before any encoder run on real data and before the first `explain` call (`runs/explain/CONTACTS.log` does not exist yet). The encoder is built and sized on synthetic data only. Nothing registered above changes. Where the section leaves a choice, the build's reading is fixed here, so that no result can choose it.
   - **The attention block.** In every arm, Q, K and V come from one linear map with a bias. One output projection, with a bias, maps the four heads back to d_model.
   - **`enc-ols`.**
@@ -678,4 +689,11 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
     - So the registered H1 is planned on the GPU. Its own pre-check still runs first, on the real sub-panel.
     - The H1 with every control is projected at about 8.7 hours, under the 12-hour budget, so every cut runs.
   - **Contacts with the real data:** none yet.
-  - **Made precise:** the honest run's fit year at the purge cuts; the concentrated grid's exact count of shifted blocks; the twins draw from bars at or before the cut; `explain`'s explicit flag; and H14's change-log line in `docs/HYPOTHESES.md`, since a narrowed claim is still a changed one.
+- 2026-10-30, before the first `explain` call and before any encoder run on real data (`runs/explain/CONTACTS.log` does not exist yet). The panel H1 for the encoder arms is built and run on synthetic data. A fifth control is added and the verdicts are made precise. No rule is loosened.
+  - **What the synthetic bench showed.** On the GPU, the pre-check matched to the bit, every honest arm was invariant at every cut, and the floor over three runs is 0. Every control was caught exactly where predicted, in both directions.
+  - **A risk, named before the run.** In a synthetic probe, `cheat-stamp` was caught bit for bit, but its leak gave no measurable skill: a Brier skill score of −0.0009, against −0.0011 for honest `enc-ols`.
+    - Its leaky entries are the last day's, about one in thirty of a 30-day window.
+    - The synthetic members move independently. The real members move together, so the leak may weigh more on the real panel.
+    - The registered check, at least 0.1 with an interval above every honest arm's, stands. Its result is reported as it falls.
+  - **`cheat-stamp-day`, a fifth control**, described in "Planted training-time leaks". Its memory is made only of labels not yet known. It shows whether H1 catches a stamp leak that gives skill, whatever `cheat-stamp`'s skill turns out to be. With it, the panel H1 is projected at about 9 hours, under the 12-hour budget.
+  - **Three verdicts, reported apart:** H1 as `docs/HYPOTHESES.md` defines it, the skill check control by control, and `pos-window`'s check. A failed skill check is a finding about the control, reported beside H1's verdict, never folded into it or dropped.
