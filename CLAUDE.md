@@ -17,6 +17,7 @@ The main session is the **orchestrator** (Opus 5.5, max effort). It plans the it
 | `leakage-auditor` | fable, high | read-only adversarial review: look-ahead, leakage, statistics, claims |
 | `scout` | sonnet, medium | primary-source research on papers, tools and datasets |
 | `teacher` | opus, high | the learning page of each iteration: a French explainer for Abdou, kept outside the repository |
+| `janitor` | sonnet, medium | tidying the repository and stray files: a manifest first, then only what was approved; never `data/`, `runs/`, the vault or git history |
 
 Why these models:
 - **Opus** for long agentic coding and for teaching.
