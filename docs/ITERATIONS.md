@@ -368,3 +368,196 @@ The first official run of H1 (commit 9c414ca) also held. CI on Linux then showed
 - **From forecasts to trades.** A portfolio simulator turns the Matrix arms' probabilities into long/flat positions through the risk kernel, at Coinbase's and Kraken's fees. Does a BSS of 0.013 survive a round trip of about 1 %?
 
 **Learning page.** [L'arbre et le coffre](https://claude.ai/artifact/8AkKGG3q97u8jU2Z9BjpbK), in French, written by `teacher` and checked by the orchestrator. It is private to Abdou's account.
+
+## Iteration 4 — Learned features, and what a verdict is worth (2026-10-30)
+
+**Goal.** This is roadmap phase 3, the OLS Prime encoder, made bolder as iteration 3's outcome proposes: learn the features, and know what a verdict is worth.
+- The encoder: OLS-attention heads trained from scratch on the hourly panel, reading Matrix as their memory.
+  - H4 compares them with softmax and linear attention at equal parameter count.
+  - H5 compares them with Matrix alone.
+  - H13 asks whether they are also cheaper to run.
+- The size and power of the pass rule, so that "does not hold" reads as "no difference" or as "too weak to see".
+- An instrument, `olsprime.explain`, that says why a forecast is what it is.
+- A bolder check of H1: two cheaters that leak at training time must be caught on GPU, where bits are harder to keep.
+
+**Deliverables.**
+1. **Report n°2's series.** `series.npz` holds its hourly series and scored rows. Its SHA-256 goes in `report2.json`, so that no later study refits an arm.
+   - Audit phase 2's four logged items are folded in.
+   - Report n°2 is re-run once and compared with iteration 3's run. Only named lines may differ.
+2. **The size and power of the pass rule.** `python -m olsprime.bench.power` reads `series.npz` by its digest and refits nothing.
+3. **`olsprime.explain`.**
+   - `why` breaks a Matrix forecast into the memory's tree nodes and into per-feature parts, with two loud checks. For it, `CentredReadout` gains `beta` and `mean_y`.
+   - `head` shows the OLS heads' W, once the encoder exists.
+   - Every call is logged in `runs/explain/CONTACTS.log`. Its first use is the five whys below.
+4. **The encoder.**
+   - torch is added to the lock without moving a locked package: CPU on Windows and CI, CUDA in WSL2.
+   - The arms `enc-ols`, `enc-softmax` and `enc-linear`, with the memory over learned keys, training in weekly episodes, yearly fits and three seeds.
+   - Report n°3: H4, H5, H13 and the cost table.
+   - The panel H1 for the encoder arms on GPU, with `cheat-stamp` and `cheat-value`. After audits 4a and 4b, it also has two purge cuts with `cheat-purge` and `cheat-slice`, and a positive control, `pos-window`.
+   - LFM3's ablations and H6, if time remains.
+5. **H1's blind spots.** The adversary's future-shuffle twins classify its misses.
+6. **Registered now, run in iteration 5:** H14, the portfolio simulator's first claim, and H1's extreme-shape cut.
+
+**Scope, fixed before any result.** `docs/PROTOCOL.md`, "The encoder, and what a verdict is worth (iteration 4)", holds the full pre-registration.
+- **Priority if time runs out**, in the protocol's order:
+  1. the audited pre-registration;
+  2. Report n°2's series, then the size and power study;
+  3. `explain`;
+  4. the encoder's core arms with H5, H13 and the cost table, then LFM3's ablations and H6;
+  5. the twins.
+
+  A hypothesis that was not run is reported as not run.
+- **The first finding, if it happens.** If the deterministic H1 cannot catch `cheat-stamp` bit for bit on GPU, that is reported before any H4 number.
+- **Sizing, before the schedule.**
+  - The machine: the RTX 3060 12 GB in WSL2.
+  - Colab: 194.04 compute units on 2026-10-29, used only if the sizing rules the 3060 out.
+  - The time of one fit of `enc-ols` on the 2024 fit's training set, measured on a synthetic panel of the real shape in wave 1. The numbers, and the schedule they allow, are written here before any encoder run.
+  - **Measured on 2026-10-30, synthetic data only.**
+    - The panel: 30 members, hourly from 2017-10. The 2024 fit trains on 1,558,575 rows over 323 weeks, an upper bound, since real members list later.
+    - The build: RTX 3060 12 GB in WSL2, driver 617.42, CUDA 13.4, cuDNN 9.26.0, torch 2.15.0+cu134, with the deterministic settings on.
+
+    | | `enc-ols` | `enc-softmax` | `enc-linear` |
+    |---|---|---|---|
+    | Training step, median | 0.471 s | 0.442 s | 0.300 s |
+    | Peak memory in training | 1.85 GB | 2.68 GB | 2.09 GB |
+    | Time per 10⁴ decisions, H13's conditions | 0.142 s | 0.134 s | 0.093 s |
+
+    - One whole 2024 fit of `enc-ols` took 945 s: 6 epochs, 1,938 steps. Forecasting its 253,193 rows took 5.1 s.
+    - **Determinism.** Two such fits were bit-identical: every epoch's parameters, the slice losses, the epoch kept and every forecast. The scope test passed at every prefix. So the registered H1 runs on the GPU. Its own pre-check still runs first, on the real sub-panel.
+    - **Two signs, before any real run.**
+      - On these synthetic rows, `enc-ols` takes 1.06 times `enc-softmax`'s time. H13 needs 0.9 or less. Its registered measurement is the one on the real rows.
+      - On a small synthetic panel, `pos-window` with `enc-ols` reached a Brier skill score of 0.53, against the 0.5 it needs, and kept its last epoch.
+  - **Projections.**
+    - H4 and H5's 54 fits (3 arms × 3 seeds × 6 fits) take about 7.4 GPU-hours.
+    - The panel H1, with its pre-check and every control, takes about 8.7 hours. That is under the 12-hour budget, so every cut runs.
+    - Each of LFM3's ablations and H6 takes about 2.9 GPU-hours.
+  - **The schedule.** Everything runs on the 3060, so Colab is not needed. In order:
+    1. the pre-check on the real sub-panel;
+    2. H1 with its controls;
+    3. the 54 fits;
+    4. H13's timing and the cost table;
+    5. then, while time remains, LFM3's ablations and H6.
+
+**The five whys**, written before the first call of `explain`.
+- Every call on 2019–2024 comes after the frozen design is committed.
+- What a call shows on those months is exploratory: no hypothesis of this iteration is tested on it.
+
+1. Why do `matrix-1y` and `knn-1y` tie?
+2. Does the Brier skill of the 18 previewed months come from a few hours, or from the whole 2019–2020 regime?
+3. Are hours with a high negative mass worse calibrated?
+4. Which feature carries the gain over climatology?
+5. What did the model do around the 2020-06-28 outage?
+
+(1), (2) and (5) get numbers in the outcome. (3) and (4) are answered only once the encoder is frozen, and are labelled "exploratory, test months".
+
+**Hypotheses touched.** H1 (the encoder arms on GPU, the training-time cheaters, the twins), H4, H5 and H13; H6 if time remains. H14 is registered.
+
+**Done when.**
+- The pre-registration was audited before any run, and every finding was fixed or logged.
+- Every check of `CLAUDE.md` is green, locally and in GitHub Actions, on Windows and Linux.
+- Every change to data, model or evaluation code has passed `leakage-auditor`.
+- `RESULTS.md` has the new rows with their variant counts. Every item not run is reported as not run.
+- The outcome and one bolder next step are recorded here, with the learning page's link.
+- The pull request is merged into `main` with a local merge commit and pushed. Abdou authorized commit, merge, push and installs for this iteration on 2026-10-29.
+
+**Plan.** Briefs are in `.claude/briefs/iteration-4/`. At most three agents run at once.
+
+| Wave | Task | Agent | Brief |
+|---|---|---|---|
+| 1 | `beta` and `mean_y` on `CentredReadout` | `rust-engineer` | `beta-getter.md` |
+| 1 | Report n°2's series; the size and power study | `ml-engineer` | `series-power.md` |
+| 1 | The encoder's core, torch and the sizing | `ml-engineer` | `encoder-core.md` |
+| 1 | Audit pass 4a, on the pre-registration | `leakage-auditor` | `audit-prereg.md` |
+| 2 | `olsprime.explain` | `ml-engineer` | `explain.md` |
+| 2 | The future-shuffle twins | `ml-engineer` | `twins.md` |
+| 2 | Audit pass 4c, on wave 1's evaluation code and the twins | `leakage-auditor` | `audit-code-4c.md` |
+| 2 | Audit pass 4d, on `olsprime.explain`, in three looks | `leakage-auditor` | `audit-code-4d.md` |
+| 2 | The encoder's panel H1 on GPU, with its controls | `ml-engineer` | `encoder-h1.md` |
+| 2 | Report n°3: the fits, H4, H5, H13 and the cost table | `ml-engineer` | `encoder-report3.md` |
+| 2 | Audit pass 4e, on the encoder's core and its panel H1 | `leakage-auditor` | `audit-code-4e.md` |
+| 2 | Audit pass 4f, on Report n°3's runner | `leakage-auditor` | `audit-code-4f.md` |
+| 3 | `explain head`, on Report n°3's checkpoints | `ml-engineer` | `explain-head.md` |
+| 3 | Audit pass 4g, on `explain head` | `leakage-auditor` | `audit-code-4g.md` |
+| 3 | Official runs and rows | orchestrator, `experiment-runner` | `runs.md` |
+| 3 | The `explain` twin's failure at one row: a diagnosis, no code change | `ml-engineer` | `twin-gap.md` |
+| 3 | LFM3's ablations and H6, built while the GPU runs | `ml-engineer` | `ablations.md` |
+| 3 | Audit pass 4h, on the ablations | `leakage-auditor` | `audit-code-4h.md` |
+| 3 | Audit pass 4h's fixes, and the seed-split control beside H6 | `ml-engineer` | `ablations-fixes-4h.md` |
+| 3 | H13's gap on synthetic data, then the rows of `docs/RESULTS.md` | `experiment-runner` | `h13-gap-and-rows.md` |
+| 4 | Audit of the code and the results | `leakage-auditor` | `audit.md` |
+| 5 | Learning page | `teacher` | `learning-page.md` |
+
+**Set up by the orchestrator before wave 1.**
+- `main` holds iteration 3 (merge commit `6e05906`, pull request abdou-rgd/ols-prime#3).
+- Work happens on the branch `iteration-4`. It was made from `origin/main` without upstream tracking, so that no push can land on `main` by mistake.
+- The Colab CLI, `google-colab-cli`, is installed with `uv tool` in WSL2. Abdou signed in on 2026-10-29.
+- The machine stays awake, and shuts down at the end of the session unless something blocks.
+
+**Before wave 2** (after audit pass 4a). The audited pre-registration is committed, and wave 2 starts only after that commit.
+
+**Outcome (2026-10-31).** Done, with LFM3's ablations and H6 not run, and H13 without a verdict, its measurement invalid.
+- Every check is green, locally and in GitHub Actions, on Windows and Linux (pull request abdou-rgd/ols-prime#4).
+  - On GitHub, all 7 jobs passed for `5f17a76`, the commit of the official runs (run 41019531179), and for `da0433e`, the last code commit of this branch (run 41035843930). Later commits change only documents and briefs.
+  - Locally, on Windows at `67cd8f3` with the record's documents in progress: rustfmt, both clippy runs and cargo test exit 0, and pytest gives 1,498 passed, 4 skipped. In WSL2 at `5f17a76`: 1,480 passed, 2 skipped.
+- The audit took eight passes on the code before any result, 4a to 4h. Phase 2, on the results and the claims, gives GO to record and merge, with its Major point fixed before the commit (see the Audit row).
+- **Contacts with the real data:** 17 entries in the protocol's change log; `runs/explain/CONTACTS.log` holds 24 lines.
+- **The first finding, the GPU H1: it holds.** The pre-check passed: each arm, trained twice on the RTX 3060 at each of the four pre-check years, gave the same bits. `enc-ols` 0 differing values of 5,232,329 (2020), 7,796,766 (2021), 7,630,828 (2022) and 10,004,070 (2024); `enc-softmax` and `enc-linear` 0 of 5,232,281, 7,796,718, 7,630,780 and 10,004,022. The registered scope test, at the first cut, moved 0 of 1,758,980 values for each arm; at the eight regular cuts, as a description, 0 too.
+  - **H1: pass.** The three honest arms have 0 violations at 8 cuts and 2 purge cuts. Every control is caught on its predicted pattern, in each direction: `cheat-stamp`, `cheat-value` and `cheat-stamp-day` at the 8 cuts and neither purge cut, `cheat-purge` at both purge cuts, and `cheat-slice` at F − 30 days alone.
+  - **The skill check: FAIL, on `cheat-stamp` alone.** Its Brier skill score is 0.0064 [0.0029, 0.0100], against the 0.1 it needs and `enc-ols`'s 0.0052 [0.0018, 0.0089] on the same rows. `cheat-value` reaches 0.9997 [0.9994, 1.0000] and `cheat-stamp-day` 0.4376 [0.4244, 0.4515]. So H1 caught a stamp leak that gives almost no skill, bit for bit, and one that gives much. A likely reading, not tested: in a 30-day memory, the last day's entries are about a thirtieth of what the readout sees, and `cheat-stamp-day` keeps only those.
+  - **`pos-window`: pass.** 0.6825 [0.6428, 0.7209], against the 0.5 it needs: the training loop learns a signal that is there.
+  - Exit code 3 is the code for "H1 holds and a skill check fails". The chain's log line "the H1 did not pass" is its own wording.
+  - The honest runs' forecasts are a first look at the encoder's skill on the sub-panel's cut years, listed as a contact: `enc-ols` 0.0052, `enc-softmax` −0.0004 [−0.0034, 0.0025], `enc-linear` −0.0024 [−0.0052, 0.0002].
+- **Report n°3: the encoder learns, at about Matrix's level, on 54 fits of 21,003 parameters.** Over 50,626 test hours, 2019-01 → 2024-12, the Brier skill scores are 0.0110 [0.0087, 0.0133] for `enc-ols`, 0.0079 [0.0059, 0.0098] for `enc-softmax`, 0.0030 [0.0016, 0.0044] for `enc-linear`, and 0.0130 [0.0108, 0.0156] for `matrix-select`.
+- **H4 holds, as non-inferiority.** `enc-ols` − `enc-softmax` is −0.00269, or −0.25 % of climatology's log-loss. Its one-sided upper bound, −0.00182, and the bootstrap's 95th percentile, −0.00181, lie below the margin, +0.00538. It is testable: both arms have a skill interval above 0. The difference favours `enc-ols` (p 3 × 10⁻⁷), in each seed pair too, but the registered test is non-inferiority: superiority is a description.
+- **H5 does not hold.** `enc-ols` − `matrix-select` is +0.00082, or +0.08 %, with p 0.52 and an interval of [−0.14 %, +0.29 %] of climatology's log-loss. No difference is shown in either direction. The power study covers Report n°2's comparisons, not this one, so the rule's detectable size for H5 is not measured. It compares two systems: the encoder refits yearly, `matrix-select` monthly.
+- **H13: no verdict, the measurement is invalid.** The rule's arithmetic gives 0.4031 ≤ 0.9, but the number measures the timing stage's own GPU cache, not the arms. The diagnosis was triggered by the gap with the 1.06 on record before the run, not by the sign of the result.
+  - The stage keys the memory over the panel before timing, and leaves torch's cache at 12,926 MiB reserved on a card of 12,288 MiB. Synthetic rows, with a far smaller panel, had given 1.06.
+  - On the same rows, the ratio is 0.3739 as the code stands, and **1.0732** with the cache emptied before each protocol call, above the bound. Emptied, the three operators fall to their synthetic times.
+  - That repeat is a description, not a registered measurement, and the official stage logged no memory state: its cache is inferred from identical code and data and from repeat 1 reproducing its numbers. Over repeats 5 to 10, past the allocator's refill, the ratio is 1.05. OLS attention is not shown to be cheaper to run than softmax attention, on this kernel. The GPU wall times of Report n°3's cost table carry the same artefact.
+- **What a verdict is worth.** The pass rule keeps its size: 2.2 % to 6.4 % two-sided, none above 7.5 %. Its smallest δ with 80 % power is 0.23 % to 0.25 % of climatology for H3 against kNN (0.26 % when concentrated), so H3's −0.094 %, at 19 % to 24 % power, is too weak to see, not evidence of no difference. H11's −0.056 % has 42 % to 51 % power. The second run, for byte identity, stopped at start-up and is not re-run.
+- **H1's blind spots.** 205 misses: constant 193, unchanged 5, blind spot 7; caught leaks moved by a twin 98.3 % [98.0, 98.5]; honest twins 0.
+- **Report n°2, twice and on two platforms.** The Windows re-run equals iteration 3's run but for five allowed lines. The WSL2 re-run, Report n°3's base, differs on the platform's last bits only, by at most 5.2 × 10⁻¹⁴ relative in `report2.json`: every verdict and rule is the same.
+- **The five whys** (exploratory, test months; numbers for 1, 2 and 5):
+  1. They tie because large hourly wins and losses nearly cancel. Over 50,626 hours the mean difference is −0.00101, and no hour is identical. The gross of the hourly differences is 39 times the net: the hours where `matrix-1y` wins sum to about 20 times the net, those where it loses to about −19 times. Its worst months are 2020-03 and 2022-05, the COVID crash and the LUNA collapse. At BTCUSDT's rows of 2020-03-12T15:00 and 18:00, the two hours of largest d (+3.17 and +3.29), the ridge readout extrapolates. 53 to 59 % of its weight mass is negative, Σ|w| is 5.6 to 8.0, the effective sample size is 1,430 to 3,255 against 41,259 at a calm hour, and the leverage is 17 to 37 times the calm hour's. So it puts 0.81 to 0.84 on "neutral" and 0.001 to 0.013 on "down", at the floor at 15:00. `knn-1y`, an average of its 1,000 nearest entries, stays at 0.61 to 0.66 and 0.06 to 0.11. The hourly log-loss over the 30 rows is 5.13 and 6.05 for `matrix-1y`, against 1.96 and 2.77. The same extrapolation also wins: at 2020-03-14T07:00 it gave 0.918 to "neutral" against kNN's 0.558, and won by 0.51. At the calm hour, 2024-04-12T23:00, where it also won by 0.52, its readout is close to an average. In short, signed weights gain a little in ordinary hours and lose a lot in the few hours where the query lies far outside the memory; the floor caps each loss at −ln 0.001 ≈ 6.9.
+  2. The previewed months' higher skill is the whole 2019 – mid-2020 regime, not a few hours. All 18 months gain (median monthly BSS 0.019); without March 2020, the largest month, the BSS is still 0.0184, against 0.0108 on the other 54 months, of which 49 gain (median 0.011). Within months, half the net gain comes from 3.3 % and 2.2 % of the hours, crash hours of both signs (2020-03-12/14, 2021-05-19/20, 2022-05-11/12): the hourly gains mostly cancel (gross / |net| 3.1 and 4.9).
+  3. No, not in this sample (exploratory, test months). Over 1,000 seeded rows of `matrix-select`, cut into deciles of 100 by negative mass, the mean log-loss is 1.07 to 1.11 in the first nine deciles and 0.93 in the tenth, whose negative mass runs from 1.07 to 8.7. The calibration gap, mean top-label confidence minus hit rate, ranges from −0.04 to +0.10 with no trend: with 100 rows a decile, its standard error is about 0.05. The first run of this call stopped on the twin's loud check at one row; the re-run, whole and at one BLAS thread, passed every check on all 1,000 rows (twin's largest gap 4 × 10⁻⁶ of its bound).
+  4. The 30-day volatility, mostly through the "neutral" readout (exploratory, test months). Per row, each feature's parts sum to zero over the three classes, so its part on the realized class says whether it moved probability toward what happened. Over the 1,000 rows, all features together moved +0.0098 toward the realized class (positive in 57.6 % of rows). `f_vol_30` alone moved +0.0122 ± 0.0030 (naive standard error), and its mean |part| on "neutral", 0.072, is the largest of any feature and class. The 90-day moving-average gap and the 7-day volatility add about +0.001 each. The 7-day range takes back −0.0042 ± 0.0018, and the 90-day return −0.0011 ± 0.0005. The other features stay within about one standard error of 0.
+  5. Nothing special: `matrix-select` kept the same cell (window all, ρ 0.01, every cell OK, no fallback) and forecast from a memory the outage had frozen. At 2020-07-01T23, its newest entry had been known since 2020-06-29T01:00, 70 hours earlier; from the last row before the outage (2020-06-27T21, 438,481 entries) only 750 entries joined, where about 30 an hour join normally. Against 439,231 entries, the missing ones barely move a forecast: BTCUSDT's neutral probability ranged from 0.345 to 0.390 over the four hours of 2020-06-27 and was 0.367 after; ETHUSDT's ranged from 0.318 to 0.383, then 0.362. The July fit read the same memory (σ and climatology from 439,231 entries known by 2020-06-30T00:00). Every scored forecast equals `series.npz` to the bit; every stamp check passed; the twin's gaps were about 2 × 10⁻¹⁵.
+- **LFM3's ablations and H6: not run.** They are built, and audit pass 4h gave GO with fixes. The fixes are unverified, and no ablation was fitted on real data. The code is on the branch `iteration-5-ablations` at `5be70a3`, not merged. `explain head` is built and audited, and was never called. The seed-split control beside H6 is registered and not run.
+- **Registered, run in iteration 5:** H14 and H1's extreme-shape cut.
+- Kani: the five proven harnesses passed again locally, in WSL2 with `-j 2`, at `c2e6381` (risk crate unchanged since `9c414ca`): `max_qty_within_contract` 5,313 s; end 04:59:32 UTC.
+- These are forecasts, not trades. Costs are in none of these numbers.
+
+| Part | Result | Briefs |
+|---|---|---|
+| Report n°2's series | `series.npz` holds the hourly series and the scored rows, its SHA-256 in `report2.json`, so that no later study refits an arm. Windows `03916fda…`; WSL2 `691e7ea7…`, the base of Report n°3. Each run's `--check` reproduces its four files. | `series-power.md` |
+| Size and power | `python -m olsprime.bench.power`: 244,000 replicates in 5,198 s with 8 workers and no pool restart, on the Windows series. | `series-power.md` |
+| `olsprime.explain` | `why`, `series`, `sample` and `head`, every call logged. Each `why` closes on two loud checks, and a Matrix-free twin recomputes the forecast. The twin failed once at one row of the first `sample`. A diagnosis then held the core exact to within 4.6 × 10⁻¹⁷ of an exact rational reference, so no scored forecast is affected; the failure's mechanism is not identified, and later calls run at one BLAS thread. | `explain.md`, `explain-head.md`, `twin-gap.md` |
+| Encoder | `enc-ols`, 21,003 parameters; `enc-softmax` and `enc-linear`, 20,995. Training in weekly episodes with causal memory, yearly fits, three seeds. | `encoder-core.md` |
+| Panel H1 for the encoder | 170 fits, 220,920 steps, from 2026-10-30 07:38:33 UTC. It reached its 16-hour timeout and resumed once with the same folder, to 00:30:02 UTC. Run `runs/2026-10-30-encoder-h1/`. | `encoder-h1.md` |
+| Report n°3 | 54 fits in 12 h 51 min, beside the H1 on one GPU, so the 12.69 training GPU-hours are upper bounds. `--check`: 4 files identical, `run.json` excluded, after a first refusal from a script error. Run `runs/2026-10-30-report3/`, [docs/reports/report-3.md](reports/report-3.md). | `encoder-report3.md` |
+| H13's gap | On synthetic rows, `experiment-runner` ruled out a cold start, tensor values and the size of the bars table. The orchestrator's two repeats on real rows found the cause. Run `runs/2026-10-31-h13-repeat/`. | `h13-gap-and-rows.md` |
+| Twins | `python -m olsprime.bench.twins`, two runs, byte-identical. | `twins.md` |
+| Ablations | `enc-ols-gate` 23,051 parameters, `enc-ols-conv` 20,007, `enc-ols-brier` 21,003, and `bench/ablations.py`. Not fitted on real data. | `ablations.md`, `ablations-fixes-4h.md` |
+| Runs | From clean clones at `221591c` and `5f17a76`. Colab: 0 units; the RTX 3060 carried every fit. Variants: 18 before this iteration, plus 3 encoder arms, 21. | `runs.md` |
+| Audit | 4a: five Major (vacuous H4; batch-size bits on GPU; fallback under one draw of noise; H14 confounded with drift; explain as a channel into the design), nine Minor, seven Nits. 4b: GO, four Minor, five Nits (H14's random positions, second purge cut and cheat-slice, the CPU budget, pos-window's stamp). 4c (series, power, twins, getters): three Minor, three Nits; second look one Minor, three Nits (one BLAS thread per pool worker; pool rebuilt on WinError 6; refusal above 10⁻⁹). 4d (explain), three looks: two Major (a residual zero by construction; a stale extension), seven Minor, six Nits; the Matrix-free twin. 4e (encoder core, panel H1): three Minor, four Nits; second look one Minor, five Nits (resume refused on a changed build; `cumsum` on CUDA probed). 4f (Report n°3): one Major (a copied part scored as another arm), seven Minor, five Nits; second look three Minor, three Nits (tree frozen at the fits' commit). 4g (explain head): one Major (head bound only to its own folder), two Minor, two Nits; second look three Nits. 4h (ablations, H6): one Major (a fitted arm reported as not run), six Minor (five test gaps; a reader that could not load the Brier arm), six Nits; the seed-split control. Phase 2, on the results and the claims: GO to record and merge. No Blocker, one Major, two Minor, three Nits. The Major: H13's Verdict column recorded a verdict the project itself said was not measured, so it now reads no verdict. The set-aside itself was judged justified, because the trigger was a reference on record before the run. The Minor points: the evidence row now gives the card's state in each repeat and repeat 2's transient, and the re-measure's status is defined. Two Nits fixed; the third, a detectable size for H5 from its standard error, is optional and left out. It recomputed H4 and H5, and read the panel H1's verdicts, the twins' counts and the power study's alerts from their JSON. It did not check the five whys, the coverage of `compare_platforms.py`, the `--check` logs, the fits table, the δ grid beyond its alerts or the GPU-hours against the per-fit times | `audit-prereg.md`, `audit-code-4c.md` … `audit-code-4h.md`, `audit.md` |
+
+**Lessons.**
+- **A surprising number gets a diagnosis before a record.** The rule met, the ratio stable within 3.4 % over ten repeats, and the wrong story fitted: a cold GPU, then a slow memory clock. A number that moved from 1.06 to 0.40 on the same code was the only alarm, and two repeats settled it.
+- **A timing is a claim about the machine's state, and the instrument is part of the machine.** The protocol fixed every shape, setting and repeat, and did not fix what the process held in memory. The stage's own preparation set the result.
+- **Stability is not validity.** Ten repeats within 3.4 % showed that the measurement was repeatable, not that it measured the arms.
+- **A control can fail its skill check and still do its job.** `cheat-stamp` was caught bit for bit and gives no useful skill. `cheat-stamp-day` was added before any run to separate the two questions, and each verdict stayed apart.
+- A bit is a property of a build: `np.log` and `np.exp` differ in their last bits between Windows and Linux, so the same commit gives two panels.
+- Documentation drifts: torch's list of deterministic CUDA ops moved `cumsum` between releases. Check the claim on the machine.
+- An `explain` call refused before contact costs nothing: `series --top 100` was refused (range 1..50) and logged nothing.
+- **Process.**
+  - Chaining the long runs into one script kept the GPU working while the weekly limit waited. The script's error on `--check` and its wording on exit 3 were both read and corrected, not taken at face value.
+  - A pipeline's last exit code hides the first: `wsl ...; tail ...` reported 0 when the timing never ran, and the "repeat" then read as identical to the official run to the last bit. That identity was the tell.
+  - Git Bash rewrites `/mnt/c/...` before WSL sees it. Launch WSL scripts from PowerShell, in a login shell.
+
+**Bolder next step.** Put a price on the skill, on an instrument that cannot fool itself.
+- **H14, the first trades.** The long/flat portfolio of `matrix-select` at Coinbase's and Kraken's taker fees, against always-flat and against random chains matched on exposure and entries. Does a Brier skill score of 0.013 survive a round trip of about 1 %?
+- **The timing stage rebuilt.** It empties the cache, and records the reserved memory, the card's total and the clocks beside every ratio. A placebo, a fixed reference kernel timed before and after each protocol call, refuses to write a ratio when the reference drifts: that would have refused 0.4031 at 00:36 UTC, with nobody awake. Then a fused OLS-head kernel as a new registered variant: can OLS attention earn H13 on a kernel worth the name?
+- **The deferred work.** The second look at audit 4h's fixes, the ablations' 54 fits, H6 and its seed-split control, the first `explain head` calls and H1's extreme-shape cut.
+
+**Learning page.** Deferred: this session had no tool to publish an Artifact, so the page's link comes with a later commit. That part of the done criteria stays open.

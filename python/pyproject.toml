@@ -20,11 +20,35 @@ dependencies = [
 
 [dependency-groups]
 dev = ["pytest>=8"]
+# torch for the encoder (iteration 4), in two builds that never meet in one environment.
+# - cpu: Windows, CI and every default `uv sync` / `uv run` (the default groups below).
+# - cu134: the RTX 3060 in WSL2, in its own environment on the Linux disk:
+#   UV_PROJECT_ENVIRONMENT=~/olsprime-gpu/venv uv sync --locked --no-default-groups --group dev --group cu134
+cpu = ["torch==2.15.0"]
+cu134 = ["torch==2.15.0; sys_platform == 'linux'"]
+
+[tool.uv]
+default-groups = ["dev", "cpu"]
+conflicts = [[{ group = "cpu" }, { group = "cu134" }]]
 
 [tool.uv.sources]
 # A regular (non-editable) install, built from the crate by maturin. The crate's pyproject
 # declares cache-keys on every Rust source compiled in, so `uv sync` rebuilds after any edit.
 olsprime-rs = { path = "../crates/olsprime-py" }
+torch = [
+    { index = "pytorch-cpu", group = "cpu" },
+    { index = "pytorch-cu134", group = "cu134" },
+]
+
+[[tool.uv.index]]
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
+explicit = true
+
+[[tool.uv.index]]
+name = "pytorch-cu134"
+url = "https://download.pytorch.org/whl/cu134"
+explicit = true
 
 [build-system]
 requires = ["hatchling"]

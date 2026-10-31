@@ -170,6 +170,318 @@ If the exact kernel readouts cannot run over the 365-day window within the itera
 
 **Out of scope here.** Trading metrics of the Matrix arms wait for a portfolio simulator. Each arm still counts as a variant.
 
+## The encoder, and what a verdict is worth (iteration 4)
+
+Registered on 2026-10-29, before any run of iteration 4, and audited before any run (see the change log). It defines the encoder arms of H4, H5 and H13, the size and power study of the pass rule, `olsprime.explain`, H1's blind spots, and H14, which is registered now and runs in iteration 5. Every choice below is the same for every arm, and nothing is tuned per arm.
+
+**Priority order**, fixed before any result. A hypothesis that was not run is reported as not run.
+1. These pre-registrations, and an audit pass on them before any run.
+2. Report n°2's series, then the size and power study.
+3. `olsprime.explain`: `why` and `head`.
+4. The encoder: H4's three arms and H5, with the cost table and H13. LFM3's two ablations, then H6, run only if time remains, in that order.
+5. H1's blind spots: the future-shuffle twins only.
+6. Deferred to iteration 5, registered now: the portfolio simulator (H14) and H1's extreme-shape cut.
+
+### The encoder arms
+
+**Panel and scoring.** The panel, test months, scored rows, hourly series, statistics and decision rule of "Matrix on hourly bars (iteration 3)". Every encoder arm forecasts every scored row of Report n°2, so its hourly series pairs with Report n°2's hour by hour.
+
+**Inputs: a window of bars.** Row (s, t) reads the 64 hourly bars of pair s that end with bar t. They are all final at its decision time, so attention inside the window may be bidirectional.
+- Each bar j gives eight quantities:
+  - `ret` = ln(c_j / c_{j−1}) and `gap` = ln(o_j / c_{j−1});
+  - `range` = ln(h_j / l_j) and `body` = ln(c_j / o_j);
+  - `upper` = ln(h_j / max(o_j, c_j)) and `lower` = ln(min(o_j, c_j) / l_j);
+  - ln(1 + quote volume);
+  - the taker share of the quote volume minus 1/2, which is 0 for a bar without volume.
+- Each quantity is standardized with its mean and standard deviation over the last bar of every training row of the fit, then clipped to ±8. These statistics are fitted at the fit (see Fits).
+- The window's 65 bars, from t − 64 for the first return, must be consecutive hours. A complete row always has them, since its 90-bar features require 90 gaps of one hour. A scored row whose window fails takes the arm's climatology, and the report counts it.
+
+**Encoder**, shared by the three arms, which differ only in the attention operator:
+- a linear map of the eight quantities to d_model = 32, plus a learned embedding of the 64 positions;
+- 2 pre-LayerNorm blocks:
+  - attention, with 4 heads of d_head = 8;
+  - an MLP 32 → 64 → 32 with GELU;
+  - a residual connection around each, and no dropout;
+- a final LayerNorm. The state h is the output at bar t, the last position.
+
+**The attention operators.** In every arm, Q, K and V are a head's 64 × 8 projections, made by the same weights.
+- `enc-ols`, the OLS head of `docs/DESIGN.md` §4:
+  - Queries and keys are scaled to unit root mean square at each position, with no parameter.
+  - K̃ = [1 | K] and q̃ = [1 | q]: an unpenalized constant key coordinate, and a 1 in every query.
+  - Λ = diag(0, 64λ, …, 64λ), with λ = softplus(θ) + 10⁻³ learned per head and θ initialised so that λ = 0.1.
+  - W = Q̃ (K̃ᵀK̃ + Λ)⁻¹ K̃ᵀ and O = W V. It is solved by a Cholesky factorization in fp32, never by an explicit inverse.
+  - Every row of W then sums to 1 (`docs/DESIGN.md` §1), so a row sum that is not 1 within rounding is a bug, and `head` checks it.
+  - T / d_head = 8.
+- `enc-softmax`: PyTorch's native scaled dot-product attention, softmax(Q Kᵀ / √8) V.
+- `enc-linear`: φ(Q) (φ(K)ᵀ V) / (φ(Q) φ(K)ᵀ 1), with φ(x) = elu(x) + 1 (Katharopoulos et al., 2020).
+
+**Parameters.** `enc-softmax` and `enc-linear` have the same count, N. `enc-ols` has N + 8: one λ per head, 2 layers × 4 heads. The constant key coordinate is a fixed input, not a parameter. The difference is under 0.1 %, inside the 1 % allowed, and the report gives the exact counts.
+
+**Memory: Matrix over learned keys.** Every arm reads a Matrix whose keys it learns.
+- Each row's key is z = W_z h ∈ R⁸ and its value is its one-hot label. The entry is stamped with the row's `label_known_at`.
+- A readout at decision time d uses the entries with d − 30 days < `label_known_at` ≤ d.
+- It is the centred ridge with a free intercept of `docs/DESIGN.md` §3.2, m = ȳ + β (z − z̄), with Λ = ρ·diag(M_zz) + 10⁻⁶·n_w·I and ρ = 10⁻². This is ridge on keys standardized inside the window. An empty window gives (1/3, 1/3, 1/3).
+- The statistics accumulate in fp64 and the 8 × 8 solve is in fp64. Prefix sums of raw moments are differenced in fp64 before centring, never in fp32.
+
+**Decision head.** [h, m] → 32 → GELU → 3 → softmax. The arm's probabilities then pass through the protocol's floor, pₖ = max(pₖ, 10⁻³) / Σⱼ max(pⱼ, 10⁻³).
+- The loss is cross-entropy on the softmax output, before the floor. The floor applies to the scored probabilities only.
+- The Brier term is H6's ablation, not part of the core arms.
+
+**Training in episodes.** A step is one episode: the training rows decided in one calendar week, Monday 00:00 UTC to the next, over every member.
+- **The memory's causality.** Inside an episode, the memory used for a query at decision time d holds exactly the entries with d − 30 days < `label_known_at` ≤ d.
+  - The statistics at d are prefix sums over the entries ordered by `label_known_at`, so an outcome joins the memory only once it is known, inside the episode too.
+  - The rows decided in the episode are keyed with gradient.
+  - The older entries the window needs are keyed with the current weights, without gradient: a cache.
+- **Its test.** On a synthetic episode, at every decision time d, the memory must hold the same entries as `Matrix.window_range(d, 30 days)` of the Rust core, and give its readout within rounding.
+
+**Fits.** One fit per test year, at 00:00 UTC on 1 January, 2019 to 2024: 6 fits. A fit at F:
+- **trains** on the complete rows whose labels are known by F − 30 days;
+- **stops early** on a slice: the complete rows decided in [F − 30 days, F) whose labels are known by F − 24 h. The slice is never trained on, and every training label is known before its first decision, so it is purged;
+- **fits** the inputs' standardization on the training rows, and takes its climatology from the labelled rows known by F − 24 h, as `climatology-panel` does;
+- **runs** at most 6 epochs. An epoch takes every week of training rows once, in an order drawn from the seed. After each epoch, the slice's mean log-loss is computed in evaluation mode, with the memory as at test time. The fit keeps the epoch with the lowest slice loss, the first on ties;
+- **optimizes** with AdamW:
+  - learning rate 10⁻³ and betas (0.9, 0.999);
+  - weight decay 0.01 on the weights of the linear maps only: the input map, the Q, K, V and output projections, the MLP, W_z and the decision head. Biases, LayerNorm parameters, the position embedding and θ have none;
+  - linear warm-up over the first 100 steps, then cosine decay to 10⁻⁴ at the end of epoch 6;
+  - the gradient norm clipped at 1;
+- **forecasts** every scored row of its year. A row's year is that of its month, the month of its bar's open, as in iteration 3. Its memory takes every entry once its label is known, test rows included, keyed by the frozen encoder.
+
+**Seeds.** Each arm has 3 seeds (1, 2, 3); a seed sets the initialisation and the order of the episodes.
+- The arm's forecast is the mean of its seeds' probabilities before the floor, then floored. That mean is the model.
+- Each seed's log-loss and their spread are reported as a description.
+
+**Determinism.**
+- The settings: `torch.use_deterministic_algorithms(True)`, `CUBLAS_WORKSPACE_CONFIG=:4096:8`, TF32 off, cuDNN benchmark off and fixed seeds.
+- The machine: one named GPU, the RTX 3060 in WSL2, and one build, whose driver, CUDA and torch versions are recorded.
+- Colab runs only if the sizing below rules the 3060 out for the whole schedule. Its runs are named apart, and never enter a 3060 column.
+
+**Batches.** Every batched computation outside a training step runs in fixed-size batches of 4,096 rows taken in panel order, by decision time and then symbol. That covers the encoder's forward pass for queries, entry keys and the cache, the slice evaluation and the forecasts.
+- The last batch is padded to 4,096 rows with copies of its last row.
+- So a row's outputs do not depend on which other rows are in the run. This matters because BLAS and cuBLAS choose their kernels by problem size, and the same row of a product can differ in its last bits between two sizes (audit pass 4a).
+- Training steps keep their weekly episodes, which are the same in every run of a fit.
+
+**Sizing, before the schedule.** One fit of an encoder arm on the largest training set (the 2024 fit), measured on a synthetic panel of the real panel's shape before any run on real data. The numbers and the schedule they allow are in `docs/ITERATIONS.md`, iteration 4's brief.
+
+**Smoke runs on the real panel**, if any, train on rows decided before 2019 and forecast no test month. Any run that scores a test month before the official runs is listed in the change log, and its months are shown apart, as in iteration 3.
+
+**Frozen.** Every choice of this section is fixed before the first encoder run on real data. It is committed before the first `explain` call on any hour of 2019–2024.
+- After that first call, this section changes only for what cannot be built as written.
+- Each such change-log entry cites the line count of `runs/explain/CONTACTS.log` at that moment.
+
+### H4, H5 and H13
+
+- **H4** holds if `enc-ols` is non-inferior to `enc-softmax` over the test months 2019-01 → 2024-12.
+  - **The margin** is 0.005 × the mean hourly log-loss of Report n°2's `climatology-panel` over the scored hours.
+  - **Two bounds** of mean(ll_ols − ll_softmax) must both lie below the margin:
+    - its one-sided 95 % upper bound: the mean plus t₀.₉₅(T − 1) times the HLN-corrected Diebold-Mariano standard error, as for H12;
+    - the stationary bootstrap's 95th percentile of the same mean.
+  - **Testable only if an arm learned something.** `enc-ols` or `enc-softmax` must have a Brier skill score against `climatology-panel` whose 95 % interval lies above 0 over the test months. Two arms that both sit at climatology would meet the bounds vacuously, so without that skill H4, and with it H13, are reported as not testable, not as holding (audit pass 4a).
+
+  `enc-linear` is a reference arm. Its comparisons with `enc-ols` and `enc-softmax` are described.
+- **H5** holds if `enc-ols` has a lower log-loss than `matrix-select`, the comparison passing: Diebold-Mariano p < 0.05, and the bootstrap interval below 0.
+  - `matrix-select`'s series is read from Report n°2's `series.npz`, by its digest, on the same scored hours.
+  - **A limit.** The encoder refits yearly and `matrix-select` monthly, so H5 compares two systems, not two attentions at equal cadence.
+- **H13** holds if H4 holds **and** the median wall time per 10⁴ decisions of `enc-ols`, over 10 repeats, is at most 0.9 × `enc-softmax`'s.
+  - A decision is the whole forward pass: encoder, memory readout and head, with the memory's statistics already built.
+  - The conditions: T = 64, d_head = 8, 4 heads, 2 layers, inference batches of 4,096 rows, the RTX 3060 in WSL2, and the driver, CUDA and torch versions recorded.
+  - Both arms run in plain fp32 eager mode with no fused attention kernel. The softmax goes through the math backend of scaled dot-product attention. The deterministic settings are on, as in the runs.
+  - **The timed rows.** A sample of 12,288 scored rows (3 batches of 4,096), drawn with the seed 20261030. The time is scaled to 10⁴ decisions.
+  - **The protocol of a repeat.** 3 untimed warm-up batches, then the 3 timed batches, with `torch.cuda.synchronize()` before and after each.
+  - **The repeats** alternate the arms, ABAB, against drift of the clock and the temperature.
+  - **Reported:** the median ratio, the 10 repeats' minimum, median and maximum for each arm, and, as a description, the attention operator's own time beside the whole pass.
+  - Analytic FLOPs favour OLS by construction when T ≫ d_head, so they stay descriptive.
+- **The cost table** is descriptive. It covers every arm of H4 and H5 and the eight Matrix arms, with five columns:
+  - parameters;
+  - analytic FLOPs per decision;
+  - wall time per 10⁴ decisions;
+  - peak memory: `torch.cuda.max_memory_allocated` on GPU, the process's peak on CPU;
+  - GPU-hours of training, with the GPU named.
+
+  Each column holds one machine and one build: GPU timings on the 3060 in WSL2, Matrix's CPU timings on the Ryzen 5 3600 with the portable build. A Colab T4 or A100 is never mixed into a 3060 column.
+
+### H1 for the encoder arms
+
+**On GPU.** Each encoder arm runs the panel H1 of iteration 3 with its first seed: the same sub-panel, the same 8 cuts, both directions, plus the purge cut below.
+- **The runs.**
+  - The honest run trains, on the sub-panel, the fit of each cut's fit year, 2021 for the purge cuts. It forecasts every scored row of that year.
+  - Each perturbed run rebuilds the sub-panel and its windows from the perturbed bars, retrains the fit of the cut's year on them, and forecasts up to the cut.
+- **What is compared, at or before the cut:**
+  - the fit's inputs: training and slice rows, standardization, climatology and the order of the episodes;
+  - every trained parameter, each epoch's slice loss and the epoch kept;
+  - the memory's stamps and statistics at each compared decision;
+  - every output.
+- **Pre-check, before H1.**
+  - Two honest runs with identical inputs.
+  - A scope test: the honest run restricted to the rows decided at or before the first cut must give the full honest run's outputs on those rows.
+  - If both agree to the bit on everything above, H1 is bit for bit, as for the Matrix arms.
+- **Fallback, registered now in case they do not** (rewritten after audit pass 4a).
+  - The registered H1 for the encoder arms then runs on CPU torch with the same settings, where it must be bit for bit.
+  - The GPU run is reported beside it as a description:
+    - everything computed outside the training loop must still match to the bit: the inputs, the standardization, the climatology, the training, slice and selection rows, the order of the episodes, and the memory's stamps and membership;
+    - the floor is the largest pairwise difference over three honest runs, quantity by quantity;
+    - each control's smallest catch is given as a multiple of the floor, and a catch under 100 × the floor is called weakly separated.
+  - A failed pre-check on the GPU is the first finding to report, before any H4 number.
+  - This rule is fixed now, never after a violation.
+- **The budget.** If the sizing projects this H1 beyond 12 hours, the planted controls run only at cuts 1, 3 and 8, in time order, and at the purge cuts. The honest arms run at every cut.
+  - Under the CPU fallback, the honest arms' retrains alone may exceed the budget. Then the honest arms retrain only at cuts 1, 3 and 8 and at the purge cuts.
+  - At the other cuts, they forecast up to the cut with the honest fit's parameters loaded, without retraining. The comparison there covers the memory and the outputs only, and the report says so.
+- **Limits.**
+  - H1 tests seed 1's pipeline, while the model is the ensemble of three seeds.
+  - The honest runs' forecasts are a first look at the encoder's skill on the sub-panel's cut years. That contact is listed in the change log when it happens, and Report n°3 says so.
+
+**The purge cuts.** Two more cuts, whose perturbed bars come before the 2021 fit, at F = 2021-01-01T00:00 UTC. They are the only cuts that can see a fit read labels too early.
+- At each, the perturbed run rebuilds the sub-panel from the perturbed bars and retrains the 2021 fit.
+- No output is compared, since every one is decided after F.
+- **At F − 24 h, 2020-12-31T00:00 UTC.**
+  - Compared: the 2021 fit's inputs, every trained parameter, each epoch's slice loss and the epoch kept.
+  - Every input of an honest fit is known by F − 24 h, so every honest arm is predicted invariant.
+  - So are `cheat-stamp` and `cheat-value`: in that fit, their leaks read only labels known by F − 30 days in training, and by F − 24 h in the slice.
+- **At F − 30 days, 2020-12-02T00:00 UTC** (audit pass 4b's bolder check).
+  - Compared: the training rows, the standardization, the order of the episodes, and the trained parameters after every epoch.
+  - Not compared: the slice's labels and losses, the epoch kept and the climatology. They legitimately read labels known after F − 30 days.
+  - Every training input of an honest fit is known by F − 30 days, so every honest arm, `cheat-stamp` and `cheat-value` are predicted invariant there.
+- Together the two cuts bracket the purge window on real data. The planted-label test of `test_train.py` brackets it on synthetic data.
+
+**Planted training-time leaks.** These are controls, not variants. Each runs with its first seed.
+- **`cheat-stamp`, the panel H1's sixth online leak.** `enc-ols` with its memory prefix-summed by decision time: an entry joins at its row's decision time, before its label is known, in training and at test time.
+- **`cheat-value`.** `enc-ols` whose last position, in every attention head, adds a learned projection of the row's own one-hot label to its value.
+- **`cheat-purge`** (after audit pass 4a). `enc-ols` whose 2021 fit trains on the rows whose labels are known by F, with no purge.
+  - It runs at the two purge cuts only.
+  - It is predicted caught at both, in both directions: some of its training rows have exit bars that open after each cut.
+- **`cheat-slice`** (after audit pass 4b). `enc-ols` whose 2021 fit trains on the rows whose labels are known by F − 24 h, its own slice included.
+  - It runs at the two purge cuts only.
+  - It is predicted caught at F − 30 days, in both directions, and invariant at F − 24 h.
+- **`cheat-stamp-day`** (added on 2026-10-30, before any run on real data; see the change log). `enc-ols` whose memory holds only the last 24 hours by decision time, (d − 24 h, d], with every entry stamped at its decision time, in training and at test time.
+  - Every entry it reads has a label not yet known at d.
+  - It runs where `cheat-stamp` runs, with the same predicted-pattern rule and the same skill check.
+  - It shows whether H1 catches a stamp leak that gives skill.
+- **Predicted patterns.** They are computed per cut, as iteration 3's are. `cheat-stamp` and `cheat-value` are predicted caught at a cut when some compared row has a label whose exit bar opens after the cut. At the eight cuts this is expected to give `XXXXXXXX` for both; the computed prediction is the one tested.
+- **Their skill.** `cheat-stamp` and `cheat-value` must also show a Brier skill score far above every honest arm's: at least 0.1, with a 95 % interval above every honest arm's interval. So must `cheat-stamp-day`. It is measured on the scored rows of the sub-panel in the cuts' years, which H1's honest run forecasts for every arm.
+- **Three verdicts, reported apart** (made precise on 2026-10-30, before any run on real data).
+  - H1, as `docs/HYPOTHESES.md` defines it: every honest arm bit for bit at every cut, and every control caught on its predicted pattern.
+  - The skill check, control by control.
+  - `pos-window`'s check, below.
+
+  Each is reported as passing or failing, and none stands in for another.
+- **The first finding.** If H1 cannot catch `cheat-stamp` bit for bit, on the GPU or under the fallback, that is the first finding to report, before any H4 number.
+
+**The positive control, `pos-window`** (audit pass 4a's bolder check). `enc-ols`, seed 1, trained and scored on a label that lies inside its own window: the class of ln(c_t / c_{t−24}), under the panel's label rule with the row's own threshold.
+- It runs the honest fits of the cut years on the sub-panel, and is scored on the same rows as the cheaters' skill, against the climatology of its own label.
+- Its entries keep the panel's stamp, `label_known_at`, the open of the exit bar, although its own label is known earlier. Stamped at its decision time, a row would sit in its own memory, as in `cheat-stamp`, and inflate the skill.
+- It must reach a Brier skill score of at least 0.5. That shows that the training loop learns a signal that is there.
+- If it fails, that is reported before any H4 or H5 number.
+- It is a control, not a variant.
+
+### LFM3's ablations and H6, if time remains
+
+Each is `enc-ols` with one change, three seeds and the same schedule. Each counts as a variant.
+- **`enc-ols-gate`.** A sigmoid gate per OLS head, after LFM3: O ← σ(x W_g) ⊙ O, where W_g maps the block's normalized input to the head's 8 outputs.
+- **`enc-ols-conv`.** A conv-first hybrid: the first block's attention is replaced by a gated short convolution, a depthwise causal convolution of width 3 over the window gated by a sigmoid. The second block keeps its OLS attention.
+- **`enc-ols-brier`, H6.** The loss is cross-entropy plus the Brier score, with weight 1. H6 holds if both conditions hold (made precise after audit pass 4a):
+  - its ECE is at most 0.8 × `enc-ols`'s, and the paired stationary bootstrap's 95 % upper bound of the ratio of the two ECEs is below 1;
+  - its log-loss exceeds `enc-ols`'s by no more than a tolerance: the larger of two numbers, the range (max − min) of `enc-ols`'s three per-seed log-losses and the HLN-corrected Diebold-Mariano standard error of the difference.
+
+  The LFM3 arms are described against `enc-ols`, with no registered rule.
+
+### Size and power of the pass rule
+
+The pass rule does not change. This study describes what a verdict under it is worth.
+- **Its input.** It reads `series.npz` of a named run of Report n°2, by its SHA-256, and refits nothing.
+- **Size.** For each registered comparison, take the hourly difference d.
+  - Centre it, d − d̄. Then sign-flip it in circular blocks of L hours, for L ∈ {24, 48, 168, 720}, with 2,000 replicates per L. A replicate rotates the hours by a random offset in [0, L), cuts them into consecutive blocks of L, and multiplies each block by an independent random sign.
+  - A block flip keeps the lag-k autocovariance with weight (L − k)/L. So L = 24 keeps only about two thirds of the long-run variance of the 24-hour overlap, and cannot show an over-rejection caused by the overlap itself. L = 48 was added for that, after audit pass 4a.
+  - The pass rule runs on each replicate as registered. The Politis-White block length is recomputed on that replicate. Only the bootstrap's RNG seed is fixed across replicates: it is the registered seed of the comparison. The study's intervals are therefore conditional on that seed.
+  - The study reports, per comparison and per L, with 95 % Wilson intervals, the rejection rate of each of these:
+    - Diebold-Mariano alone;
+    - the bootstrap alone;
+    - both on the same side, the pass rule;
+    - the pass rule in its registered direction.
+  - For H12's non-inferiority rule, the size is the rate at which it holds when the true difference sits on the margin: (d − d̄) + m.
+  - Any L under which the pass rule's two-sided size exceeds 7.5 % is named.
+- **Power, model-free.**
+  - The replicates are flip(d − d̄) + δ, with δ in the registered direction. The grid of δ is {0.05, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4, 0.5, 0.75, 1.0} % of climatology's log-loss, with 1,000 replicates per point.
+  - The study reports power(δ) and the smallest δ on the grid with power at least 80 %.
+  - A constant shift is the easiest gain to see, so that detectable δ is a lower bound of the detectable mean gain. A gain concentrated in regimes needs more.
+  - So a second grid, at L = 168 only, concentrates the shift. The series is cut into 720-hour blocks, rotated by a random offset. Exactly round(0.1 × the number of blocks) of them, drawn without replacement, get a shift scaled so that the mean shift over the series is δ, about 10 δ; the others get nothing. It reports the same power curve beside the constant one.
+  - H3's `matrix-1y` − `knn-1y`, −0.094 %, is then read against those detectable sizes.
+- **Seed.** The flips use one registered seed, 20261030.
+
+### `olsprime.explain`
+
+An instrument for the orchestrator, read by Claude.
+- **Output.** Compact, bounded and reproducible: JSON lines and a short text summary.
+  - JSON is written with sorted keys and no wall clock.
+  - Every answer carries its provenance: commit, manifest digest and panel fingerprint.
+- **The log of contacts.** Every call appends one line to the git-tracked `runs/explain/CONTACTS.log`: UTC time, subcommand, period touched, arm and commit.
+- **The default period** is 2017-11 → 2018-12, the only development hours that are not test hours. Any other period must be named in the call, with an explicit flag, or the call is refused.
+  - `series` and `sample` read `series.npz`, which holds test rows only, so they touch test months by construction. They are logged like any call.
+- **Its reach.** It reads the development panel only, 2017-10 → 2024-12. The validation year and the vault are out of its reach.
+- **Exploratory, never tested.** A pattern seen through `explain` on 2019–2024 hours is exploratory. It is never tested as a hypothesis on those months: it waits for the validation year's scheduled opening, or for the vault.
+- **`why <pair> <as_of> --arm --by {year,month,day} --top k`** gives:
+  - the forecast, the intercept and the cell's status;
+  - the contributions of the memory's tree nodes at that granularity, sorted by |c|, with the rest summed so that the parts add up exactly. The grouping is by entry stamp (`label_known_at`), not by decision time, and the output says so;
+  - the per-feature view βⱼ·z̃ⱼ. It sums to the forecast within rounding. Summed in the core's order, it can give the forecast to the bit: the output says which, as a fact checked at that call;
+  - the top-k entries by |w|, with their labels and feature deltas;
+  - diagnostics: Σ|w|, the negative mass, the effective sample size 1/Σw² and the leverage.
+- **`why`'s two loud checks.** A failure stops the call.
+  - Each weighted entry's `label_known_at` is recomputed from its panel row, and from the raw bar's `open_time` for the top-k, and must be at or before `as_of`. Matrix's own stamps are never trusted for this.
+  - The forecast must equal the arm's probability in `series.npz` to the bit. A row that is not scored, such as every row of the default period, has no such check. The output then says so, and only the first check applies.
+- **`series <arm> [<arm_b>] --period --by {year,month} --top k`** reads only a run's `series.npz`, by its digest. It shows how one of two things is spread over hours:
+  - an arm's Brier skill against climatology;
+  - or the log-loss difference of two arms.
+
+  It gives the share carried by the top 1 %, 5 % and 10 % of hours, the parts by year or month, and the k hours that carry the most.
+- **`sample <arm> --period --n --seed`** runs `why`'s diagnostics on a random sample of n scored rows of the period, drawn by the seed alone, without the per-entry lists. For each row it gives:
+  - the negative mass, the effective sample size, the leverage and Σ|w|;
+  - the per-feature parts;
+  - the row's log-loss.
+- **`head`**, once the encoder exists, gives per OLS head:
+  - the row of W;
+  - its diagonal mass, which shows a head that copies its input;
+  - its effective rank;
+  - its row sum, 1 by construction.
+
+### H1's blind spots
+
+- **The twins.** Each random leak of the adversary gets K = 8 seeded future-shuffle twins at each cut. In a twin, each of the pair's bars after the cut keeps its time stamps. It takes every other value of a bar drawn, with replacement, from the same pair's bars at or before the cut: open, high, low, close, volume, quote volume, trades, and the taker base and quote volumes. The draws use one registered seed, 20261030.
+- **Moved by a twin.** A twin moves a leak when, at a compared row, one of its outputs differs by more than 10⁻⁹, or turns missing, or stops being missing. That is H1's own catch rule.
+- **The misses.** A leak caught at no cut is classed as one of three kinds:
+  - constant at the compared rows;
+  - unchanged under all K twins at every cut: on these bars it does not depend on the future;
+  - a true blind spot: some twin moves it, yet H1 did not catch it.
+- **Descriptive.** The result measures this generator's misses; H1's rule does not change.
+- **Deferred to iteration 5:** the extreme-shape cut. It will be a separate cut type, with its own predicted pattern for every existing control.
+
+### H14, registered now, run in iteration 5
+
+- **The claim.** At Coinbase's and Kraken's entry-tier taker fees plus 2 bps of slippage, the long/flat portfolio of `matrix-select` beats always-flat, and not only through the market's drift. Both conditions must hold, at each venue (the second added after audit pass 4a):
+  - **Above flat.** Its net annualized Sharpe ratio has a 95 % stationary-bootstrap interval above 0. Always-flat earns 0 every hour, and cash earns nothing, so beating it means a Sharpe ratio above 0.
+  - **Above random positions.** A portfolio long most of the time would inherit the market's drift: buy and hold had a Sharpe ratio interval above 0 in Report n°1. So a second interval must also lie above 0, against 100 random long/flat portfolios (made precise after audit pass 4b):
+    - For each member, a random portfolio is a two-state chain on the hourly grid. Its entry and exit probabilities are set so that its expected share of hours long and its expected number of entries per hour equal those of `matrix-select`'s portfolio for that member over the test months.
+    - Its positions are sized and costed by the same rule.
+    - The 100 portfolios use the seeds 0 … 99, derived from 20261030.
+    - The paired 95 % stationary-bootstrap interval resamples hours jointly across the portfolio's and the 100 random portfolios' net hourly returns. Each resample gives Sharpe(portfolio) − the mean over the 100 of Sharpe(random).
+    - Report n°1's `random-turnover` matched turnover only and was summarized by its median seed. This control differs.
+  - Buy and hold of the equal-weight member universe is reported beside it.
+- **The rule:**
+  - the expected return is the `fwd_return` readout of `matrix-select`'s cell;
+  - a member is entered when its expected return exceeds the round trip, and exited when it falls below 0;
+  - decisions are hourly and re-evaluate every holding, and each executes at the next open;
+  - a position opens at min(1/n, 1/10) of the equity at that hour, n being the members with a signal, as far as the cash allows. It is held without rebalancing until it exits;
+  - a holding whose pair leaves the universe is closed at the open that follows its last member month, as if the month's last decision were an exit;
+  - a position whose bars end is closed at its last close;
+  - every entry and every exit pays the taker fee plus slippage.
+- **The series.** The initial equity is 10,000 USDT. The portfolio's net hourly returns are annualized with √8760. A portfolio that is never exposed has no Sharpe ratio, and H14 then fails.
+- **Assumptions, stated.** Binance's 5 USDT minimum and the BTC and ETH lot steps are applied to every pair.
+- **Prior:** fails. Each sizing or threshold choice counts as a variant.
+
+### Variants
+
+18 before this iteration, plus one per encoder arm: `enc-ols`, `enc-softmax` and `enc-linear`, 21 in all.
+- A seed ensemble counts once.
+- Each ablation that runs counts as one more.
+- The planted leaks and the positive control are controls, not variants.
+
 ## Metrics
 
 - **Primary, forecast quality:**
@@ -306,3 +618,295 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
     - The hourly path adds about 30 rows per cell, then the cells over about 50,000 hours. Its rounding is smaller still: at most about H·u, for H hours.
     - So 4·n·ε is more than eight times the worst case, as long as the mean confidence stays below 0.96. Climatology's is about 0.44.
     - For the run's 1,493,353 scored rows, the tolerance is 1.33 × 10⁻⁹. The entry above rounded the panel to 1.4 million rows and the tolerance to 1.2 × 10⁻⁹. The stopped run's gap was 3.7 × 10⁻¹² in absolute terms: 1.3 × 10⁻⁹ of an ECE of 0.0029.
+- 2026-10-29, before any run of iteration 4. "The encoder, and what a verdict is worth (iteration 4)" is added. No rule, statistic, threshold, grid, seed or period of iteration 3 changes.
+  - **What it registers:**
+    - the encoder arms of H4, H5 and H13, with their fits, seeds, determinism settings and the cost table;
+    - the panel H1 for the encoder arms on GPU, with a pre-check, a fallback rule fixed in advance, and two planted training-time leaks, `cheat-stamp` and `cheat-value`;
+    - LFM3's two ablations and H6, run only if time remains;
+    - the size and power study of the pass rule;
+    - `olsprime.explain` and its log of contacts;
+    - H1's future-shuffle twins;
+    - H14, which runs in iteration 5.
+  - **Variants:** 21, with the three new arms.
+  - **Report n°2 is re-run once**, to save its hourly series and scored rows in `series.npz`, with their digest.
+    - Audit phase 2's four logged items are folded in: the Coverage sentence, `ece_tolerance`'s docstring, H12's own rule in the parts, and a per-file summary in `diff_runs`.
+    - Its numbers must not change. The re-run is compared with `runs/2026-10-29-report2/`, and only a fixed, named list of lines may differ.
+  - **Contacts with the real data in this iteration** are listed in the entries below, as they happen. None has happened yet. The encoder is sized on a synthetic panel shaped like the real one, whose row counts come from `docs/DATA.md`.
+- 2026-10-30, after audit pass 4a and before any run of iteration 4. The audit found five Major points, nine Minor points and seven Nits, and no Blocker. Every one is fixed in the section above. No rule of iteration 3 changes.
+  - **H4 could hold vacuously.** Two arms that both sit at climatology meet its bounds. H4, and H13 with it, is now testable only if `enc-ols` or `enc-softmax` shows skill, an interval of its Brier skill score above 0.
+  - **The GPU H1 would have flagged honest arms.** BLAS and cuBLAS choose their kernels by problem size. A probe on the design's shapes showed rows of the same product differing by up to 5.7 × 10⁻⁶ in fp32 between batch sizes. The perturbed run forecasts fewer rows than the honest one, so its batches differ.
+    - Every batched computation outside a training step now runs in fixed batches of 4,096 rows, in panel order, the last one padded.
+    - The pre-check gains a scope test.
+  - **The fallback let leaks hide under one draw of noise.** If the GPU is not bit for bit, the registered H1 now runs on CPU torch, where it must be. The GPU run becomes a description, with a floor over three honest runs and catches given as multiples of it. A time budget for the controls is fixed in advance.
+  - **H14 was confounded with the market's drift.** It now also needs a Sharpe ratio above that of random positions with the same exposure and turnover. Its sizing, exits at the universe's edge, initial equity, annualization and the never-exposed case are fixed.
+  - **`explain` could open a channel into the encoder's design.** Wave 2 starts only after this pre-registration is committed. After the first `explain` call on 2019–2024, the encoder section changes only for what cannot be built as written, and each such entry cites the line count of `CONTACTS.log`. `series` and `sample` touch test months by construction. `why` outside the scored rows runs only its first check.
+  - **The purge was invisible to the cuts**, which all fall at least 60 days after the fit they test.
+    - A ninth cut, at F − 24 h for the 2021 fit, compares that fit itself.
+    - A third control, `cheat-purge`, trains with no purge and is predicted caught there.
+  - **The audit's bolder check is added: a positive control, `pos-window`.** It must learn a label that lies inside its own window to a Brier skill score of at least 0.5, or that is reported before any H4 or H5 number.
+  - **Made precise:**
+    - the controls' predicted patterns, computed per cut;
+    - H13's timing protocol;
+    - H6's rule, with an interval and a tolerance that three seeds cannot shrink to 0;
+    - the twins' bar values and what "moved" means;
+    - which parameters take weight decay;
+    - the cross-entropy before the floor;
+    - a row's year;
+    - H4's margin;
+    - the H1 runs' seed and their preview of skill, stated as limits.
+  - **The power study**
+    - adds L = 48, since L = 24 keeps only two thirds of the overlap's own dependence;
+    - adds a second power grid whose shift is concentrated in a tenth of the blocks;
+    - calls its detectable size a lower bound;
+    - says that its intervals are conditional on the bootstrap's seed.
+- 2026-10-30, after audit pass 4b, which re-checked the fixes of pass 4a, and before any run of iteration 4. GO to commit this pre-registration and start wave 2, with four Minor points and five Nits, all fixed above.
+  - **H14's random positions** were not buildable as written. They are now two-state chains per member, matched in expected exposure and entries to `matrix-select`'s portfolio, 100 of them. The paired bootstrap of the Sharpe difference is defined.
+  - **The purge cut saw only a leak past F − 24 h.** A second purge cut, at F − 30 days for the 2021 fit, compares the training and every epoch's parameters. A fourth control, `cheat-slice`, which trains on its own slice, is predicted caught there and not at F − 24 h. This was the audit's bolder check, and it is cheap once the first purge cut exists. The two cuts bracket the purge window.
+  - **The budget had no answer** when the honest arms alone exceed it on CPU. They then retrain at four cuts, and only forecast with the honest parameters at the others.
+  - **`pos-window` keeps the panel's stamp**, so that its row never sits in its own memory.
+  - **Made precise:** the honest run's fit year at the purge cuts; the concentrated grid's exact count of shifted blocks; the twins draw from bars at or before the cut; `explain`'s explicit flag; and H14's change-log line in `docs/HYPOTHESES.md`, since a narrowed claim is still a changed one.
+- 2026-10-30, wave 1, before any encoder run on real data and before the first `explain` call (`runs/explain/CONTACTS.log` does not exist yet). The encoder is built and sized on synthetic data only. Nothing registered above changes. Where the section leaves a choice, the build's reading is fixed here, so that no result can choose it.
+  - **The attention block.** In every arm, Q, K and V come from one linear map with a bias. One output projection, with a bias, maps the four heads back to d_model.
+  - **`enc-ols`.**
+    - It computes O = Q̃ ((K̃ᵀK̃ + Λ)⁻¹ (K̃ᵀV)), the product W V taken in another order, with the same Cholesky factor. `head` computes W itself.
+    - Queries and keys are scaled to unit root mean square with ε = 10⁻¹².
+  - **`enc-softmax`** uses the math backend of scaled dot-product attention in training too, not only in H13's timing.
+  - **The memory.**
+    - Its key map W_z has no bias: the ridge is centred, so a bias would cancel.
+    - Its entries are the complete rows with a valid window, the same rows that train and are forecast.
+  - **The standardization** uses the population standard deviation.
+  - **The fit.**
+    - The slice loss that picks the epoch is the log-loss of the floored probabilities, as the scores read them. Training minimizes the cross-entropy before the floor.
+    - All six epochs run. There is no patience rule.
+    - The cosine reaches 10⁻⁴ at the last step of epoch 6.
+  - **The controls.**
+    - `cheat-value`'s label projection is a linear map, so it takes weight decay.
+    - `pos-window`'s label sums the window's last 24 one-bar returns in order, in fp32, and classes the sum with the row's own threshold.
+  - **Parameters:** 20,995 for `enc-softmax` and `enc-linear`, 21,003 for `enc-ols`. `cheat-value` adds 192.
+  - **Checkpoints** are written by hand in the safetensors layout and never go through pickle.
+  - **Sizing**, on a synthetic panel of 30 members, hourly from 2017-10 (`docs/ITERATIONS.md`, iteration 4).
+    - Two whole 2024 fits of `enc-ols` on the RTX 3060 were bit-identical: every epoch's parameters, the slice losses, the epoch kept and the 253,193 forecasts. The scope test passed at every prefix.
+    - So the registered H1 is planned on the GPU. Its own pre-check still runs first, on the real sub-panel.
+    - The H1 with every control is projected at about 8.7 hours, under the 12-hour budget, so every cut runs.
+  - **Contacts with the real data:** none yet.
+- 2026-10-30, before the first `explain` call and before any encoder run on real data (`runs/explain/CONTACTS.log` does not exist yet). The panel H1 for the encoder arms is built and run on synthetic data. A fifth control is added and the verdicts are made precise. No rule is loosened.
+  - **What the synthetic bench showed.** On the GPU, the pre-check matched to the bit, every honest arm was invariant at every cut, and the floor over three runs is 0. Every control was caught exactly where predicted, in both directions.
+  - **A risk, named before the run.** In a synthetic probe, `cheat-stamp` was caught bit for bit, but its leak gave no measurable skill: a Brier skill score of −0.0009, against −0.0011 for honest `enc-ols`.
+    - Its leaky entries are the last day's, about one in thirty of a 30-day window.
+    - The synthetic members move independently. The real members move together, so the leak may weigh more on the real panel.
+    - The registered check, at least 0.1 with an interval above every honest arm's, stands. Its result is reported as it falls.
+  - **`cheat-stamp-day`, a fifth control**, described in "Planted training-time leaks". Its memory is made only of labels not yet known. It shows whether H1 catches a stamp leak that gives skill, whatever `cheat-stamp`'s skill turns out to be. With it, the panel H1 is projected at about 9 hours, under the 12-hour budget.
+  - **Three verdicts, reported apart:** H1 as `docs/HYPOTHESES.md` defines it, the skill check control by control, and `pos-window`'s check. A failed skill check is a finding about the control, reported beside H1's verdict, never folded into it or dropped.
+- 2026-10-30, after audit passes 4c to 4f and their second looks, before any encoder run on real data and before the first `explain` call (`runs/explain/CONTACTS.log` does not exist yet). No rule, statistic, threshold, grid, seed or period changes. Where the section leaves a choice, the build's reading is fixed here. Descriptions are added beside registered verdicts, and one line of the wave-1 entry is corrected.
+  - **Audit pass 4c**, on Report n°2's series, the power study, the twins and the getters: no Blocker and no Major point, three Minor points and three Nits, all fixed before the study runs. GO for Report n°2's re-run and the twins. Its second look gave GO for the power study, with one Minor point and three Nits, all fixed.
+    - Every command-line run of the study goes through a pool whose workers use one BLAS thread, so every worker count gives the same bytes. In one process, the main process's multithreaded BLAS moved the last bits of 7 of 5,452 values of `power.json`, never a rate.
+    - On Windows a worker's pipe sometimes breaks (WinError 6), in about one test run in four. The pool is then rebuilt and only the calls without a result run again, at most three times. A pool in which no call finishes for 1,800 s counts as broken. Each restart is recorded in `run.json`. A call is a pure function of its arguments, and a pool broken on purpose by the audit gave the same bytes.
+    - The study refuses a series whose recomputed comparisons differ from `report2.json`'s by more than 10⁻⁹ relative, instead of only recording it. Every value the comparison records is checked, the count of identical hours included, and so is climatology's mean log-loss.
+    - The reader refuses a path outside the runs folder before it reads a byte.
+    - The audit's bolder check is added as a description: the variance ratio each block length should give, predicted from the series' own autocovariances, beside the measured one. Each no-flips ratio is given with its standard error, about 14 %.
+  - **Audit pass 4d**, on `olsprime.explain`, in three looks: two Major points, seven Minor points and six Nits, all fixed. GO for the five whys.
+    - The residual that closed a forecast's parts was zero by construction. It is now bounded, and a residual above its bound stops the call (exit 3).
+    - The shared environment held an extension built before `beta` and `mean_y`. It was synced, and every call probes the extension before it reads anything.
+    - Each tree's partition is recounted group by group, not only checked by its sum.
+    - A Matrix-free twin of the ridge forecast, in numpy, rebuilds each explained ridge forecast within a stated bound (the audit's bolder check).
+    - One limit is stated, not fixed: check 1 holds the range of the entries behind σ² to the panel's stamps, not their values.
+  - **Audit pass 4e**, on the encoder's core and its panel H1: no Blocker and no Major point, three Minor points and four Nits. GO for the panel H1 and for Report n°3's fits on this core. Its second look, at commit `abbc7d1`, gave GO for the panel H1 on the GPU, with one Minor point, on this entry's wording, corrected here, and five Nits. It trained `cheat-stamp`'s run 1 in four orders, and every part came out byte-identical.
+    - A resume is refused if the build changed: torch and its CUDA build, cuDNN, Python, the platform, the GPU and the driver passed by `--driver`, and on CPU the thread count, as well as the config, the code and the manifest. The refusal names each field that changed. The platform holds WSL2's kernel version, so a kernel update between a stop and a resume also refuses the resume.
+    - **A limit.** On CUDA the identity does not hold the CPU's thread count, although the memory's readout runs on the CPU there. The audit found the prefix sums and the readout bit-identical with 1, 2, 4 and 6 threads.
+    - The registered scope test runs at the first cut. The same test also runs at every regular cut, as a description (below).
+    - Torch 2.15's documentation lists `cumsum` on a CUDA floating tensor among the operations that act deterministically under `use_deterministic_algorithms(True)`; older releases listed it among those that raise. On the RTX 3060 it neither raised nor drifted across calls and prefix lengths, and it matched the CPU's sequential sum to the bit on a 5,000 × 100 fp64 probe. The pre-check remains the gate.
+    - **A correction of the wave-1 entry.** `pos-window`'s label sums the 24 one-bar returns in fp64, as built, not in fp32. On 38,144 synthetic rows the two readings class every row alike, the closest margin being 308 fp32 ulps.
+  - **Audit pass 4f**, on Report n°3: no Blocker, one Major point, seven Minor points and five Nits, all fixed before any fit. Its second look gave GO for the fits and the score, with three Minor points and three Nits, all fixed. It stopped a run at seven points where a file is written, and every resume gave the same bytes.
+    - A saved part is checked against its folder: its arm, seed and year, and its checkpoint's and forecasts' own records. A copied folder would otherwise have been scored as another arm (the Major point).
+    - A timing file that fails its digest stops the score, instead of reading as absent.
+    - Every stage binds the code and manifest digests, and the score refuses two timing files drawn on different samples.
+    - `report3.json` lists the fits' builds. Report n°3 is registered only if every fit ran on CUDA with one build, and H13's timing only if it ran on CUDA with the GPU named.
+    - The tree is frozen at the fits' commit: the timings, the score and `--check` run at that commit. A fix found in between waits until `--check` has passed.
+  - **The panel H1, as built.** Audit pass 4e accepted every reading.
+    - At a compared decision, the memory's stamps and statistics are the window's range among the stamp-sorted entries, those entries' stamp, symbol and open time, the window's raw moments and the readout. They are read through a no-op hook in `predict`.
+    - Inputs are compared as rows keyed by open time and symbol. The order of the episodes is the weeks' stamps and each epoch's permutation. The step, parameter and missing-window counts are compared too.
+    - A control must be caught in each direction where it is predicted caught, and in neither where it is not. That is stricter than iteration 3, which took the union of the directions.
+    - The pre-check compares the memory up to each fit year's last cut. The registered scope test runs at the first cut, with the fit reloaded from its file.
+    - Every system's predicted pattern follows one rule, computed per cut through the system's own hooks: a system is predicted caught at a cut when a compared item reads a label whose `label_known_at` is after the cut hour.
+    - `cheat-stamp` and `cheat-stamp-day` put a row's own label in its memory at its decision time. That is their leak, by design.
+    - The purge cuts take the seeds of a 9th and a 10th cut of the same schedule (k = 8 and 9 in `perturbation_at`), and their mirror follows the parity of k.
+    - `pos-window` is scored on the cut years. A row without a label of its own is dropped and counted.
+    - The CPU fallback's floor is computed per system, from its own three unperturbed runs.
+    - Exit codes: 2 if the pre-check fails, 1 if H1 fails, 3 if H1 holds and a skill check or `pos-window`'s check fails.
+  - **Report n°3, as built.** Audit pass 4f accepted every reading.
+    - H13's timing uses each arm's seed-1 fit of 2024. The 12,288 timed rows are drawn with the seed 20261030 from the scored rows that have a valid window. The Matrix timing uses the same sample, by its digest.
+    - The memory readout is timed where `predict` computes it, on the CPU in fp64. It costs the same for every arm, about a fifth of the whole pass on synthetic data, so it pulls the ratio toward 1: it can only make a holding H13 fail.
+    - Within each repeat the arms run in the order `enc-ols`, `enc-softmax`, `enc-linear`, so `enc-ols` and `enc-softmax` alternate.
+    - H13's ratio is median(`enc-ols`) / median(`enc-softmax`), as registered.
+    - Each Matrix arm is timed by its own readout at the last fit's choices, and `matrix-adaptive` at `matrix-select`'s ρ.
+    - Every stage of Report n°3 runs in WSL2, on the Ryzen 5 3600 and the RTX 3060. Matrix's CPU column uses the portable build there, where the process's peak memory is `ru_maxrss`. That peak is the whole process's, panel and windows included, and the memory's own size is given beside it. Matrix's parameters are 0: its choices are selections.
+    - The statistics' parameters come from Report n°2's `config.json`. The panel is checked by its fingerprint, and every scored row is paired one for one before any training.
+  - **Descriptions, beside the registered verdicts.** None enters a verdict.
+    - The scope test at every regular cut, for the honest arms and `cheat-stamp`, in the pre-check stage (audit pass 4e's bolder check). It loads each system's unperturbed run 1 of the cut's year; `cheat-stamp`'s is the control's own fit, the one H1 uses. At the registered setting, every system at every cut, it trains nothing that H1 does not train.
+    - H13: the readout's own time, beside the attention operator's and the whole pass; and the median of the per-repeat ratios, beside the ratio of medians.
+    - H4's two bounds on the three seed-matched pairs, and in the reversed direction, `enc-softmax` non-inferior to `enc-ols` (audit pass 4f's bolder check).
+  - **`explain head`, its readings**, fixed before it is built.
+    - It explains only scored rows of 2019–2024, which Report n°3 forecasts, so every call needs `--test-months` and is logged. A row before 2019 is refused: no fit of Report n°3 is in force there.
+    - The model is the `enc-ols` checkpoint of the fit in force at the row's decision time, seed by seed, verified by its digest and against its folder.
+    - Per block and head, W = Q̃ (K̃ᵀK̃ + Λ)⁻¹ K̃ᵀ over the row's 64-bar window. Its rank is at most 9.
+    - The row of W is the decision bar's: 64 signed weights, oldest first.
+    - The diagonal mass is trace(W) / 64. The decision token's own weight is given beside it.
+    - The effective rank is the exponential of the Shannon entropy of W's normalized singular values (Roy and Vetterli, 2007).
+    - Every row must sum to 1 within `row_sum_tolerance`. The row's forecast, recomputed from the checkpoint, must equal the saved one, to the bit where the fits' computation is reproduced. Either failure stops the call.
+  - **Contacts with the real data in this iteration so far**, all from a clean clone of 221591c on Windows, before any `explain` call and any encoder run:
+    1. Report n°2's re-run, `--compare-with runs/2026-10-29-report2`, 2026-10-30 02:42–03:05 UTC. It reads 2017-10 → 2024-12 and scores 2019-01 → 2024-12, as in iteration 3. The five allowed differences were met and every other byte matched. `series.npz`'s SHA-256 is `03916fda8ffa9f97709216b2365e7a224dd8c8d71448d75035a7824fdc9cc0b9`.
+    2. Its `--check`, 03:05–03:28 UTC: the four files were byte-identical, `series.npz` included.
+    3. The twins, twice, at 03:28 and 03:29 UTC, byte-identical. They read BTCUSDT's and ETHUSDT's daily bars through 2024-12, as iteration 3's H1 and adversary did.
+- 2026-10-30, before the first `explain` call and before any encoder run on real data (`runs/explain/CONTACTS.log` does not exist yet). Report n°3 cannot be built as written on the Windows runs of Report n°2, so it is given a Report n°2 run made in WSL2. No rule, statistic, threshold, grid, seed or period changes.
+  - **What was found.** On the same input bytes, `np.log` and `np.exp` give different last bits on Windows and in WSL2's Linux.
+    - So the panel's log-based columns differ in their last bits between the two platforms: among the features the returns, volatilities, moving-average gaps and ranges, and also the threshold and the forward return. The panel's fingerprint differs with them.
+    - On identical synthetic bars, exactly representable on both sides, the times, the labels, `f_qvol_z_30` and `f_taker_7` matched, and the other columns did not.
+    - The `explain head` engineer found it, and the orchestrator reproduced it.
+  - **Why it matters.**
+    - Every stage of Report n°3 runs in WSL2, and Report n°3 checks its panel against Report n°2's fingerprint before any training. Every Report n°2 run so far was made on Windows, so Report n°3 would be refused.
+    - Scoring an encoder trained on Linux features against Matrix forecasts made from Windows features would not compare two systems on one panel either.
+  - **What is done.**
+    - Report n°2 is re-run in WSL2, from the clean WSL2 clone, with the registered configuration.
+    - Report n°3 reads that run, by its series' digest: its panel and fingerprint, `matrix-select`'s series for H5, and `climatology-panel`'s log-loss for H4's margin.
+    - `explain head` runs in WSL2 too, on Report n°3's folder.
+    - The Windows runs remain Report n°2's record of iteration 3. `why`, `series` and `sample` keep reading the Windows re-run.
+  - **A description, beside it.** The two runs of Report n°2 are compared: the scored rows and their labels, each arm's scores, and the verdicts of H2, H3, H10, H11 and H12. A verdict that the platform's last bits can move is the first finding to report.
+  - The panel H1 for the encoder arms is not affected: it builds its sub-panel and compares its own runs, all in WSL2.
+- 2026-10-30, after audit pass 4g on `explain head`, before the first `explain` call (`runs/explain/CONTACTS.log` does not exist yet). No rule, statistic, threshold, grid, seed or period changes.
+  - **Audit pass 4g**, on `explain head`: no Blocker, one Major point, two Minor points and two Nits. GO once the Major point is fixed, before any call on a real checkpoint. Each of the build's seven interpretations was accepted.
+    - **The Major point.** `head` checked a part only against its own folder. A checkpoint changed by one bit, with its digests rewritten to match, was explained as if it were Report n°3's. `head` now refuses a part unless its checkpoint's and forecasts' digests, its count of forecasts and its epoch kept are the ones `report3.json` records for that arm, seed and year.
+    - The forecast check is a fingerprint of the forecast, not a proof of the checkpoint's bytes. The digests bound to `report3.json` are the checkpoint's identity.
+    - The registered row-sum check, on the fp32 W, is loose by three orders of magnitude. The same check on W formed in fp64 from the same Q, K and λ, with its own bound, is added beside it, and it stops the call too.
+    - The contact line names all that a call reads: the fit year's forecasts and labels, and the memory through `as_of`.
+    - The audit's bolder check, if it can be built without loosening a guard: with every seed, the recomputed forecasts, ensembled as the fits ensemble them, must equal the `enc-ols` probability of the row in Report n°3's `series.npz`, to the bit.
+  - **Contacts with the real data since the last entry**, from clean clones at `5f17a76`, whose CI was green on Linux and Windows:
+    4. The panel H1 for the encoder arms, on the GPU in WSL2, from 07:38 UTC. It reads the 10-member sub-panel's hourly bars through 2024-12, and forecasts and scores its rows in the cut years 2020, 2021, 2022 and 2024.
+    5. The power study, on Windows, from 07:38 UTC. It reads Report n°2's series `03916fda…` by its digest.
+    6. Report n°2's re-run in WSL2, from 07:39 UTC, compared with `runs/2026-10-30-report2`. It reads 2017-10 → 2024-12 and scores 2019-01 → 2024-12, as before.
+- 2026-10-30, after the first `explain` call (07:42:06 UTC). From that call on, the iteration 4 section changes only for what cannot be built as written. `runs/explain/CONTACTS.log` holds 24 lines at this entry. No rule, statistic, threshold, grid, seed or period changes.
+  - **Contacts with the real data since the last entry.** The five whys ran from the clean Windows clone at `5f17a76`, on Report n°2's Windows re-run (`03916fda…`), each call with `--test-months`. Every answer is exploratory.
+    7. Question 2's two `series` calls, at 07:42:06 and 07:42:20 UTC (lines 1 and 2 of `CONTACTS.log`).
+    8. Question 3's `sample`, from 07:42:30 UTC (line 3). It stopped at 08:02 on the Matrix-free twin's loud check and printed no result (below).
+    9. Question 5's `why` at its ten rows, at 08:03 UTC (lines 4 to 13). A line of the log names the arm and the hour, not the pair, so BTCUSDT's and ETHUSDT's rows at one hour read alike.
+    10. Question 1's `series`, at 08:06:59 UTC (line 14), then its `why` at the four rows picked by the fixed rule, for both arms, from 08:07 to 08:10 UTC (lines 15 to 22). A first `series --top 100` was refused before it read anything, since `--top` takes 1 to 50. The rows were picked from the top 50.
+    11. The diagnosis of the twin's failure, below: `why` at the failing row, at 08:12:04 UTC (line 23), then five probes from 08:18 to 08:35 UTC. The probes rebuilt Matrix through 2024-12-26, formed an exact reference at that row, and ran the twin at 133 values of `as_of` from 2024-11-29 to 2024-12-31. Their copies of the data were deleted at 08:35.
+    12. Question 3's `sample` again, whole, from 08:41:59 to 09:02 UTC (line 24), with OpenMP, OpenBLAS and MKL at one thread. Every check passed on all 1,000 rows, and the twin's largest gap was 4 × 10⁻⁶ of its bound.
+  - **The twin's failure at one row.** At SUIUSDT's row decided at 2024-12-26T10:59:59.999Z, window all, ρ = 10⁻⁴, over 1,587,472 entries, the twin's `fwd_return` was 0.0012707678705418557 and the core's 0.0012707731610964704. The gap, 5.29 × 10⁻⁹, exceeded its bound, 2.67 × 10⁻⁹.
+    - **The core is exact there.** A reference computed in exact rational arithmetic gives the core's four outputs within 5 × 10⁻¹⁷.
+    - **The twin's error did not reproduce.** Re-run at one BLAS thread, the twin gives the four outputs within 4 × 10⁻¹⁶ of the reference. It stays within its bound at all 133 values of `as_of` from 2024-11-29 to 2024-12-31, and at that row in a new `why` call.
+    - **Its cause is not identified.** The suspects are OpenBLAS's multithreaded products on a loaded machine and a transient hardware fault. No single bit flip in the twin's Gram matrix reproduces the failing value exactly.
+    - **No scored forecast is in question.** The forecasts are the core's, computed in Rust, and Report n°2's `--check` reproduced `series.npz` byte for byte.
+    - **What is done.** The third why runs again, whole, and every later `explain` call runs with BLAS at one thread. The twin and its bound do not change: the check did its job.
+  - **Audit pass 4g, second look**, on `explain head`'s fixes: GO for the commit and for the first call on Report n°3's checkpoints. No Blocker, no Major and no Minor point; three Nits, logged.
+    - **The audit's bolder check is not built in iteration 4**, since it cannot be built without loosening a guard. It would hold the recomputed forecasts, ensembled as the fits ensemble them, to Report n°3's `series.npz` to the bit. The only reader of `series.npz` without pickles is `power.load_series`, which requires `report2.json` beside the file. A second reader in `head` would trip the protocol tests' rules on zip archives and binary loads. The chain of identity therefore ends at the part's record in `report3.json`, and Report n°3's score stage, audited in pass 4f, maps the parts to its series. The check stays for iteration 5, through a `report_file` argument on `power.load_series`.
+    - **How `head` runs.** In WSL2, with the fits' build of torch, CUDA and cuDNN, after Report n°3's score stage has written `report3.json`, and with OpenMP, OpenBLAS and MKL at one thread. On CUDA the fits record no CPU thread count. The memory's readout on the CPU is bit-identical at 1, 2, 4 and 6 threads (audit pass 4e). The first call asks one seed at one row.
+- 2026-10-30, after audit pass 4h on LFM3's ablations and H6, before any ablation fit on real data. `runs/explain/CONTACTS.log` holds 24 lines at this entry. No registered rule, statistic, threshold, grid, seed or period changes. The build's readings are recorded, and one control with no verdict is added beside H6.
+  - **Contacts with the real data since the last entry**, from clean clones at `5f17a76`:
+    13. Report n°3's 54 fits, on the GPU in WSL2, from 09:00:54 UTC, from `~/ols-prime-r3`. They read the panel through 2024-12 and Report n°2's WSL2 series (`691e7ea7…`), and fit the yearly models 2019 to 2024. No score is computed before the score stage.
+    14. The power study's second run, for byte identity, on Windows, from 09:05:23 to 09:10:17 UTC. It read Report n°2's series `03916fda…` by its digest, then stopped when its worker pool failed at start-up, before any output. It is not re-run in iteration 4: the study gives the same bytes for every worker count (audit pass 4c), and the week's budget goes to Report n°3.
+  - **The ablations, as built.** Audit pass 4h accepted each of the build's readings.
+    - **`enc-ols-gate`.** σ(x W_g), with x = LN1(x), the block's normalized input.
+      - W_g is a 32 × 32 map without bias. Its slice h gates head h's 8 outputs, before the output projection.
+      - It takes weight decay.
+      - It is drawn after every module of `enc-ols`.
+    - **`enc-ols-conv`.** The first block's attention becomes out(σ(x W_g) ⊙ conv3(x W_u + b_u)), with x the block's normalized input.
+      - The value map and the output projection have a bias. The gate and the kernel have none, since b_u already offsets each channel.
+      - The convolution is depthwise and causal, of width 3, zero-padded on the left.
+      - The kernel is drawn U(±1/√3), as `nn.Conv1d` draws a depthwise kernel.
+      - It is computed as shifted products, not with cuDNN, for determinism.
+      - The arm needs n_layers ≥ 2. The second block keeps its OLS attention.
+      - **The kernel takes no weight decay. This is the build's choice, not a consequence of the protocol:** a depthwise kernel is a linear map, and AdamW usually decays a `Conv1d`. It is immaterial (96 parameters) and recorded as a choice.
+    - **`enc-ols-brier`.** The loss is the cross-entropy plus Σ_k (p_k − 1{y=k})², the form the scores use, in [0, 2].
+      - The Brier term is taken on the softmax before the floor, averaged over the episode's rows, with weight 1.
+      - The epoch kept is still chosen by the slice's log-loss.
+    - **Shared by all three.**
+      - Each arm is built as `enc-ols`, then changed. Under one seed it starts from `enc-ols`'s initial weights for every module they share, and draws the same episode order.
+      - `EncoderConfig` and `FitConfig` gain no field, so their JSON is unchanged. A subclass, `BrierFitConfig`, alone carries `brier_weight`.
+    - **Parameters.** `enc-ols` 21,003; `enc-ols-gate` 23,051 (+2,048); `enc-ols-conv` 20,007 (−996); `enc-ols-brier` 21,003. Each count holds both by the closed form and by counting the built models.
+  - **H6, as computed.**
+    - The ECE is `stats.ece` on the ensemble's floored forecasts over the scored rows.
+    - **The ratio's bootstrap.**
+      - Hours are resampled jointly for both arms.
+      - Each replicate's ECE is rebuilt exactly from per-hour bin sums: count, sum of confidences and sum of hits. They are cross-checked against `stats.ece`.
+      - The block is the larger of the two arms' Politis-White blocks of their hourly Brier scores.
+      - The seed is `_seed(rcfg, "ece_ratio", "enc-ols-brier", "enc-ols")`, and `n_boot` is Report n°2's.
+    - **"The 95 % upper bound" is the bootstrap's one-sided 95th percentile**, as for H4's bound.
+      - The two-sided interval and both ECEs are reported beside it.
+      - A bound that is not a number never passes.
+      - The condition reads the ratio the report prints.
+    - **The log-loss condition is inclusive (≤)**, on the difference `enc-ols-brier` − `enc-ols`, with Diebold-Mariano at 23 lags and HLN. If the test is undefined (the same difference at every hour), the tolerance is the seed range alone.
+  - **The registered run.**
+    - The arms are fitted and scored in the protocol's order, as a prefix of it.
+    - Every fit runs on CUDA, in one build equal to Report n°3's, driver included.
+    - The fits cannot share Report n°3's code digest, since that code predates the ablations. They are bound to it by the data's digests:
+      - `series.npz`;
+      - `report3.json`;
+      - each of Report n°3's parts: its `fit_sha256`, `forecast_sha256`, `forecast_rows` and `kept_epoch`.
+    - The score rebuilds Report n°3's series from the bound parts and requires its digest. `np.log`'s last bits differ between Windows and WSL2, so the score stage runs in WSL2, like Report n°3's.
+    - **After audit pass 4h's Major point, the score takes stock of every arm in the run folder.**
+      - An arm fitted in full must be scored.
+      - An arm fitted in part is reported as such, with its count of parts, and is not scored.
+      - Only an arm with no part is reported as not run.
+    - **Variants.** 21 before, plus one for each ablation scored. An arm fitted in part is never scored, so it is not a variant.
+  - **Evidence before any fit on real data.**
+    - **On the CPU.** Old code (`ece1950`) against new: the checkpoints and forecasts of `enc-ols`, `enc-softmax`, `enc-linear`, `cheat-stamp` and `cheat-value` are byte-identical, 11 files of 11. The build found it, and the audit reproduced it on its own run.
+    - **On the RTX 3060**, from 09:51:58 to 10:05:27 UTC:
+      - the same 11 files of 11 are identical;
+      - each ablation, fitted twice, is identical;
+      - then a synthetic Report n°3, the ablations against it, and `--check`, which passed.
+    - **The Windows suite:** 1,539 passed, 4 skipped.
+  - **The prior on H6, an analysis and not a result.** Near uniform forecasts, the Brier term's gradient in the logits is 2/3 of the cross-entropy's, in nearly the same direction. AdamW is nearly invariant to the gradient's scale, so CE + Brier ≈ CE at first order, and H6 is expected to be close to a null.
+    - **The audit's probe.** The ratio of the two gradients' norms and their cosine:
+      - at logits of scale 0.05: 0.666 and 0.9996;
+      - at scale 1: 0.57 and 0.90;
+      - at scale 4: 0.30 and 0.54.
+    - **Its caveat.** AdamW is invariant to a constant gradient scale, not to the clipping at norm 1, which rescales step by step. A gradient 5/3 larger is clipped on more steps.
+    - **The GPU smoke agrees.** `enc-ols-brier`'s per-seed log-losses differ from `enc-ols`'s by 1 to 2 × 10⁻⁵, and the epochs kept are the same (4, 5 and 6).
+    - **An observation on the rule, kept as registered.** On the synthetic smoke, the log-loss tolerance came from the seed range (5.4 × 10⁻³), 500 times the Diebold-Mariano standard error (1.1 × 10⁻⁵). On the real panel the seed range will very likely dominate too, which makes the log-loss condition lenient. The ECE condition carries H6.
+  - **Audit pass 4h.** No Blocker, one Major point, six Minor points and six Nits. GO, with the Major point fixed before the real score stage and the Minor points before the commit. The fixes were made in the working tree the same day. By the engineer's account, every plant the suite had missed now fails a named test. Neither the orchestrator's verification nor the audit's second look has seen them yet.
+    - **The Major point.** A fitted arm could be reported as not run by a run that called itself registered: all 54 fits, then a score of two arms, gave "H6 not run". The fix is the stock-taking above. The fits stage also refuses an arm list that is not a prefix of the protocol's order, unless every part of each earlier arm is sealed.
+    - **Five Minor points were test gaps.** The code was right, but the suite could not tell:
+      - the Brier term before the floor;
+      - the Brier arm's early-stopping statistic;
+      - the inclusive log-loss condition;
+      - the block-length rule;
+      - the two guards that bind the numbers to Report n°3's series.
+    - **The sixth Minor point.** Report n°3's checkpoint reader could not rebuild a `BrierFitConfig`. Its fix reads a config that carries `brier_weight` as a `BrierFitConfig`, and every other config as before.
+    - **The Nits.**
+      - The WSL2-bound score is stated in its refusal.
+      - The ECE condition reads the printed ratio.
+      - A docstring names the binding check that does the work.
+      - The kernel's decay and the lenient log-loss condition are recorded above.
+  - **A control with no verdict, beside H6: its ECE condition on two seeds of one model.** It comes from the audit's bolder check.
+    - **What it measures.** How far seed noise alone moves the ECE ratio. It needs no new fit.
+    - **What it computes.** For each of the six ordered pairs (i, j) of Report n°3's `enc-ols` seeds, each seed's forecasts are floored on their own, as its per-seed log-loss floors them, over the scored rows. Then:
+      - ECE_i and ECE_j;
+      - the ratio ECE_i / ECE_j and its paired bootstrap, by H6's own machinery and block rule, with the seed `_seed(rcfg, "ece_ratio", "enc-ols seed i", "enc-ols seed j")`;
+      - its two-sided 95 % interval and its 95th percentile;
+      - whether H6's ECE condition holds for i against j.
+    - **The log-loss condition is not applied.** Two seeds of one model differ by at most the seed range, by construction.
+    - **How to read it, fixed before the run.**
+      - H6 compares 3-seed ensembles, whose seed noise is smaller than one seed's.
+      - If the ECE condition holds for any ordered pair, H6's verdict is reported with that fact beside it: one seed's luck can meet the ECE condition.
+      - The control never changes H6's verdict, and it is not a variant.
+    - **The audit's positive control**, forecasts sharpened with a temperature of 0.7, is a test on synthetic data and does not run on the real panel.
+  - **The ablations stop here in iteration 4, for the week's budget.**
+    - **What is not done.** They are not fitted, and H6 is reported as not run.
+    - **What moves to iteration 5:**
+      - the verification of the fixes and the audit's second look;
+      - the ablations' 54 fits, their score and the seed-split control, as registered above;
+      - `explain head`, which is built and audited but not called in iteration 4.
+    - **What runs unattended** (`runs/2026-10-30-chain.log`):
+      - the panel H1, resumed with the same folder if it reaches its 16-hour timeout;
+      - then Report n°3's timing, Matrix timing, score and `--check`, at `5f17a76`, once both GPU jobs have ended.
+- 2026-10-31, after the official runs of iteration 4, before the results audit. `runs/explain/CONTACTS.log` holds 24 lines at this entry. No registered rule, statistic, threshold, grid, seed or period changes.
+  - **Contacts with the real data since the last entry**, from the clean clone `~/ols-prime-r3` at `5f17a76`:
+    15. Report n°3's timing, 2026-10-31 from 00:31:25 to 00:36:59 UTC; its Matrix timing to 00:40:39; its score to 00:43:03; its `--check`, first refused for missing arguments at 00:43:06 with no data read, then run from 00:44:18 to 00:46:52.
+    16. The panel H1's resume, from 23:39:23 UTC on 2026-10-30 to 00:30:02 on 2026-10-31, with the same folder, from `~/ols-prime-official`. It belongs to contact 4.
+    17. H13's timing repeated on the real rows, twice, on 2026-10-31 from 17:02:02 to 17:08:06 and from 17:09:00 to 17:14:01 UTC. Each read the panel through 2024-12 and Report n°2's WSL2 series, on a copy of Report n°3's parts. No score was computed, and no fit ran.
+  - **H13's timing measured the timing stage's own GPU cache.** Report n°3's ratio, 0.4031, met every condition the protocol names, and the protocol names no state of the GPU's memory. `report-3.md` stays as it is, as the run's file.
+    - **The sign.** Synthetic rows gave 1.06 at wave 1 and in the smokes, on the same code. `enc-softmax`'s operator was 10 times slower on real rows, `enc-ols`'s 1.4 times, and `enc-linear`'s unchanged.
+    - **The cause.** `EncoderTimer` keys the memory over the panel's entries before the protocol. On the real panel that leaves torch's cache at 12,926 MiB reserved, on a card of 12,288 MiB, with 260 MiB allocated. On the synthetic panel, the card's used memory, every process included, peaks at about 4,300 MiB.
+    - **The evidence.** On the same 12,288 rows, the ratio is 0.3739 as the code stands and 1.0732 with `torch.cuda.empty_cache()` before each protocol call. Emptied, the three operators fall to their synthetic times. The memory clock stays at 7,301 MHz in both repeats, so the state of the clocks does not explain it. The mechanism by which a full cache slows the operators is not measured.
+    - **The reading: no verdict, the measurement is invalid.** The rule's arithmetic gives 0.4031 ≤ 0.9, but the number measures the stage's cache, not the arms. H1's cuts already treat a quantity that cannot be measured this way: it is reported and left out of the verdict, and it never counts as a pass. The diagnosis was triggered by the gap with a reference on record before the run, 1.06, not by the sign of the result. So `docs/RESULTS.md` records no verdict for H13, and says that OLS attention is not shown to be cheaper to run. The GPU wall times of the cost table carry the same artefact. H4 and H5 read no timing; the fits, the forecasts, the peak memories and the Matrix timing are unaffected.
+    - **For iteration 5, before any re-measure.** The timing stage empties the cache before each protocol call and records the reserved memory, the card's total and the clocks. The bound stays 0.9. The re-measure is a new registered measurement under the amended conditions; its result is recorded whatever it is, with the note that 1.07 had been seen before it ran. A new kernel is a new variant, with its own registration.

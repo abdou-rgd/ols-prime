@@ -1,6 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use nalgebra::DVector;
+use nalgebra::{DMatrix, DVector};
 
 use crate::OlsError;
 use crate::centred::{CentredFit, CentredRidge, CentredStats};
@@ -122,12 +122,18 @@ impl Window {
 /// A centred read of Matrix for one query over a range of entries ([`Matrix::centred_query`]).
 ///
 /// Like [`Readout`], only the memory that made it accepts it back.
+///
+/// It carries the whole primal side of its fit, `x̄`, `ȳ` and `β`, beside the dual direction
+/// `a`, so that a forecast can be split into per-feature parts with the very bits it was
+/// computed from ([`CentredReadout::beta`]).
 #[derive(Debug, Clone, PartialEq)]
 pub struct CentredReadout {
     owner: u64,
     start: usize,
     end: usize,
     mean_x: Vec<f64>,
+    mean_y: DVector<f64>,
+    beta: DMatrix<f64>,
     a: DVector<f64>,
     forecast: DVector<f64>,
     leverage: f64,
@@ -148,6 +154,35 @@ impl CentredReadout {
     /// The window's mean state `x̄`.
     pub fn mean_x(&self) -> &[f64] {
         &self.mean_x
+    }
+
+    /// The window's mean outcome `ȳ` (length q): the forecast at `x_q = x̄`, and the free
+    /// intercept's share of every forecast. These are the bits of
+    /// [`CentredStats::mean_y`] for the readout's range, the ones [`CentredReadout::forecast`]
+    /// added.
+    pub fn mean_y(&self) -> &DVector<f64> {
+        &self.mean_y
+    }
+
+    /// The coefficients `β = M_yx (M_xx + Λ)⁻¹` (q × p) of the fit behind the readout, from the
+    /// same Cholesky solve as the forecast (they are [`CentredFit::beta`]), so that
+    ///
+    /// ```text
+    /// ŷ_c = ȳ_c + Σ_j β_cj · x̃_j,   x̃ = x_q − x̄.
+    /// ```
+    ///
+    /// Row c of `β` is outcome c; `β_cj · x̃_j` is feature j's part of the forecast, and the
+    /// intercept `b = ȳ − β x̄` is implied.
+    ///
+    /// **Bits.** [`CentredReadout::forecast`] was computed as: `x̃_j = x_q,j − x̄_j`, each product
+    /// `β_cj · x̃_j` rounded on its own (no fused multiply-add: Rust never contracts), the
+    /// products summed from j = 0 upwards starting from the first product (`Iterator::sum`
+    /// starts from −0.0, which is neutral), then `ȳ_c` added last. Repeating exactly those
+    /// operations reproduces the forecast to the bit. Any other order, a BLAS `gemv` or an FMA
+    /// included, agrees only within rounding: at most `2γ_{p+1}(|ȳ_c| + Σ_j |β_cj x̃_j|)`, with
+    /// `γ_k = k·u/(1 − k·u)` and `u = 2⁻⁵³` (two inner products of length p + 1, Higham, Thm 3.1).
+    pub fn beta(&self) -> &DMatrix<f64> {
+        &self.beta
     }
 
     /// The dual direction `a = (M_xx + Λ)⁻¹ (x_q − x̄)`.
@@ -567,7 +602,8 @@ impl Matrix {
     /// intercept and the penalty `Λ = ρ·n·diag(s)` of `cfg` ([`CentredFit`]).
     ///
     /// The forecast, leverage and residual sums are the bits [`Matrix::ridge_batch`] returns
-    /// for the same range and penalty.
+    /// for the same range and penalty. The readout also keeps `ȳ` and `β` of the one solve
+    /// ([`CentredReadout::beta`]), so that a forecast can be explained term by term.
     pub fn centred_query(
         &self,
         x_q: &[f64],
@@ -587,6 +623,8 @@ impl Matrix {
             start,
             end,
             mean_x: fit.mean_x().to_vec(),
+            mean_y: DVector::from_column_slice(fit.mean_y()),
+            beta: fit.beta(),
             a,
             forecast,
             leverage,

@@ -38,6 +38,11 @@ _RULES: dict[str, dict[str, str]] = {
         "raw-reader": "parses the downloaded archives into the stored schema",
         "import:zipfile": "opens the downloaded archives",
     },
+    "olsprime/bench/power.py": {
+        "import:zipfile": "load_series opens series.npz, a Report n°2 output under runs/, from the bytes it has just hashed; never data/",
+        "raw-reader": "load_series opens series.npz's archive only after its SHA-256 matches the one given and its run's report2.json",
+        "binary-load": "load_series reads each .npy member of series.npz with allow_pickle=False, from the hashed bytes; never data/",
+    },
     "tests/fakes.py": {
         "raw-reader": "writes fake archives",
         "import:zipfile": "writes fake archives",
@@ -66,6 +71,12 @@ _RULES: dict[str, dict[str, str]] = {
         "import:importlib": "finds and imports the optional libraries (pandas, torch) when installed",
         "disarm": "reads the allow-list it enforces, and unwraps classmethod and staticmethod entry points to wrap them",
         "vault-tree": "computes the vault roots that the readers are judged against",
+    },
+    "tests/test_torch_guards.py": {
+        "exec": "compiles its torch.load probes as code of this file, which holds no import:pickle allowance, so that the tripwire judges them",
+    },
+    "tests/test_torch_free.py": {
+        "dynamic": "reads sys.modules, in a fresh spawned interpreter only, to check that the evaluation modules load no torch",
     },
     "tests/test_tripwire.py": {
         "exec": "executes a string to show that the tripwire sees code built at run time",

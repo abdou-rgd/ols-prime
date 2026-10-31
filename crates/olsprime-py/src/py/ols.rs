@@ -666,6 +666,20 @@ impl CentredReadout {
         PyArray1::from_slice(py, self.inner.mean_x())
     }
 
+    /// The range's mean outcome `ȳ`, shape (q,): the bits the forecast added.
+    #[getter]
+    fn mean_y<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
+        dvector(py, self.inner.mean_y())
+    }
+
+    /// `β = M_yx (M_xx + Λ)⁻¹`, shape (q, p), C-ordered: the coefficients of the one solve
+    /// behind the forecast (`ols_core::CentredReadout::beta` states which order of operations
+    /// gives back its bits).
+    #[getter]
+    fn beta<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f64>>> {
+        array2(py, self.inner.beta())
+    }
+
     /// The dual direction `a = (M_xx + Λ)⁻¹ (x_q − x̄)`, shape (p,).
     #[getter]
     fn a<'py>(&self, py: Python<'py>) -> Bound<'py, PyArray1<f64>> {
