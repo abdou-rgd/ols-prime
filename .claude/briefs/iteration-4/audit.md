@@ -73,6 +73,24 @@ All under `C:\Users\abdou\ols-prime\runs\`. Each `run.json` names its commit and
 - Write probes with a file tool, never through shell heredocs or pipes into `python`. Run them with `uv run --no-sync --project python python -I <file>`.
 - No git command that changes state. Never set `OLSPRIME_OPEN_VAULT` and never read the vault.
 
+## Addendum, 2026-10-31: scope and budget of this pass
+
+**One pass, and be frugal.** Abdou's weekly limit is nearly spent: 16 % left, and 29 % for Fable. Do not run the test suites: the orchestrator runs them. Prefer reading the run's JSON to probes, and write at most a handful of short probes. Spend your effort where a wrong claim would do the most harm, in the order below. Keep the report under about 1,000 words, and say what you did not check.
+
+**What changed since this brief was written.**
+- `explain head` never ran, and LFM3's ablations and H6 were not run: item 9 falls, and the code is off this branch (`iteration-5-ablations`, `5be70a3`). The outcome must call them not run.
+- The power study's second run stopped at start-up, so item 5's byte identity does not exist. The row must say so.
+- The rows are at the end of `docs/RESULTS.md`, the outcome at the end of `docs/ITERATIONS.md`, and the last change-log entry at the end of `docs/PROTOCOL.md`, all uncommitted. `docs/reports/report-3.md` is a copy of the run's file. Placeholders ending in `_TODO` are the orchestrator's, for your verdict and the verification.
+- Probes go in the scratch folder named below, in a new subfolder `audit-phase2`.
+
+**The first target: H13.** The orchestrator found that the registered ratio, 0.4031, is an artefact, and chose to keep the number the rule computes while not claiming it. Attack that decision in both directions.
+- The evidence: `runs/2026-10-31-h13-repeat/` (repeat1-timing.json, repeat2-timing.json, the two `smi.csv`), the logs `runs/2026-10-31-h13-repeat.log` and `-2.log`, the scripts `h13-gap\repeat-real.sh`, `repeat-empty.sh` and `wrap_empty.py` in the scratch folder, and `.claude/briefs/iteration-4/h13-gap-and-rows.md`. The report of the synthetic replays is summarized in `docs/RESULTS.md`; its logs are in `h13-gap\`.
+- Does repeat 2 show what the records say? Nobody logged the reserved memory during the official timing: is it fair to call the official number the same artefact, given repeat 1 and the code? Is one repeat, by day, with Windows applications on the GPU, worded no stronger than it deserves?
+- Is "the rule computes holds, not claimed" the right reading of `docs/PROTOCOL.md`, or should the verdict read otherwise? A registered verdict set aside after seeing a result is the kind of move this project forbids, even in the cautious direction. Say whether this one is justified and how it should be worded.
+- Does the artefact reach anything else: the cost table's other columns, H4, H5, the Matrix timing, the 2026-10-30 claim that the readout pulls the ratio toward 1?
+
+**Then, in order:** the three verdicts of the panel H1; H4 and H5 against their rules; the claims of the outcome, especially the reading of `cheat-stamp`'s failed skill check and H5's interval; the power, twins and platform rows; the five whys and the contacts. Sample the numbers instead of recomputing all of them where the runner's checks already cover them.
+
 ## Report
 
 - The findings, by severity, each with its failure case and probe.

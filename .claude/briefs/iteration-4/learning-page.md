@@ -102,4 +102,14 @@ Close with:
 
 ## Verified figures
 
-The orchestrator appends them below once they are verified.
+Appended by the orchestrator on 2026-10-31, after audit phase 2. Take numbers only from these three places: the outcome of iteration 4 in `docs/ITERATIONS.md`, the rows dated 2026-10-30 and 2026-10-31 in `docs/RESULTS.md`, and the entry of 2026-10-31 at the end of `docs/PROTOCOL.md`.
+
+**What changed since this brief was written, and it wins over the plan above.**
+- **Item 7, H13: no verdict, the measurement is invalid.** Make this the page's central story: a number that fitted the rule and was still false. The rule's arithmetic gave 0.4031 ≤ 0.9, on ten repeats within 3.4 %. Synthetic rows had given 1.06 before the run. Two wrong explanations came first and were ruled out: the cold GPU, then the slow memory clock. The cause: the stage's own preparation left torch's cache at 12,926 MiB reserved on a card of 12,288 MiB. With the cache emptied, 1.0732, and 1.05 past the allocator's refill. How a full cache slows the operators is not measured. Do not say OLS attention is cheaper, and do not say it is dearer as a finding: one repeat is a description.
+  - Teach why a full card hurts `enc-softmax` (four heads of 4,096 × 64 × 64 matrices) so much more than `enc-linear`, as a likely mechanism, labelled as such.
+  - A demo fits here: the ratio with and without the cache, with the operators' times, and the reader finding which explanation each measurement rules out.
+- **H4 holds as non-inferiority.** Say what that does not mean: the difference favours `enc-ols`, and superiority is a description.
+- **H5 does not hold,** and no difference is shown in either direction. The encoder, at 21,003 parameters, sits about where a memory of hand-made features sits.
+- **The skill check failed on `cheat-stamp`, and H1 passed.** Explain why these are two questions, and that the 30-day reading is a likely one, not tested.
+- **Not run:** LFM3's ablations, H6, the seed-split control, `explain head`, the power study's second run. Items 2 and 9 teach the ideas; never show a result for them.
+- **Item 12, H14** stays planned work, and the bolder next step is the one in the outcome.
