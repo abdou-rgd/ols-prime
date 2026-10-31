@@ -800,3 +800,102 @@ Climatology, always flat, buy and hold, moving-average momentum, random position
   - **Audit pass 4g, second look**, on `explain head`'s fixes: GO for the commit and for the first call on Report n°3's checkpoints. No Blocker, no Major and no Minor point; three Nits, logged.
     - **The audit's bolder check is not built in iteration 4**, since it cannot be built without loosening a guard. It would hold the recomputed forecasts, ensembled as the fits ensemble them, to Report n°3's `series.npz` to the bit. The only reader of `series.npz` without pickles is `power.load_series`, which requires `report2.json` beside the file. A second reader in `head` would trip the protocol tests' rules on zip archives and binary loads. The chain of identity therefore ends at the part's record in `report3.json`, and Report n°3's score stage, audited in pass 4f, maps the parts to its series. The check stays for iteration 5, through a `report_file` argument on `power.load_series`.
     - **How `head` runs.** In WSL2, with the fits' build of torch, CUDA and cuDNN, after Report n°3's score stage has written `report3.json`, and with OpenMP, OpenBLAS and MKL at one thread. On CUDA the fits record no CPU thread count. The memory's readout on the CPU is bit-identical at 1, 2, 4 and 6 threads (audit pass 4e). The first call asks one seed at one row.
+- 2026-10-30, after audit pass 4h on LFM3's ablations and H6, before any ablation fit on real data. `runs/explain/CONTACTS.log` holds 24 lines at this entry. No registered rule, statistic, threshold, grid, seed or period changes. The build's readings are recorded, and one control with no verdict is added beside H6.
+  - **Contacts with the real data since the last entry**, from clean clones at `5f17a76`:
+    13. Report n°3's 54 fits, on the GPU in WSL2, from 09:00:54 UTC, from `~/ols-prime-r3`. They read the panel through 2024-12 and Report n°2's WSL2 series (`691e7ea7…`), and fit the yearly models 2019 to 2024. No score is computed before the score stage.
+    14. The power study's second run, for byte identity, on Windows, from 09:05:23 to 09:10:17 UTC. It read Report n°2's series `03916fda…` by its digest, then stopped when its worker pool failed at start-up, before any output. It is not re-run in iteration 4: the study gives the same bytes for every worker count (audit pass 4c), and the week's budget goes to Report n°3.
+  - **The ablations, as built.** Audit pass 4h accepted each of the build's readings.
+    - **`enc-ols-gate`.** σ(x W_g), with x = LN1(x), the block's normalized input.
+      - W_g is a 32 × 32 map without bias. Its slice h gates head h's 8 outputs, before the output projection.
+      - It takes weight decay.
+      - It is drawn after every module of `enc-ols`.
+    - **`enc-ols-conv`.** The first block's attention becomes out(σ(x W_g) ⊙ conv3(x W_u + b_u)), with x the block's normalized input.
+      - The value map and the output projection have a bias. The gate and the kernel have none, since b_u already offsets each channel.
+      - The convolution is depthwise and causal, of width 3, zero-padded on the left.
+      - The kernel is drawn U(±1/√3), as `nn.Conv1d` draws a depthwise kernel.
+      - It is computed as shifted products, not with cuDNN, for determinism.
+      - The arm needs n_layers ≥ 2. The second block keeps its OLS attention.
+      - **The kernel takes no weight decay. This is the build's choice, not a consequence of the protocol:** a depthwise kernel is a linear map, and AdamW usually decays a `Conv1d`. It is immaterial (96 parameters) and recorded as a choice.
+    - **`enc-ols-brier`.** The loss is the cross-entropy plus Σ_k (p_k − 1{y=k})², the form the scores use, in [0, 2].
+      - The Brier term is taken on the softmax before the floor, averaged over the episode's rows, with weight 1.
+      - The epoch kept is still chosen by the slice's log-loss.
+    - **Shared by all three.**
+      - Each arm is built as `enc-ols`, then changed. Under one seed it starts from `enc-ols`'s initial weights for every module they share, and draws the same episode order.
+      - `EncoderConfig` and `FitConfig` gain no field, so their JSON is unchanged. A subclass, `BrierFitConfig`, alone carries `brier_weight`.
+    - **Parameters.** `enc-ols` 21,003; `enc-ols-gate` 23,051 (+2,048); `enc-ols-conv` 20,007 (−996); `enc-ols-brier` 21,003. Each count holds both by the closed form and by counting the built models.
+  - **H6, as computed.**
+    - The ECE is `stats.ece` on the ensemble's floored forecasts over the scored rows.
+    - **The ratio's bootstrap.**
+      - Hours are resampled jointly for both arms.
+      - Each replicate's ECE is rebuilt exactly from per-hour bin sums: count, sum of confidences and sum of hits. They are cross-checked against `stats.ece`.
+      - The block is the larger of the two arms' Politis-White blocks of their hourly Brier scores.
+      - The seed is `_seed(rcfg, "ece_ratio", "enc-ols-brier", "enc-ols")`, and `n_boot` is Report n°2's.
+    - **"The 95 % upper bound" is the bootstrap's one-sided 95th percentile**, as for H4's bound.
+      - The two-sided interval and both ECEs are reported beside it.
+      - A bound that is not a number never passes.
+      - The condition reads the ratio the report prints.
+    - **The log-loss condition is inclusive (≤)**, on the difference `enc-ols-brier` − `enc-ols`, with Diebold-Mariano at 23 lags and HLN. If the test is undefined (the same difference at every hour), the tolerance is the seed range alone.
+  - **The registered run.**
+    - The arms are fitted and scored in the protocol's order, as a prefix of it.
+    - Every fit runs on CUDA, in one build equal to Report n°3's, driver included.
+    - The fits cannot share Report n°3's code digest, since that code predates the ablations. They are bound to it by the data's digests:
+      - `series.npz`;
+      - `report3.json`;
+      - each of Report n°3's parts: its `fit_sha256`, `forecast_sha256`, `forecast_rows` and `kept_epoch`.
+    - The score rebuilds Report n°3's series from the bound parts and requires its digest. `np.log`'s last bits differ between Windows and WSL2, so the score stage runs in WSL2, like Report n°3's.
+    - **After audit pass 4h's Major point, the score takes stock of every arm in the run folder.**
+      - An arm fitted in full must be scored.
+      - An arm fitted in part is reported as such, with its count of parts, and is not scored.
+      - Only an arm with no part is reported as not run.
+    - **Variants.** 21 before, plus one for each ablation scored. An arm fitted in part is never scored, so it is not a variant.
+  - **Evidence before any fit on real data.**
+    - **On the CPU.** Old code (`ece1950`) against new: the checkpoints and forecasts of `enc-ols`, `enc-softmax`, `enc-linear`, `cheat-stamp` and `cheat-value` are byte-identical, 11 files of 11. The build found it, and the audit reproduced it on its own run.
+    - **On the RTX 3060**, from 09:51:58 to 10:05:27 UTC:
+      - the same 11 files of 11 are identical;
+      - each ablation, fitted twice, is identical;
+      - then a synthetic Report n°3, the ablations against it, and `--check`, which passed.
+    - **The Windows suite:** 1,539 passed, 4 skipped.
+  - **The prior on H6, an analysis and not a result.** Near uniform forecasts, the Brier term's gradient in the logits is 2/3 of the cross-entropy's, in nearly the same direction. AdamW is nearly invariant to the gradient's scale, so CE + Brier ≈ CE at first order, and H6 is expected to be close to a null.
+    - **The audit's probe.** The ratio of the two gradients' norms and their cosine:
+      - at logits of scale 0.05: 0.666 and 0.9996;
+      - at scale 1: 0.57 and 0.90;
+      - at scale 4: 0.30 and 0.54.
+    - **Its caveat.** AdamW is invariant to a constant gradient scale, not to the clipping at norm 1, which rescales step by step. A gradient 5/3 larger is clipped on more steps.
+    - **The GPU smoke agrees.** `enc-ols-brier`'s per-seed log-losses differ from `enc-ols`'s by 1 to 2 × 10⁻⁵, and the epochs kept are the same (4, 5 and 6).
+    - **An observation on the rule, kept as registered.** On the synthetic smoke, the log-loss tolerance came from the seed range (5.4 × 10⁻³), 500 times the Diebold-Mariano standard error (1.1 × 10⁻⁵). On the real panel the seed range will very likely dominate too, which makes the log-loss condition lenient. The ECE condition carries H6.
+  - **Audit pass 4h.** No Blocker, one Major point, six Minor points and six Nits. GO, with the Major point fixed before the real score stage and the Minor points before the commit. The fixes were made in the working tree the same day. By the engineer's account, every plant the suite had missed now fails a named test. Neither the orchestrator's verification nor the audit's second look has seen them yet.
+    - **The Major point.** A fitted arm could be reported as not run by a run that called itself registered: all 54 fits, then a score of two arms, gave "H6 not run". The fix is the stock-taking above. The fits stage also refuses an arm list that is not a prefix of the protocol's order, unless every part of each earlier arm is sealed.
+    - **Five Minor points were test gaps.** The code was right, but the suite could not tell:
+      - the Brier term before the floor;
+      - the Brier arm's early-stopping statistic;
+      - the inclusive log-loss condition;
+      - the block-length rule;
+      - the two guards that bind the numbers to Report n°3's series.
+    - **The sixth Minor point.** Report n°3's checkpoint reader could not rebuild a `BrierFitConfig`. Its fix reads a config that carries `brier_weight` as a `BrierFitConfig`, and every other config as before.
+    - **The Nits.**
+      - The WSL2-bound score is stated in its refusal.
+      - The ECE condition reads the printed ratio.
+      - A docstring names the binding check that does the work.
+      - The kernel's decay and the lenient log-loss condition are recorded above.
+  - **A control with no verdict, beside H6: its ECE condition on two seeds of one model.** It comes from the audit's bolder check.
+    - **What it measures.** How far seed noise alone moves the ECE ratio. It needs no new fit.
+    - **What it computes.** For each of the six ordered pairs (i, j) of Report n°3's `enc-ols` seeds, each seed's forecasts are floored on their own, as its per-seed log-loss floors them, over the scored rows. Then:
+      - ECE_i and ECE_j;
+      - the ratio ECE_i / ECE_j and its paired bootstrap, by H6's own machinery and block rule, with the seed `_seed(rcfg, "ece_ratio", "enc-ols seed i", "enc-ols seed j")`;
+      - its two-sided 95 % interval and its 95th percentile;
+      - whether H6's ECE condition holds for i against j.
+    - **The log-loss condition is not applied.** Two seeds of one model differ by at most the seed range, by construction.
+    - **How to read it, fixed before the run.**
+      - H6 compares 3-seed ensembles, whose seed noise is smaller than one seed's.
+      - If the ECE condition holds for any ordered pair, H6's verdict is reported with that fact beside it: one seed's luck can meet the ECE condition.
+      - The control never changes H6's verdict, and it is not a variant.
+    - **The audit's positive control**, forecasts sharpened with a temperature of 0.7, is a test on synthetic data and does not run on the real panel.
+  - **The ablations stop here in iteration 4, for the week's budget.**
+    - **What is not done.** They are not fitted, and H6 is reported as not run.
+    - **What moves to iteration 5:**
+      - the verification of the fixes and the audit's second look;
+      - the ablations' 54 fits, their score and the seed-split control, as registered above;
+      - `explain head`, which is built and audited but not called in iteration 4.
+    - **What runs unattended** (`runs/2026-10-30-chain.log`):
+      - the panel H1, resumed with the same folder if it reaches its 16-hour timeout;
+      - then Report n°3's timing, Matrix timing, score and `--check`, at `5f17a76`, once both GPU jobs have ended.
