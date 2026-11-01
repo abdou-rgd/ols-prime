@@ -1,0 +1,66 @@
+# Bootstrap coverage tests in python/tests/test_stats.py. The pytest job of
+# ci.yml never sets OLSPRIME_SLOW, so the two tests marked slow there are
+# skipped on every push and pull request. This workflow sets OLSPRIME_SLOW=1
+# and runs that file. It is not on push or pull_request, so the jobs in
+# ci.yml stay as they are.
+#
+# Started by hand: Actions, Slow tests, Run workflow.
+# Also every Monday at 06:17 UTC. Locally on 2026-11-01 the file passed in
+# 78 s (43 tests). A GitHub run adds the uv sync of the pytest job (CPU torch
+# and the PyO3 build): one ubuntu runner, once a week. ubuntu-latest only;
+# the tests are seeded NumPy, and ci.yml already runs the fast suite on Windows.
+#
+# Setup steps and pins match the pytest job of ci.yml, checked on 2026-10-25.
+name: Slow tests
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Monday 06:17 UTC. Off the hour, once a week.
+    - cron: "17 6 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: slow-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The string "1" is what python/tests/test_stats.py checks.
+  OLSPRIME_SLOW: "1"
+
+jobs:
+  bootstrap:
+    name: bootstrap coverage
+    runs-on: ubuntu-latest
+    # Same 30 minutes as the pytest job of ci.yml, which covers this uv sync.
+    # Locally on 2026-11-01 the file itself passed in 78 s.
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # setup-uv publishes no floating major tag since v10.
+      - uses: astral-sh/setup-uv@07a047e608db84b3d8c06cd9a7c7dcc9c355c18e # v10.3.2
+        with:
+          version: "0.12.15"
+          working-directory: python
+      # `uv sync` builds olsprime-rs (crates/olsprime-py) with maturin, which needs Rust.
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master, 2026-10-16
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # Python 3.12 comes from python/.python-version. The tests are offline:
+      # tests/conftest.py makes any socket connection fail, and the job sets no
+      # vault variable and downloads no market data.
+      - run: uv sync --locked
+      # OLSPRIME_SLOW is read only in tests/test_stats.py. A new slow test in
+      # another file belongs on this command.
+      - name: pytest, bootstrap coverage
+        run: uv run --locked pytest tests/test_stats.py
