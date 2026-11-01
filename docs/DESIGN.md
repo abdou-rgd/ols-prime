@@ -177,36 +177,70 @@ Two stray processes kept two of the 12 hardware threads busy during these runs. 
 - **The lock test.** The test that the global interpreter lock is released was not checked against a build that holds the lock.
 - **Footprints.** The memory bounds that the bindings check are derived from the code. Nothing measures the actual allocations.
 
-## 4. Encoder (phase 3)
+## 4. Encoder (iteration 4)
 
-Tokens embed (asset × time patch) pairs from a window that lies entirely in the past. Attention inside the window may therefore be bidirectional. Each head computes signed T × T weights:
+Roadmap phase 3, as built. A row is one pair at one hourly bar.
+
+**Tokens.** One token per hourly bar of that pair. The window is the 64 bars ending at the decision bar, `t − 63` through `t`. All 64 are already final, so attention inside the window is bidirectional: there is no mask. A token that embeds an asset together with a span of time is not built.
+
+Each bar carries eight quantities: `ln(c / c_prev)`, `ln(o / c_prev)`, `ln(h / l)`, `ln(c / o)`, `ln(h / max(o, c))`, `ln(min(o, c) / l)`, `ln(1 + quote volume)`, and the taker share of quote volume minus 1/2 (0 when the bar has no volume). The first two use the previous close, so the series starts at `t − 64`. The bars from `t − 64` through `t` must be consecutive hours, and every quantity of the 64 window bars must be finite. Otherwise the row takes the arm's climatology.
+
+Each quantity is standardized with the mean and standard deviation (divisor n) of the last bar of every training row of the fit. Those sums are sequential, in fp64. The values are then clipped to ±8 and kept in fp32.
+
+**Trunk.** A linear map sends the eight quantities to `d_model = 32`, plus a learned embedding of the 64 positions. Two pre-LayerNorm blocks follow. Each is attention with 4 heads of `d_head = 8`, then an MLP `32 → 64 → 32` with GELU, a residual around the attention and around the MLP, and no dropout. A final LayerNorm. The state `h ∈ R³²` is the output at the last position, bar t.
+
+The three arms use this same trunk. Only the attention operator differs.
+- `enc-ols` uses the OLS head below.
+- `enc-softmax` uses `softmax(Q Kᵀ / √8) V`, scaled dot-product attention on the math backend.
+- `enc-linear` uses `φ(Q) (φ(K)ᵀ V) / (φ(Q) φ(K)ᵀ 1)`, with `φ(x) = elu(x) + 1`.
+
+**The OLS head.** Queries and keys are scaled to unit root mean square at each position, with no parameter. A constant coordinate is concatenated and left unpenalized:
 
 ```
-W = Q (KᵀK + λI)⁻¹ Kᵀ,     O = W V.
+K̃ = [1 | K],    q̃ = [1 | q],
+Λ = diag(0, Tλ, …, Tλ),    λ = softplus(θ) + 10⁻³,
+W = Q̃ (K̃ᵀK̃ + Λ)⁻¹ K̃ᵀ,    O = W V.
 ```
 
-The rows of W sum to one under the two conditions of §1:
-- the constant key coordinate is unpenalized, `Λ = diag(0, λ, …, λ)` rather than `λI`;
+`λ` is learned per head. `θ` is initialised so that `λ = 0.1`. With `T = 64`, every key coordinate other than the constant carries the penalty `64λ`. The head runs in fp32, and the Cholesky factorization uses that precision. The explicit inverse is never formed. The forward pass evaluates `O = Q̃ (A⁻¹ (K̃ᵀ V))`, which is `W V` with the product associated the other way.
+
+The rows of `W` sum to one, because this `Λ` meets the two conditions of §1:
+- the constant key coordinate is unpenalized;
 - every query has 1 in that coordinate.
 
-In general they do not otherwise. Take a constant key column under `λI`, and a query q with 1 in that coordinate. Since `Kᵀ1 = KᵀK e₀`, its row sums to `1 − λ·e₀ᵀ(KᵀK + λI)⁻¹ q`, where e₀ picks the constant coordinate. That is 1 only at λ = 0, or in special cases such as a dual direction `(KᵀK + λI)⁻¹ q` with no constant component.
+They do not under a penalty on the constant. Take a constant key column under `λI`, and a query `q` with 1 in that coordinate. Since `Kᵀ1 = KᵀK e₀`, its row sums to `1 − λ·e₀ᵀ(KᵀK + λI)⁻¹ q`, where `e₀` picks the constant coordinate. That is 1 only at `λ = 0`, or in special cases such as a dual direction `(KᵀK + λI)⁻¹ q` with no constant component.
 
-Design constraints:
-- `T ≫ d_head`; otherwise `K (KᵀK)⁻¹ Kᵀ ≈ I` and the head copies its input;
-- λ > 0, learned per head, on every coordinate except the constant one;
-- Cholesky solves in fp32, with normalized keys.
+`T ≫ d_head`, or else `K (KᵀK)⁻¹ Kᵀ ≈ I` and the head copies its input. The built head has `T / d_head = 8`, and the code refuses a smaller ratio. `λ` stays positive: the floor is `10⁻³`.
 
-During training, Matrix is causal inside episodes of consecutive days, through prefix sums of the statistics as in the mesa-layer. Older history acts as a cache without gradient.
-- The prefix sums accumulate in fp64 and are cast to fp32 only for the factorization. A range read as the difference of two large fp32 prefix sums can lose positive definiteness.
-- The tree's merges avoid that subtraction altogether.
+**Memory.** Every arm reads one memory. The key is `z = W_z h ∈ R⁸` with no bias, the value is the one-hot label, and the stamp is the row's `label_known_at`. A readout at decision time `d` uses the entries with `d − 30 days < stamp ≤ d`. That is the only window. It is the centred ridge of §3.2, on keys centred inside the window:
+
+```
+m = ȳ + β (z_q − z̄),    β = M_yz (M_zz + Λ)⁻¹,
+Λ = ρ · diag(M_zz) + 10⁻⁶ · n_w · I,    ρ = 10⁻².
+```
+
+An empty window gives `(1/3, 1/3, 1/3)`. The normal matrix is 8 × 8, and its Cholesky factorization is in fp64. The fp32 factorization above belongs to the OLS head. The memory's solve is a separate one, and it stays in fp64.
+
+The window is the difference of two prefix sums of the raw moments `(n, Σz, Σzzᵀ, Σy, Σyzᵀ)`, in the manner of the mesa-layer. The prefixes accumulate in fp64, and the difference is taken in fp64 before centring. A difference of two large fp32 prefixes can lose positive definiteness, so the memory never casts those moments to fp32 for the factorization. The solved `m` is cast to the head's dtype, fp32 in the runs, only once the solve is done. The tree of §3 is a different object: its merges add node statistics. The encoder's memory does not read that tree.
+
+Training walks the rows in weekly episodes, Monday 00:00 UTC to the next Monday, over every member. Inside an episode, the memory at `d` holds the training rows in the 30-day window. Rows of the episode are keyed with gradient. Older rows the window needs are keyed with the current weights and without gradient. A fit is once a year, at 00:00 UTC on 1 January, for each test year from 2019 through 2024.
+
+A readout at one year, and a readout over all history, are not built beside this window. §7 still plans to stack the three, with three weights.
 
 ## 5. Decision head and decision rule
 
-- **Options.** The head outputs probabilities over typed options: down, neutral or up over horizon h. The thresholds are set by fees and volatility.
-- **Inputs.** It reads the encoder state and Matrix readouts at several resolutions: 30 days, one year, all history.
-- **Loss.** Cross-entropy plus a Brier term.
-  - Label smoothing pulls every probability towards uniform. That biases the expected edge the rule compares with costs, so label smoothing is an ablation, off by default.
-  - The probabilities the rule reads are recalibrated inside the fold, by temperature scaling on the fold's last segment. Their calibration error is reported.
+- **Options.** The head outputs probabilities over three classes, down, neutral or up, across horizon h. The threshold is set by fees and volatility:
+
+  ```
+  threshold_t = max(k · σ_t · √h, floor),
+  ```
+
+  with `k = 1/2` and `floor = 0.0024`. `σ_t` is the sample standard deviation of the last 30 one-bar log returns. On the hourly panel that window is 30 hours, and `h = 24` bars. The floor is one round trip on the Binance history: taker fee 0.10 % a side, plus 2 bps of slippage a side. The class is down when the forward log return is below `−threshold`, up when it is above `+threshold`, and neutral otherwise. The floor prices that history. The rule below prices the venue of a trade.
+- **Inputs.** The head reads `[h, m]`: the encoder state `h ∈ R³²` concatenated with the one memory readout `m ∈ R³`, 35 inputs. The map is `35 → 32 → GELU → 3` logits, then a softmax. It does not read a one-year readout or an all-history readout. Those resolutions remain the stack planned in §7, and that stack is not built.
+- **Loss.** The trained arms minimise the mean cross-entropy of the logits. That is the cross-entropy of the softmax, taken before the floor. The probabilities that are scored pass through `p_k = max(p_k, 10⁻³) / Σⱼ max(pⱼ, 10⁻³)`.
+  - A Brier term added to the cross-entropy is H6, the registered ablation `enc-ols-brier`. It is not part of the arms that were trained. The registered run, on the real panel, has not been made.
+  - Label smoothing is not built. It would pull every probability towards uniform, which biases the expected edge the rule compares with costs. It is not a registered ablation.
+  - Temperature scaling of those probabilities, fitted on the fold's last segment, is not built. No part of the encoder recalibrates them.
 - **Rule.** Go long only when the expected edge clears the venue's round-trip cost, with hysteresis. The risk kernel has the last word.
   - Iteration 2's baselines enter when the expected return exceeds the round-trip cost (taker fee plus 2 bps of slippage, each way) and exit when it falls below 0.
 
@@ -252,7 +286,7 @@ So generalized cross-validation, `GCV(λ) = N·RSS(λ)/(N − tr H(λ))²`, need
 - a test on skill, not variance: the prequential log-loss against climatology;
 - a CUSUM on the standardized recursive residuals (Brown, Durbin and Evans 1975), with its false-alarm rate fixed in advance.
 
-Two timescales follow: Matrix and the readout weights at every bar, gradient-free; the encoder and the head at monthly refits, as the protocol already does, plus early refits on alarm.
+Two timescales follow: Matrix and the readout weights at every bar, gradient-free; the encoder and the head at monthly refits, plus early refits on alarm. The encoder built in §4 is fitted once a year. Its monthly refit, and a refit on alarm, are not built.
 
 ## Change log
 
@@ -272,3 +306,7 @@ Two timescales follow: Matrix and the readout weights at every bar, gradient-fre
   - §3.1: centred nodes now exist. They sit beside the raw tree, which keeps every raw read's bits.
   - §3.2: the centred ridge with a free intercept and its refusal bound.
   - §3.3: the batch readouts, their statuses and their measured speed.
+- 2026-11-01: §4 and §5 now describe the encoder iteration 4 built.
+  - §4: one token per hourly bar of one pair, in a window of 64. The OLS penalty is `diag(0, Tλ, …, Tλ)`, and that Cholesky is in fp32. The memory is a single 30-day window; its prefix sums and its 8 × 8 solve stay in fp64. Episodes are weeks, and fits are yearly.
+  - §5: the head reads `[h, m]` (35) and the trained loss is cross-entropy. The Brier term remains H6; its registered run on the real panel has not been made. Label smoothing and temperature scaling are not built. One-year and all-history readouts stay the plan in §7.
+  - §7 no longer says the protocol already refits the encoder every month.
