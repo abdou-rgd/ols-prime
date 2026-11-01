@@ -85,3 +85,5 @@ Kani runs only the proven harnesses, with the flags of `KANI_FLAGS` in `.github/
 - In iteration 2, so did the contracts of the four dividing helpers, at 40 minutes each, and every harness that stubs them. No verdict rests on an unproven contract.
 - On 2026-10-28, GitHub's `open` run (run 40636068905, 340 minutes per harness) proved `max_qty_within_contract` in 72.5 minutes. The other 16 gave no verdict.
 - On 2026-10-29, the five proven harnesses passed again locally with `-j 4`, in 122 minutes of wall time, under load from other jobs. `max_qty_within_contract` took 7,318 s; the other four took 27 to 1,057 s.
+
+The bootstrap coverage tests in `python/tests/test_stats.py` run with `OLSPRIME_SLOW=1`: by hand (Actions, Slow tests, Run workflow) and each Monday at 06:17 UTC (`.github/workflows/slow.yml`).
